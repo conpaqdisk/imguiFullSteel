@@ -1,0 +1,632 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+#ifndef SPARTAN_SHARED_BUFFERS
+#define SPARTAN_SHARED_BUFFERS
+
+// sigma local lights, 1 jittered ray each, bits 8-10 of light flags store slot+1
+#define nrd_local_shadow_max 4
+
+// shared type abstraction - resolves to native types on each side
+#ifdef __cplusplus
+    #define SHARED_FLOAT    float
+    #define SHARED_FLOAT2   spartan::math::Vector2
+    #define SHARED_FLOAT3   spartan::math::Vector3
+    #define SHARED_FLOAT4   spartan::math::Vector4
+    #define SHARED_COLOR    spartan::Color
+    #define SHARED_MATRIX   spartan::math::Matrix
+    #define SHARED_UINT     uint32_t
+    #define SHARED_INT      int32_t
+    #define SHARED_DOUBLE   double
+    #define SHARED_BOOL     bool
+    #define SHARED_DEFAULT(x) = x
+#else
+    #define SHARED_FLOAT    float
+    #define SHARED_FLOAT2   float2
+    #define SHARED_FLOAT3   float3
+    #define SHARED_FLOAT4   float4
+    #define SHARED_COLOR    float4
+    #define SHARED_MATRIX   matrix
+    #define SHARED_UINT     uint
+    #define SHARED_INT      int
+    #define SHARED_DOUBLE   double
+    #define SHARED_BOOL     bool
+    #define SHARED_DEFAULT(x)
+#endif
+
+// constant buffer - updates once per frame
+struct FrameBufferData
+{
+    SHARED_MATRIX view;
+    SHARED_MATRIX view_inverted;
+    SHARED_MATRIX view_previous;
+    SHARED_MATRIX projection;
+    SHARED_MATRIX projection_inverted;
+    SHARED_MATRIX projection_previous;
+    SHARED_MATRIX view_projection;
+    SHARED_MATRIX view_projection_inverted;
+    SHARED_MATRIX view_projection_orthographic;
+    SHARED_MATRIX view_projection_unjittered;
+    SHARED_MATRIX view_projection_previous;
+    SHARED_MATRIX view_projection_previous_unjittered;
+
+    SHARED_FLOAT2 resolution_render;
+    SHARED_FLOAT2 resolution_output;
+
+    SHARED_FLOAT2 taa_jitter_current;
+    SHARED_FLOAT2 taa_jitter_previous;
+
+    SHARED_FLOAT camera_aperture;
+    SHARED_FLOAT delta_time;
+    SHARED_UINT  frame;
+    SHARED_UINT  options;
+
+    SHARED_FLOAT3 camera_position;
+    SHARED_FLOAT  camera_near;
+
+    SHARED_FLOAT3 camera_forward;
+    SHARED_FLOAT  camera_far;
+
+    SHARED_FLOAT camera_last_movement_time;
+    SHARED_FLOAT hdr_enabled;
+    SHARED_FLOAT hdr_max_nits;
+    SHARED_FLOAT padding_restir;
+
+    SHARED_FLOAT3 camera_position_previous;
+    SHARED_FLOAT  resolution_scale;
+
+    SHARED_DOUBLE time;
+    SHARED_FLOAT  camera_fov;
+    SHARED_FLOAT  restir_pt_scale;
+
+    SHARED_FLOAT3 wind;
+    SHARED_FLOAT  gamma;
+
+    SHARED_FLOAT3 camera_right;
+    SHARED_FLOAT  camera_exposure;
+
+    SHARED_FLOAT restir_pt_light_count;
+    // emissive triangle nee pool count, set by Renderer::UpdateAccelerationStructures, when
+    // zero the restir initial ris pass falls back to the brdf + analytical light strategies
+    // only, when non zero a third strategy area samples a random emissive triangle and the
+    // balance heuristic mis denominator includes its solid angle pdf, see restir_pt.hlsl
+    SHARED_FLOAT restir_pt_emissive_tri_count;
+    // cumulus horizontal coverage, 0 = clear sky, 1 = overcast, authored on the directional light
+    SHARED_FLOAT cloud_coverage;
+    SHARED_FLOAT hdr_sdr_white_nits;
+
+    // vr stereo - right eye matrices (left eye uses the primary matrices above)
+    SHARED_MATRIX view_right;
+    SHARED_MATRIX view_inverted_right;
+    SHARED_MATRIX projection_right;
+    SHARED_MATRIX projection_inverted_right;
+    SHARED_MATRIX view_projection_right;
+    SHARED_MATRIX view_projection_inverted_right;
+    SHARED_MATRIX view_projection_previous_right;
+    SHARED_MATRIX view_projection_unjittered_right;
+    SHARED_MATRIX view_projection_previous_unjittered_right;
+    SHARED_FLOAT3 camera_position_right;
+    SHARED_FLOAT  camera_exposure_mode;
+    SHARED_UINT   is_multiview;
+    SHARED_UINT   padding_mv0;
+    SHARED_UINT   padding_mv1;
+    SHARED_UINT   padding_mv2;
+
+    // clustered lighting, populated each frame from camera near/far and the grid constants
+    // exponential z slicing, slice = floor(log(view_z) * z_scale + z_bias)
+    SHARED_UINT   cluster_count_x;
+    SHARED_UINT   cluster_count_y;
+    SHARED_UINT   cluster_count_z;
+    SHARED_UINT   cluster_light_count;
+
+    SHARED_FLOAT  cluster_z_scale;
+    SHARED_FLOAT  cluster_z_bias;
+    SHARED_UINT   volumetric_light_count;
+    SHARED_FLOAT  cluster_padding1;
+
+    // fft ocean, filled each frame from the active Water component while it is enabled
+    SHARED_FLOAT4 ocean_cascade_length;       // patch length (meters) per cascade
+    SHARED_FLOAT  ocean_sea_level;
+    SHARED_FLOAT  ocean_choppiness;
+    SHARED_FLOAT  ocean_displacement_scale;
+    SHARED_FLOAT  ocean_normal_strength;
+    SHARED_UINT   ocean_cascade_count;
+    SHARED_FLOAT  ocean_enabled;
+    SHARED_FLOAT  ocean_turbidity;
+    SHARED_FLOAT  ocean_caustics_intensity;
+
+    // terrain heightfield in world xz, sampled by the ocean for shallow water
+    SHARED_FLOAT4 terrain_height_mapping; // xy = world min xz, zw = 1 / world size
+    SHARED_FLOAT  terrain_height_y;
+    SHARED_FLOAT  terrain_height_enabled;
+    SHARED_FLOAT  padding_terrain_height_0;
+    SHARED_FLOAT  padding_terrain_height_1;
+
+    // radial motion blur wheel hubs, xy = screen uv, z = signed per-frame rotation angle in radians, w = projected radius in output pixels
+    SHARED_FLOAT4 radial_blur_hubs[8];
+    SHARED_FLOAT  radial_blur_hub_count;
+    // 0 = midnight, 0.5 = noon, drives catalog star and milky way rotation with the sun day cycle
+    SHARED_FLOAT  time_of_day;
+    SHARED_FLOAT  padding_radial_1;
+    SHARED_FLOAT  padding_radial_2;
+
+#ifdef __cplusplus
+    void set_bit(const bool set, const uint32_t bit)
+    {
+        options = set ? (options |= bit) : (options & ~bit);
+    }
+#endif
+};
+
+// push constant buffer - carries per-draw and per-pass data
+// draw_index indexes into the bindless draw data buffer for transforms and material info
+// material_index and is_transparent are pass-level state for compute shaders
+// values[] carries generic per-pass parameters (3 x float4)
+struct PassBufferData
+{
+    SHARED_UINT draw_index     SHARED_DEFAULT(0);
+    SHARED_UINT material_index SHARED_DEFAULT(0);
+    SHARED_UINT is_transparent SHARED_DEFAULT(0);
+    SHARED_UINT eye_index      SHARED_DEFAULT(0); // 0 = left / monoscopic, 1 = right
+
+#ifdef __cplusplus
+    // c++ uses a flat float array with setter helpers
+    float v[12] = {};
+
+    void set_f3_value(const spartan::math::Vector3& value) { v[0] = value.x; v[1] = value.y; v[2] = value.z; }
+    void set_f3_value(float x, float y = 0.0f, float z = 0.0f) { v[0] = x; v[1] = y; v[2] = z; }
+
+    void set_f3_value2(const spartan::math::Vector3& value) { v[4] = value.x; v[5] = value.y; v[6] = value.z; }
+    void set_f3_value2(float x, float y, float z) { v[4] = x; v[5] = y; v[6] = z; }
+
+    void set_f4_value(const spartan::Color& color) { v[8] = color.r; v[9] = color.g; v[10] = color.b; v[11] = color.a; }
+    void set_f4_value(float x, float y, float z, float w) { v[8] = x; v[9] = y; v[10] = z; v[11] = w; }
+
+    void set_f2_value(float x, float y) { v[3] = x; v[7] = y; }
+#else
+    // hlsl uses float4 array with swizzle accessors
+    float4 values[3];
+#endif
+};
+
+// note, the full uv state (tiling, offset, invert, rotation, world_space_uv) lives on DrawData,
+// not here, so multiple renderables can share a material yet have per-instance uv tweaks
+struct MaterialParameters
+{
+    SHARED_FLOAT4 color SHARED_DEFAULT(spartan::math::Vector4::Zero);
+
+    SHARED_FLOAT roughness  SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT metalness SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT normal     SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT height     SHARED_DEFAULT(0.0f);
+
+    SHARED_UINT  flags             SHARED_DEFAULT(0);
+    SHARED_FLOAT local_width       SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT local_height      SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT emissive_strength SHARED_DEFAULT(0.0f); // 0-1 scale for emissive_from_albedo, 1 maps to the composition nits
+
+    SHARED_FLOAT subsurface_scattering;
+    SHARED_FLOAT sheen;
+    SHARED_FLOAT anisotropic;
+    SHARED_FLOAT anisotropic_rotation;
+
+    SHARED_FLOAT clearcoat;
+    SHARED_FLOAT clearcoat_roughness;
+    SHARED_FLOAT flake_strength;
+    SHARED_FLOAT flake_scale;
+
+    SHARED_FLOAT4 pearl_color SHARED_DEFAULT(spartan::math::Vector4::One);
+    SHARED_FLOAT4 coat_tint SHARED_DEFAULT(spartan::math::Vector4::One);
+
+    SHARED_FLOAT pearl_strength;
+    SHARED_FLOAT ior;
+    SHARED_FLOAT absorption SHARED_DEFAULT(0.0f); // beer lambert dye density for glass, independent of alpha
+    SHARED_FLOAT thickness  SHARED_DEFAULT(0.0f); // shell thickness in meters for glass parallax and optical path
+
+    // terrain, two disjoint roles sharing one block
+    // on a terrain layer material these carry the procedural rule that decides where the layer appears
+    // on the terrain surface material they carry the layer table location and the analysis map mapping
+    // every group below is 16 bytes so the structured buffer layout stays aligned on both apis
+    SHARED_FLOAT2 terrain_slope_range  SHARED_DEFAULT(spartan::math::Vector2::Zero); // radians, weight ramps in across the range
+    SHARED_FLOAT2 terrain_height_range SHARED_DEFAULT(spartan::math::Vector2::Zero); // meters
+
+    SHARED_FLOAT terrain_curvature_influence  SHARED_DEFAULT(0.0f); // positive favours concave, negative favours convex
+    SHARED_FLOAT terrain_flow_influence       SHARED_DEFAULT(0.0f); // positive favours water channels
+    SHARED_FLOAT terrain_occlusion_influence  SHARED_DEFAULT(0.0f); // positive favours crevices and valley floors
+    SHARED_FLOAT terrain_insolation_influence SHARED_DEFAULT(0.0f); // positive favours sun facing slopes
+
+    SHARED_FLOAT terrain_wear_influence       SHARED_DEFAULT(0.0f); // positive favours eroded bedrock
+    SHARED_FLOAT terrain_deposition_influence SHARED_DEFAULT(0.0f); // positive favours accumulated sediment
+    SHARED_FLOAT terrain_talus_influence      SHARED_DEFAULT(0.0f); // positive favours scree below cliffs
+    SHARED_FLOAT terrain_weight_bias          SHARED_DEFAULT(1.0f); // overall priority against the other layers
+
+    SHARED_FLOAT terrain_tiling_scale   SHARED_DEFAULT(1.0f); // multiplies the terrain uv, per layer texel density
+    SHARED_FLOAT terrain_blend_contrast SHARED_DEFAULT(0.2f); // height blend band width, smaller is sharper
+    SHARED_FLOAT terrain_porosity       SHARED_DEFAULT(0.5f); // how much the layer darkens when wet
+    SHARED_FLOAT terrain_macro_strength SHARED_DEFAULT(1.0f); // large scale colour breakup amount
+
+    SHARED_FLOAT4 terrain_world_mapping SHARED_DEFAULT(spartan::math::Vector4::Zero); // xy = world min xz, zw = 1 / world size xz
+
+    SHARED_FLOAT terrain_sea_level   SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT terrain_snow_level  SHARED_DEFAULT(0.0f);
+    SHARED_UINT  terrain_layer_base  SHARED_DEFAULT(0); // bindless material index of layer 0
+    SHARED_UINT  terrain_layer_count SHARED_DEFAULT(0);
+
+    SHARED_UINT  terrain_layer_stride SHARED_DEFAULT(0); // bindless indices between consecutive layers
+    SHARED_UINT  terrain_flags        SHARED_DEFAULT(0);
+    SHARED_FLOAT terrain_snow_amount  SHARED_DEFAULT(1.0f); // global snow multiplier, 0 disables the snow layer
+    SHARED_FLOAT terrain_wetness      SHARED_DEFAULT(0.0f); // global wetness added on top of the flow driven amount
+
+#ifndef __cplusplus
+    bool has_texture_albedo()    { return (flags & (1 << 2))  != 0; }
+    bool has_texture_normal()    { return (flags & (1 << 1))  != 0; }
+    bool has_texture_height()    { return (flags & (1 << 0))  != 0; }
+    bool has_texture_occlusion() { return (flags & (1 << 7))  != 0; }
+    bool has_texture_roughness() { return (flags & (1 << 3))  != 0; }
+    bool has_texture_metalness() { return (flags & (1 << 4))  != 0; }
+    bool has_texture_emissive()  { return (flags & (1 << 6))  != 0; }
+    bool is_terrain()            { return (flags & (1 << 8))  != 0; }
+    bool emissive_from_albedo()  { return (flags & (1 << 15)) != 0; }
+    bool is_alpha_tested()       { return (flags & (1 << 16)) != 0; }
+    bool is_albedo_srgb()        { return (flags & (1 << 17)) != 0; }
+    bool is_emissive_srgb()      { return (flags & (1 << 18)) != 0; }
+    bool is_motion_blur_radial() { return (flags & (1 << 19)) != 0; }
+
+    // terrain_flags bits, see TerrainLayer.h
+    bool terrain_layer_biplanar() { return (terrain_flags & (1 << 0)) != 0; }
+    bool terrain_layer_pom()      { return (terrain_flags & (1 << 1)) != 0; }
+    bool terrain_layer_snow()     { return (terrain_flags & (1 << 2)) != 0; }
+    bool terrain_layer_below_sea(){ return (terrain_flags & (1 << 3)) != 0; }
+    bool terrain_has_maps()       { return (terrain_flags & (1 << 4)) != 0; }
+    // on the surface material bits 8 to 11 hold how many layers to sample and 12 to 15 the debug view
+    uint terrain_layer_quality()  { return (terrain_flags >> 8)  & 0xFu; }
+    uint terrain_debug_view()     { return (terrain_flags >> 12) & 0xFu; }
+#endif
+};
+
+struct LightParameters
+{
+    SHARED_COLOR  color;
+    SHARED_FLOAT3 position;
+    SHARED_FLOAT  intensity;
+    SHARED_FLOAT3 direction;
+    SHARED_FLOAT  range;
+    SHARED_FLOAT3 direction_right;
+    SHARED_FLOAT  angle;
+    SHARED_UINT   flags;
+    SHARED_UINT   screen_space_shadow_slice_index;
+    SHARED_FLOAT  area_width;
+    SHARED_FLOAT  area_height;
+    SHARED_MATRIX transform[6];
+    SHARED_FLOAT2 atlas_offsets[6];
+    SHARED_FLOAT2 atlas_scales[6];
+    SHARED_FLOAT2 atlas_texel_sizes[6];
+};
+
+struct Aabb
+{
+    SHARED_FLOAT3 min;
+    SHARED_FLOAT  is_occluder;
+    SHARED_FLOAT3 max;
+    SHARED_FLOAT  padding2;
+};
+
+// per-blas-instance data (indexed by InstanceIndex() in rt shaders)
+// carries the per-renderable uv state too so rt and raster see the same per-instance tweak
+struct GeometryInfo
+{
+    SHARED_UINT vertex_offset;
+    SHARED_UINT index_offset;
+
+    SHARED_FLOAT2 uv_tiling      SHARED_DEFAULT(spartan::math::Vector2(1.0f, 1.0f));
+    SHARED_FLOAT2 uv_offset      SHARED_DEFAULT(spartan::math::Vector2::Zero);
+    SHARED_FLOAT2 uv_invert      SHARED_DEFAULT(spartan::math::Vector2::Zero);
+    SHARED_FLOAT  uv_rotation    SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT  uv_world_space SHARED_DEFAULT(0.0f);
+};
+
+// emissive triangle for the restir nee pool, 64 bytes
+// built once per frame on the cpu by walking renderables with non-zero emission, world space
+// positions and normal are precomputed, area is in world units, the rgb radiance is the
+// material emission radiance estimate (color * intensity), the shader samples a triangle by
+// stepping a linear prefix sum stored in the alpha channels of v0.w (cumulative weight) and
+// v1.w (per triangle weight = area * lum(emission)), the last triangle's cumulative weight is
+// the total weight used to normalize the area pdf to a probability density
+// see sample_emissive_tri_candidate in restir_pt.hlsl
+struct EmissiveTriangle
+{
+    SHARED_FLOAT3 v0;          // world space vertex 0
+    SHARED_FLOAT  weight;      // per triangle picking weight (area * lum(emission))
+    SHARED_FLOAT3 v1;          // world space vertex 1
+    SHARED_FLOAT  cdf;         // prefix sum of weight up to and including this triangle
+    SHARED_FLOAT3 v2;          // world space vertex 2
+    SHARED_FLOAT  area;        // world space triangle area
+    SHARED_FLOAT3 normal;      // world space triangle normal (front side)
+    SHARED_FLOAT  pad0         SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT3 emission;    // emitted radiance per unit projected area (world units)
+    SHARED_FLOAT  pad1         SHARED_DEFAULT(0.0f);
+};
+
+// gpu-driven indirect draw arguments (matches VkDrawIndexedIndirectCommand layout)
+// when used as the args for vkCmdDrawIndirect (non-indexed) the first 16 bytes alias to VkDrawIndirectCommand:
+// index_count -> vertex_count, instance_count -> instance_count, first_index -> first_vertex, vertex_offset -> first_instance
+struct IndirectDrawArgs
+{
+    SHARED_UINT index_count    SHARED_DEFAULT(0);
+    SHARED_UINT instance_count SHARED_DEFAULT(0);
+    SHARED_UINT first_index    SHARED_DEFAULT(0);
+    SHARED_INT  vertex_offset  SHARED_DEFAULT(0);
+    SHARED_UINT first_instance SHARED_DEFAULT(0);
+};
+
+// gpu-driven indirect dispatch arguments (matches VkDispatchIndirectCommand layout)
+struct IndirectDispatchArgs
+{
+    SHARED_UINT group_count_x SHARED_DEFAULT(0);
+    SHARED_UINT group_count_y SHARED_DEFAULT(1);
+    SHARED_UINT group_count_z SHARED_DEFAULT(1);
+};
+
+// per-draw data for gpu-driven rendering (one entry per renderable lod, looked up from MeshletInstance.draw_index)
+// flags bit 0: skinned (instance cull uses the dynamic world aabb, phase b keeps every meshlet, triangle pass skips backface)
+// flags bit 1: per-instance (both cull phases rebuild the per-instance world transform from instance_index for per-instance bounds)
+// flags bit 2: retired (was the hw-instancing fallback, the two-phase cull culls every instance individually)
+// flags bit 3: two-sided material (triangle pass skips backface)
+// flags bit 4: alpha-tested material (triangle pass routes survivors to the alpha half so the depth prepass can run opaque depth-only)
+// flags bit 5: skip hi-z (recently moved, last frame occluder depth would pop the mesh)
+// lod_first_index/lod_vertex_offset hold the global geometry offsets for the lod (replaces what indirect_draw_args used to carry)
+struct DrawData
+{
+    SHARED_MATRIX transform;
+    SHARED_MATRIX transform_previous;
+    SHARED_UINT   material_index    SHARED_DEFAULT(0);
+    SHARED_UINT   is_transparent    SHARED_DEFAULT(0);
+    SHARED_UINT   aabb_index        SHARED_DEFAULT(0);
+    SHARED_UINT   lod_first_index   SHARED_DEFAULT(0); // global first index into the geometry index buffer for this lod
+    SHARED_UINT   flags             SHARED_DEFAULT(0);
+    SHARED_UINT   instance_offset   SHARED_DEFAULT(0); // offset into the global instance buffer
+    SHARED_UINT   instance_index    SHARED_DEFAULT(0); // per-draw instance to fetch, vs uses this in place of sv_instanceid
+    SHARED_UINT   lod_vertex_offset SHARED_DEFAULT(0); // global vertex offset for this lod (added to lod-local indices)
+    SHARED_UINT   lod_meshlet_offset SHARED_DEFAULT(0); // global first meshlet index for this lod, phase b expands meshlets from here
+    SHARED_UINT   lod_meshlet_count  SHARED_DEFAULT(0); // meshlet count for this lod, phase b loops over this many meshlets per surviving instance
+
+    // per-renderable uv state, resolved on the cpu from the renderable's override or the material default
+    // lets multiple renderables share a material yet tweak tiling, offset, rotation, invert, or world_space_uv independently
+    SHARED_FLOAT2 uv_tiling        SHARED_DEFAULT(spartan::math::Vector2(1.0f, 1.0f));
+    SHARED_FLOAT2 uv_offset        SHARED_DEFAULT(spartan::math::Vector2::Zero);
+    SHARED_FLOAT2 uv_invert        SHARED_DEFAULT(spartan::math::Vector2::Zero);
+    SHARED_FLOAT  uv_rotation      SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT  uv_world_space   SHARED_DEFAULT(0.0f);
+
+    // lod-local aabb, the cull shader uses this to dequantize the compressed MeshletBounds center/radius
+    // diag is the precomputed length(extent), it's the reference distance for the u16-normalized radius and saves a sqrt per cull task
+    SHARED_FLOAT3 lod_aabb_min                  SHARED_DEFAULT(spartan::math::Vector3::Zero);
+    SHARED_FLOAT  lod_aabb_diag                 SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT3 lod_aabb_extent               SHARED_DEFAULT(spartan::math::Vector3::Zero);
+    // per-instance gpu distance cull, squared so the cull shader avoids a sqrt, the cpu side fills it from renderable->GetMaxRenderDistance(),
+    // a sentinel of zero disables the check and is used for renderables that should never be distance-culled (terrain tiles for example),
+    // this is critical for consolidated world-spanning entities (forest trees, rocks) where the per-entity cpu check always passes and the
+    // gpu would otherwise burn cull task and survivor budget on instances far beyond the artist-set max render distance
+    SHARED_FLOAT  max_render_distance_squared   SHARED_DEFAULT(0.0f);
+};
+
+// one cull task per (renderable lod, instance) tuple, the instance cull pass (phase a) dispatches over these
+// meshlet_index and instance_count are unused now, the meshlet range lives on DrawData and phase b expands it per survivor
+struct CullTask
+{
+    SHARED_UINT draw_index     SHARED_DEFAULT(0);
+    SHARED_UINT meshlet_index  SHARED_DEFAULT(0);
+    SHARED_UINT instance_index SHARED_DEFAULT(0);
+    SHARED_UINT instance_count SHARED_DEFAULT(1);
+};
+
+// emitted by the instance cull pass (phase a) for every surviving (renderable lod, instance) tuple
+// the meshlet cull pass (phase b) dispatches one workgroup per entry and expands that instance's meshlets
+struct SurvivingInstance
+{
+    SHARED_UINT draw_index     SHARED_DEFAULT(0);
+    SHARED_UINT instance_index SHARED_DEFAULT(0);
+};
+
+// emitted by the meshlet cull pass for every surviving (renderable lod, meshlet, instance) tuple
+// indexed by the triangle cull pass (one workgroup per surviving meshlet)
+struct MeshletInstance
+{
+    SHARED_UINT draw_index     SHARED_DEFAULT(0);
+    SHARED_UINT meshlet_index  SHARED_DEFAULT(0);
+    SHARED_UINT instance_index SHARED_DEFAULT(0);
+    SHARED_UINT padding0       SHARED_DEFAULT(0);
+};
+
+// per-meshlet bounding sphere and topology ranges
+// center/radius are quantized into the lod's local aabb (drawdata.lod_aabb_min, drawdata.lod_aabb_extent), the cull shader dequantizes on read
+// first_index is relative to the lod's index_offset within the global index buffer, triangle_count is packed into the high 7 bits
+// first_vertex indexes the packed unique-vertex remap buffer used by mesh shaders, vertex_count is packed into the high 7 bits
+// first_micro indexes the packed micro-index buffer (one uint local index per corner, 3 * triangle_count entries)
+// the bounds are conservative, the cpu-side packer pads radius to cover center/radius quantization error so culling can never reject a sphere that the true geometry occupied
+struct MeshletBounds
+{
+    // [u16 cx | u16 cy] center x/y as unorm quantized into the lod aabb
+    SHARED_UINT center_xy             SHARED_DEFAULT(0);
+    // [u16 cz | u16 r] center z as unorm into the lod aabb, radius as unorm into the lod aabb diagonal length
+    SHARED_UINT center_z_radius       SHARED_DEFAULT(0);
+    // backface cone, [s8 ax | s8 ay | s8 az | s8 cutoff], snorm, cutoff = 127 means degenerate cone -> no backface cull
+    SHARED_UINT cone_axis_cutoff      SHARED_DEFAULT(0);
+    // [bits 0..24 first_index] + [bits 25..31 triangle_count], first_index max 32m (33,554,432), triangle_count max 127 (engine cap 124)
+    SHARED_UINT first_index_tri_count SHARED_DEFAULT(0);
+    // [bits 0..24 first_vertex] + [bits 25..31 vertex_count], first_vertex into the unique remap buffer, vertex_count max 64
+    SHARED_UINT first_vertex_vert_count SHARED_DEFAULT(0);
+    // byte/element offset into the micro-index buffer, one uint local index per triangle corner
+    SHARED_UINT first_micro           SHARED_DEFAULT(0);
+};
+// packing helpers for the meshlet bounds, kept here so cpu builder and gpu cull stay in lockstep
+#define MESHLET_FIRST_INDEX_BITS   25u
+#define MESHLET_FIRST_INDEX_MAX    ((1u << MESHLET_FIRST_INDEX_BITS) - 1u)
+#define MESHLET_FIRST_INDEX_MASK   MESHLET_FIRST_INDEX_MAX
+#define MESHLET_TRI_COUNT_SHIFT    MESHLET_FIRST_INDEX_BITS
+#define MESHLET_TRI_COUNT_MASK     0x7Fu
+#define MESHLET_FIRST_VERTEX_BITS  25u
+#define MESHLET_FIRST_VERTEX_MAX   ((1u << MESHLET_FIRST_VERTEX_BITS) - 1u)
+#define MESHLET_FIRST_VERTEX_MASK  MESHLET_FIRST_VERTEX_MAX
+#define MESHLET_VERT_COUNT_SHIFT   MESHLET_FIRST_VERTEX_BITS
+#define MESHLET_VERT_COUNT_MASK    0x7Fu
+
+// must mirror meshlet_max_triangles in GeometryProcessing.h, 124 triangles -> 372 indices
+#define MESHLET_MAX_TRIANGLES 124
+#define MESHLET_MAX_INDICES   (MESHLET_MAX_TRIANGLES * 3)
+#define MESHLET_MAX_VERTICES  64
+#define MESH_SHADER_NUMTHREADS 32
+
+// clustered lighting grid dimensions, 16x9 matches a 16:9 aspect ratio and 24 exponential z slices
+// keep these in sync with the cluster_z_scale, cluster_z_bias compute on the cpu
+#define CLUSTER_COUNT_X     16
+#define CLUSTER_COUNT_Y     9
+#define CLUSTER_COUNT_Z     24
+#define CLUSTER_COUNT_TOTAL (CLUSTER_COUNT_X * CLUSTER_COUNT_Y * CLUSTER_COUNT_Z)
+#define CLUSTER_MAX_LIGHTS  256
+
+// visible triangle, packed into a single uint
+// high 24 bits: meshlet instance index (16M cap), low 8 bits: triangle index within the meshlet (124 cap)
+// emitted by the triangle cull pass, consumed by the vertex shader via sv_vertexid / 3
+#define VISIBLE_TRI_PACK(mi, tri) (((mi) << 8u) | ((tri) & 0xffu))
+#define VISIBLE_TRI_MI(packed)    ((packed) >> 8u)
+#define VISIBLE_TRI_IDX(packed)   ((packed) & 0xffu)
+
+// vertex pulling - global geometry buffer exposed as a structured buffer (24 bytes)
+// uv is half2, normal/tangent are octahedral snorm 16:16, decoded in shader via unpack_vertex_*
+struct PulledVertex
+{
+    SHARED_FLOAT3 position;
+    SHARED_UINT   uv;      // f16 x | f16 y
+    SHARED_UINT   normal;  // s16 oct.x | s16 oct.y
+    SHARED_UINT   tangent; // s16 oct.x | s16 oct.y
+};
+
+// vertex pulling - instance buffer exposed as packed uint data (10 bytes per instance)
+struct PackedInstance
+{
+    SHARED_UINT pos_xy;     // position_x (half16) | position_y (half16)
+    SHARED_UINT pos_z_norm; // position_z (half16) | normal_oct (uint16)
+    SHARED_UINT yaw_scale;  // yaw_packed (uint8) | scale_packed (uint8) | padding (uint16)
+};
+
+// 16-byte grass instance, dedicated grass-only format because grass needs sub-cm position
+// precision in world space, half-float positions in PackedInstance quantize to ~1m at
+// world distances of a few hundred meters and snap every blade onto a visible lattice
+// even when the populate compute emits perfectly random sub-meter offsets
+struct GrassInstance
+{
+    SHARED_FLOAT pos_x;
+    SHARED_FLOAT pos_y;
+    SHARED_FLOAT pos_z;
+    SHARED_UINT  normal_yaw_scale; // normal_oct (high 16) | yaw_packed (8) | scale_packed (8)
+};
+
+// gpu particle (64 bytes)
+struct Particle
+{
+    SHARED_FLOAT3 position;
+    SHARED_FLOAT  lifetime     SHARED_DEFAULT(0.0f); // remaining
+    SHARED_FLOAT3 velocity;
+    SHARED_FLOAT  max_lifetime SHARED_DEFAULT(0.0f); // initial
+    SHARED_FLOAT4 color;                              // current rgba
+    SHARED_FLOAT  size          SHARED_DEFAULT(0.0f); // current
+    SHARED_UINT   emitter_index SHARED_DEFAULT(0);    // emitter that spawned this particle
+    SHARED_FLOAT  start_size    SHARED_DEFAULT(0.0f); // birth size, captured so later emitter changes do not resize live particles
+    SHARED_FLOAT  end_size      SHARED_DEFAULT(0.0f); // death size, captured for the same reason
+};
+
+// gpu emitter parameters
+struct EmitterParams
+{
+    SHARED_FLOAT3 position;
+    SHARED_FLOAT  emission_rate    SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT  lifetime         SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT  start_speed      SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT  start_size       SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT  end_size         SHARED_DEFAULT(0.0f);
+    SHARED_COLOR  start_color;
+    SHARED_COLOR  end_color;
+    SHARED_FLOAT  gravity_modifier SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT  radius           SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT  delta_time       SHARED_DEFAULT(0.0f);
+    SHARED_UINT   max_particles    SHARED_DEFAULT(0); // total active particle buffer span
+    SHARED_UINT   range_start      SHARED_DEFAULT(0);
+    SHARED_UINT   range_count      SHARED_DEFAULT(0);
+    SHARED_UINT   emit_count       SHARED_DEFAULT(0);
+    SHARED_UINT   frame            SHARED_DEFAULT(0);
+    SHARED_UINT   emitter_count    SHARED_DEFAULT(0);
+    SHARED_UINT   blend_mode       SHARED_DEFAULT(0);
+    SHARED_UINT   lighting_mode    SHARED_DEFAULT(0);
+    SHARED_UINT   render_mode      SHARED_DEFAULT(0);
+    SHARED_FLOAT  volume_density   SHARED_DEFAULT(1.0f);
+    SHARED_FLOAT  volume_anisotropy SHARED_DEFAULT(0.35f);
+    SHARED_FLOAT  volume_shadowing SHARED_DEFAULT(0.5f);
+    SHARED_FLOAT3 emission_direction;
+    SHARED_FLOAT  emission_cone_angle SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT  directional_blend   SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT  soft_depth_scale     SHARED_DEFAULT(20.0f);
+    SHARED_FLOAT  drag                 SHARED_DEFAULT(1.2f);
+    SHARED_FLOAT  turbulence_strength  SHARED_DEFAULT(0.3f);
+    SHARED_FLOAT  wind_influence       SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT  velocity_inheritance SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT  velocity_stretch     SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT  emissive_strength    SHARED_DEFAULT(0.0f);
+    SHARED_UINT   flipbook_rows        SHARED_DEFAULT(1);
+    SHARED_UINT   flipbook_columns     SHARED_DEFAULT(1);
+    SHARED_FLOAT  flipbook_fps         SHARED_DEFAULT(0.0f);
+    SHARED_FLOAT3 emitter_velocity;
+    // splat every nth particle into the volume grid, each one scatters into hundreds of voxels so the
+    // cost is unbounded in live particle count, the survivors carry the dropped density
+    SHARED_UINT   volume_splat_stride SHARED_DEFAULT(1);
+};
+
+// c++ backward compatibility aliases
+#ifdef __cplusplus
+namespace spartan
+{
+    using Cb_Frame            = FrameBufferData;
+    using Pcb_Pass            = PassBufferData;
+    using Sb_Material         = MaterialParameters;
+    using Sb_Light            = LightParameters;
+    using Sb_Aabb             = Aabb;
+    using Sb_GeometryInfo     = GeometryInfo;
+    using Sb_EmissiveTriangle = EmissiveTriangle;
+    using Sb_IndirectDrawArgs     = IndirectDrawArgs;
+    using Sb_IndirectDispatchArgs = IndirectDispatchArgs;
+    using Sb_DrawData         = DrawData;
+    using Sb_MeshletBounds    = MeshletBounds;
+    using Sb_CullTask          = CullTask;
+    using Sb_SurvivingInstance = SurvivingInstance;
+    using Sb_MeshletInstance   = MeshletInstance;
+    using Sb_Particle         = Particle;
+    using Sb_EmitterParams    = EmitterParams;
+    using Sb_GrassInstance    = GrassInstance;
+
+    static_assert(sizeof(Sb_IndirectDrawArgs) == sizeof(uint32_t) * 5);
+    static_assert(sizeof(Sb_MeshletBounds) == sizeof(uint32_t) * 6);
+}
+#else
+// hlsl backward compatibility alias
+#define aabb Aabb
+#endif
+
+#endif // SPARTAN_SHARED_BUFFERS

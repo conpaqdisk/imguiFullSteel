@@ -1,0 +1,539 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES =========
+#include "common.hlsl"
+#include "brdf.hlsl"
+//====================
+
+// refraction and transparency constants
+static const float ior_water                  = 1.333f; // water IOR
+static const float ior_air                    = 1.0f;   // air IOR
+static const float chromatic_aberration       = 0.02f;  // water chromatic aberration strength
+static const float glass_dispersion           = 0.03f;  // per channel ior spread for glass
+static const uint  glass_frost_taps           = 8;      // frosted transmission disc taps
+static const float glass_parallax_scale       = 0.18f;  // thin-shell uv shift per meter of optical path
+static const float glass_absorption_scale     = 50.0f;  // maps authored absorption*thickness into beer lambert exponent
+
+// ray traced reflections now jitter the ray across the ggx lobe by surface roughness and a
+// spatiotemporal denoiser reconstructs a roughness proportional blur, so rough surfaces show a
+// correct soft reflection instead of a wrong sharp mirror, the fade band is pushed to the very
+// top of the roughness range as a gentle safety tail, beyond the ray spread alpha cap the lobe
+// stops widening so the last stretch fades out rather than reading as an under blurred mirror,
+// smooth surfaces (glass, polished metal, car paint) keep the full sharp reflection
+static const float reflection_roughness_fade_start = 0.85f; // full reflection at or below this
+static const float reflection_roughness_fade_end   = 1.0f;  // no reflection at or above this
+
+// karis 2014 analytic split sum, same as reflections_shade, f90 is baked in as 1 so the bias
+// term carries grazing fresnel, the gpu lut was built with compute_f90(0)=0 which wiped that term
+float2 reflection_env_brdf(float roughness, float n_dot_v)
+{
+    const float4 c0 = float4(-1.0f, -0.0275f, -0.572f, 0.022f);
+    const float4 c1 = float4(1.0f, 0.0425f, 1.04f, -0.04f);
+    float4 r        = roughness * c0 + c1;
+    float  a004     = min(r.x * r.x, exp2(-9.28f * n_dot_v)) * r.x + r.y;
+    return float2(-1.04f, 1.04f) * a004 + r.zw;
+}
+
+// screen-space raymarching constants
+static const uint  g_refraction_max_steps     = 16;     // max ray steps for refraction
+static const float g_refraction_max_distance  = 2.0f;   // max refraction distance
+static const float g_refraction_thickness     = 0.1f;   // depth testing thickness
+static const float g_refraction_step_length   = g_refraction_max_distance / (float)g_refraction_max_steps;
+
+// contact foam only where opaque geometry sits within this 3d world distance of the water surface point,
+// vertical clearance alone foams every submerged wall seen through the water, full distance cannot
+static const float contact_foam_radius = 0.85f;
+
+// Compute Fresnel for dielectrics using Schlick approximation
+float3 compute_dielectric_fresnel(float cos_theta, float ior_outer, float ior_inner)
+{
+    // compute F0 for dielectric
+    float f0_val = pow((ior_outer - ior_inner) / (ior_outer + ior_inner), 2.0f);
+    float3 F0 = float3(f0_val, f0_val, f0_val);
+    
+    // Schlick Fresnel
+    return F_Schlick(F0, get_f90(), cos_theta);
+}
+
+// subtle thin-film iridescence for clear windshield glass at grazing angles, heavy absorption kills it so taillight lenses stay clean
+float3 glass_thin_film_fresnel(float3 fresnel, float n_dot_v, float absorption)
+{
+    float clear   = saturate(1.0f - absorption * 2.0f);
+    float grazing = pow(saturate(1.0f - n_dot_v), 3.0f);
+    float phase   = (1.0f - n_dot_v) * 14.0f;
+    float3 irid   = 0.5f + 0.5f * float3(cos(phase), cos(phase + 2.094395f), cos(phase + 4.188790f));
+    return lerp(fresnel, fresnel * lerp(1.0f, irid, 0.4f), clear * grazing);
+}
+
+// beer lambert water column, the closed form of single scattering in a homogeneous medium
+// one extinction drives both the transmitted background and the in-scatter fill, per channel,
+// so the fill takes over exactly as fast as the background fades, red dies first and blue persists,
+// a separate scatter rate here made every channel converge to the body color at the same depth which read as flat milk
+float3 apply_water_absorption(float3 color, float depth, float3 body_radiance)
+{
+    float3 transmittance = exp(-ocean_extinction * depth);
+    return color * transmittance + body_radiance * (1.0f - transmittance);
+}
+
+// Compute refracted direction using Snell's law (returns zero if total internal reflection)
+float3 compute_refracted_dir(float3 incident_dir, float3 normal, float ior_outer, float ior_inner)
+{
+    float ior_ratio   = ior_outer / ior_inner;
+    float cos_theta_i = -dot(incident_dir, normal);
+    float sin_theta_i = sqrt(max(0.0f, 1.0f - cos_theta_i * cos_theta_i));
+    float sin_theta_t = ior_ratio * sin_theta_i;
+    
+    // check for total internal reflection
+    if (sin_theta_t >= 1.0f)
+        return float3(0.0f, 0.0f, 0.0f);
+    
+    // compute refracted direction
+    float cos_theta_t = sqrt(max(0.0f, 1.0f - sin_theta_t * sin_theta_t));
+    return normalize(ior_ratio * incident_dir + (ior_ratio * cos_theta_i - cos_theta_t) * normal);
+}
+
+// screen space raymarch along the refracted direction, returns the hit uv or the straight through uv, handles curved glass correctly
+float2 compute_refraction_uv(float3 surface_pos_ws, float3 refracted_dir_ws, float depth_transparent, float2 uv)
+{
+    // convert to view space
+    float3 ray_pos  = world_to_view(surface_pos_ws);
+    float3 ray_dir  = world_to_view(refracted_dir_ws, false);
+    float3 ray_step = ray_dir * g_refraction_step_length;
+
+    // offset starting position slightly to avoid self-intersection with the glass surface
+    ray_pos += ray_dir * 0.02f;
+
+    for (uint i = 0; i < g_refraction_max_steps; i++)
+    {
+        ray_pos       += ray_step;
+        float2 ray_uv  = view_to_uv(ray_pos);
+
+        if (!is_valid_uv(ray_uv))
+            break;
+
+        // check if the ray passed through the glass and hit geometry behind it
+        float depth_z     = get_linear_depth(ray_uv);
+        float depth_delta = ray_pos.z - depth_z;
+        if (depth_delta > 0.0f && depth_delta < g_refraction_thickness && depth_z > depth_transparent + 0.01f)
+            return ray_uv;
+
+        // early exit if the ray is too far from any surface
+        if (abs(depth_delta) > g_refraction_thickness * 10.0f && i > 4)
+            break;
+    }
+
+    return uv;
+}
+
+float shoreline_intersection_mask(
+    float2 render_uv,
+    float3 water_position,
+    float3 terrain_position
+)
+{
+    static const int2 offsets[8] =
+    {
+        int2(-3,  0),
+        int2( 3,  0),
+        int2( 0, -3),
+        int2( 0,  3),
+        int2(-3, -3),
+        int2( 3, -3),
+        int2(-3,  3),
+        int2( 3,  3)
+    };
+
+    uint output_width;
+    uint output_height;
+    tex4.GetDimensions(
+        output_width,
+        output_height
+    );
+    float2 output_resolution = float2(
+        output_width,
+        output_height
+    );
+    float2 screen_uv = render_uv_to_screen_uv(
+        render_uv
+    );
+
+    float intersection = 0.0f;
+    [unroll]
+    for (uint i = 0; i < 8; i++)
+    {
+        float2 sample_uv =
+            screen_uv +
+            float2(offsets[i]) /
+            output_resolution;
+        if (!is_valid_uv(sample_uv))
+        {
+            continue;
+        }
+
+        float depth_raw = tex4.SampleLevel(
+            samplers[sampler_point_clamp],
+            sample_uv,
+            0.0f
+        ).r;
+        if (depth_raw <= 1e-5f)
+        {
+            continue;
+        }
+
+        float3 neighbor_position = get_position(
+            depth_raw,
+            sample_uv
+        );
+        float crosses_surface = smoothstep(
+            water_position.y - 0.04f,
+            water_position.y + 0.08f,
+            neighbor_position.y
+        );
+        float horizontal_distance = length(
+            neighbor_position.xz -
+            terrain_position.xz
+        );
+        float is_local = 1.0f - smoothstep(
+            0.15f,
+            1.50f,
+            horizontal_distance
+        );
+        intersection = max(
+            intersection,
+            crosses_surface * is_local
+        );
+    }
+
+    return intersection;
+}
+
+[numthreads(THREAD_GROUP_COUNT_X, THREAD_GROUP_COUNT_Y, 1)]
+void main_cs(uint3 thread_id : SV_DispatchThreadID)
+{
+    float2 resolution_out;
+    tex_uav.GetDimensions(resolution_out.x, resolution_out.y);
+    float2 uv = (thread_id.xy + 0.5f) / resolution_out;
+
+    // cheap gbuffer probes before Surface.Build, most pixels are opaque and skip or take the add-only path
+    float4 sample_albedo   = tex_albedo.SampleLevel(samplers[sampler_point_clamp], uv, 0);
+    float  alpha           = sample_albedo.a;
+    if (alpha == 0.0f)
+    {
+        return; // sky
+    }
+
+    float4 sample_normal   = tex_normal.SampleLevel(samplers[sampler_point_clamp], uv, 0);
+    float4 sample_material = tex_material.SampleLevel(samplers[sampler_point_clamp], uv, 0);
+    MaterialParameters mat = material_parameters[uint(sample_normal.a)];
+    bool is_water_pixel    = (mat.flags & uint(1U << 13)) != 0;
+    bool is_glass_pixel    = alpha > 0.0f && alpha < 1.0f;
+
+    if (!is_water_pixel && !is_glass_pixel)
+    {
+        float coat = saturate(mat.clearcoat);
+        float reflection_roughness = lerp(sample_material.r, mat.clearcoat_roughness, coat);
+        if (reflection_roughness >= reflection_roughness_fade_end)
+        {
+            return;
+        }
+
+        float3 reflection = tex[thread_id.xy].rgb;
+        if (dot(reflection, reflection) < 1e-8f)
+        {
+            return;
+        }
+
+        // opaque add-only path, matches the bottom branch without ssao or refraction work
+        float  depth               = tex_depth.SampleLevel(samplers[sampler_point_clamp], uv, 0).r;
+        float3 position            = get_position(depth, render_uv_to_screen_uv(uv));
+        float3 camera_to_pixel     = normalize(position - get_camera_position());
+        float3 normal              = sample_normal.xyz;
+        float  n_dot_v             = saturate(dot(normal, -camera_to_pixel));
+        float2 brdf                = reflection_env_brdf(reflection_roughness, n_dot_v);
+        float3 albedo              = sample_albedo.rgb;
+        float  metallic            = sample_material.g;
+        float3 F0                  = lerp(0.04f, albedo, metallic);
+        float3 F0_brdf             = lerp(F0, float3(0.04f, 0.04f, 0.04f), coat);
+        float  roughness_fade      = 1.0f - smoothstep(reflection_roughness_fade_start, reflection_roughness_fade_end, reflection_roughness);
+        float3 specular_reflection = reflection * roughness_fade * (F0_brdf * brdf.x + brdf.y);
+        tex_uav[thread_id.xy]     += float4(specular_reflection, 0.0f);
+        return;
+    }
+
+    Surface surface;
+    surface.Build(thread_id.xy, resolution_out, true, false);
+
+    // fft ocean foam, the water color below is built purely from reflection and refraction so the diffuse
+    // foam written into the g-buffer never surfaces, it has to be injected here from the same cascade map
+    float foam = 0.0f;
+    if (surface.is_water() && buffer_frame.ocean_enabled > 0.5f)
+    {
+        // recover the undisplaced fft grid so foam sits on the crest that produced it
+        float2 grid_xz = get_ocean_grid_xz(surface.position.xz);
+        foam           = get_ocean_foam(grid_xz);
+
+        // contact foam, the opaque point behind this water pixel must sit right at the surface point in
+        // full 3d, a submerged wall seen through the water lies meters along the ray so it stays clean
+        float2 uv_foam          = (thread_id.xy + 0.5f) / resolution_out;
+        float2 uv_foam_screen   = render_uv_to_screen_uv(uv_foam);
+        float  depth_water      = linearize_depth(surface.depth);
+        float depth_opaque_raw = tex4.SampleLevel(
+            samplers[sampler_point_clamp],
+            uv_foam_screen,
+            0.0f
+        ).r;
+        float  depth_opaque     = linearize_depth(depth_opaque_raw);
+        if (depth_opaque > depth_water + 0.02f)
+        {
+            float3 opaque_pos = get_position(
+                depth_opaque_raw,
+                uv_foam_screen
+            );
+            float contact = saturate(
+                1.0f -
+                length(opaque_pos - surface.position) /
+                contact_foam_radius
+            );
+            float shoreline = shoreline_intersection_mask(
+                uv_foam,
+                surface.position,
+                opaque_pos
+            );
+            float contact_foam = contact * shoreline;
+            foam = saturate(max(foam, contact_foam));
+        }
+    }
+
+    // get background color
+    float3 background = tex2[thread_id.xy].rgb;
+    float3 refraction = background;
+    
+    // determine material IOR
+    float ior_material = surface.is_water() ? ior_water : max(surface.ior, 1.0001f);
+    
+    // compute view direction and angle
+    float3 view_dir_normalized = normalize(surface.camera_to_pixel);
+    float n_dot_v = saturate(dot(surface.normal, -view_dir_normalized));
+    
+    // compute Fresnel: F = reflection amount, (1-F) = refraction amount
+    float3 F = compute_dielectric_fresnel(n_dot_v, ior_air, ior_material);
+    
+    // compute refraction for transparent surfaces
+    if (surface.is_water() || surface.is_transparent())
+    {
+        float2 uv = (thread_id.xy + 0.5f) / resolution_out;
+        float depth_transparent = linearize_depth(surface.depth);
+        
+        // compute refracted direction
+        float3 refracted_dir = compute_refracted_dir(view_dir_normalized, surface.normal, ior_air, ior_material);
+        
+        // check for total internal reflection
+        if (dot(refracted_dir, refracted_dir) < 0.001f)
+        {
+            // total internal reflection: all light reflects, no refraction
+            refraction = background;
+            F = float3(1.0f, 1.0f, 1.0f);
+        }
+        else
+        {
+            if (surface.is_water())
+            {
+                // point sample, bilinear blends silhouette depths into values that land anywhere
+                float depth_background = linearize_depth(tex4.SampleLevel(samplers[sampler_point_clamp], uv, 0.0f).r);
+                // geometry in front leaking into this texel says nothing about the water column, a zero
+                // column shows the raw background as a bright halo, treat the column as deep instead
+                float thickness = depth_background > depth_transparent ? clamp(depth_background - depth_transparent, 0.0f, 10.0f) : 10.0f;
+
+                // a physically bent ray shifts the whole underwater image systematically in one direction,
+                // and wherever the shifted sample is unavailable in screen space the pixel has to fall back
+                // toward the straight view, a constant shift next to its own fallback reads as two copies of
+                // the object, so distort with the zero mean wave slope instead, the image wobbles around its
+                // true position and always stays one object, the offset still grows with the water column so
+                // it vanishes at the waterline and deeper content shimmers more
+                float2 offset = surface.normal.xz * 0.05f * saturate(thickness * 0.5f);
+
+                // the wobble can still land on geometry in front of the water, e.g. the part of a pillar
+                // above the surface, halve it until the sample is submerged, the offset is small so the
+                // collapse is invisible when it happens
+                float2 refracted_uv = uv;
+                float depth_shown   = depth_transparent + thickness;
+                float scale         = 1.0f;
+                [unroll]
+                for (int i = 0; i < 4; i++)
+                {
+                    float2 uv_try   = uv + offset * scale;
+                    float depth_try = linearize_depth(tex4.SampleLevel(samplers[sampler_bilinear_clamp], uv_try, 0.0f).r);
+                    if (depth_try > depth_transparent && all(uv_try == saturate(uv_try)))
+                    {
+                        refracted_uv = uv_try;
+                        depth_shown  = depth_try;
+                        break;
+                    }
+                    scale *= 0.5f;
+                }
+
+                // chromatic aberration along the refraction delta
+                float2 delta = refracted_uv - uv;
+                refraction.r = tex2.SampleLevel(samplers[sampler_bilinear_clamp], uv + delta * (1.0f + chromatic_aberration), 0.0f).r;
+                refraction.g = tex2.SampleLevel(samplers[sampler_bilinear_clamp], refracted_uv, 0.0f).g;
+                refraction.b = tex2.SampleLevel(samplers[sampler_bilinear_clamp], uv + delta * (1.0f - chromatic_aberration), 0.0f).b;
+
+                // the body color is an albedo, light it with the downwelling sun and the reflected sky, a constant radiance glows at night and reads black at noon
+                float3 downwelling   = get_sun_radiance() * saturate(-light_parameters[0].direction.y) * (1.0f / PI) + tex[thread_id.xy].rgb;
+                float3 body_radiance = ocean_scatter_albedo * downwelling;
+
+                // absorption follows the water column of the sample actually shown so brightness stays consistent with the offset chosen above
+                float water_depth = max(depth_shown - depth_transparent, 0.0f);
+
+                // warm the column where the visible water is thin, screen depth not the 25 m heightfield
+                float shallow = saturate(1.0f - water_depth / 2.4f);
+                shallow       = shallow * shallow;
+                body_radiance = lerp(
+                    body_radiance,
+                    body_radiance * float3(1.12f, 1.04f, 0.82f) + refraction * 0.12f,
+                    shallow * 0.65f
+                );
+                refraction = apply_water_absorption(refraction, water_depth, body_radiance);
+            }
+            else
+            {
+                float shell_thickness = max(surface.thickness, 0.001f);
+                float optical_path    = max(shell_thickness / max(n_dot_v, 0.15f), shell_thickness);
+
+                // thin-shell parallax, bend the background by the authored thickness even when the raymarch fails
+                float3 view_tangent = view_dir_normalized - surface.normal * dot(view_dir_normalized, surface.normal);
+                float2 parallax     = view_tangent.xz * (optical_path * glass_parallax_scale);
+                float2 uv_parallax  = uv + parallax;
+                if (!is_valid_uv(uv_parallax))
+                {
+                    uv_parallax = uv;
+                }
+
+                float2 refracted_uv = compute_refraction_uv(surface.position, refracted_dir, depth_transparent, uv_parallax);
+                if (dot(refracted_uv - uv_parallax, refracted_uv - uv_parallax) < 1e-10f)
+                {
+                    refracted_uv = uv_parallax;
+                }
+
+                float2 delta = refracted_uv - uv;
+
+                // dispersion, the ior rises toward blue so each channel bends by a slightly different amount
+                refraction.r = tex2.SampleLevel(samplers[sampler_bilinear_clamp], uv + delta * (1.0f - glass_dispersion), 0.0f).r;
+                refraction.g = tex2.SampleLevel(samplers[sampler_bilinear_clamp], refracted_uv, 0.0f).g;
+                refraction.b = tex2.SampleLevel(samplers[sampler_bilinear_clamp], uv + delta * (1.0f + glass_dispersion), 0.0f).b;
+
+                // frosted blur from roughness and authored thickness, screen depth is only an upper bound so thin windshields stay sharp
+                float depth_background = linearize_depth(tex4.SampleLevel(samplers[sampler_bilinear_clamp], refracted_uv, 0.0f).r);
+                float screen_thickness = clamp(depth_background - depth_transparent, 0.0f, 4.0f);
+                float blur_metric      = min(max(shell_thickness * 40.0f, screen_thickness * 0.25f), screen_thickness + shell_thickness * 20.0f);
+                float blur_radius      = min(surface.roughness_alpha * blur_metric / max(depth_transparent, 0.5f), 0.03f);
+                if (blur_radius > 0.0002f)
+                {
+                    // golden angle disc with a per pixel rotation, taa resolves the residual noise
+                    float  rotation = noise_interleaved_gradient(thread_id.xy) * PI2;
+                    float3 sum      = 0.0f;
+                    [unroll]
+                    for (uint t = 0; t < glass_frost_taps; t++)
+                    {
+                        float  angle  = (t + 0.5f) * 2.399963f + rotation;
+                        float  radius = blur_radius * sqrt((t + 0.5f) / glass_frost_taps);
+                        float2 tap_uv = refracted_uv + float2(cos(angle), sin(angle)) * radius;
+                        sum          += tex2.SampleLevel(samplers[sampler_bilinear_clamp], tap_uv, 0.0f).rgb;
+                    }
+                    refraction = sum / glass_frost_taps;
+                }
+
+                refraction = lerp(background, refraction, screen_fade(refracted_uv));
+            }
+        }
+    }
+    
+    // compute specular reflection using fresnel and brdf split sum
+    float3 reflection = tex[thread_id.xy].rgb;
+
+    // the tracer blends toward the clearcoat lobe on every surface, weigh with the same roughness
+    // and coat f0 or the split sum integrates a lobe that was never sampled
+    float  coat               = saturate(surface.clearcoat);
+    float  reflection_roughness = lerp(surface.roughness, surface.clearcoat_roughness, coat);
+    float2 brdf               = reflection_env_brdf(reflection_roughness, n_dot_v);
+
+    // transparent uses ior f0, opaque with clearcoat uses coat f0 0.04 because that is the lobe we traced
+    float  f0_dielectric = pow((ior_air - ior_material) / (ior_air + ior_material), 2.0f);
+    float3 F0_dielectric = float3(f0_dielectric, f0_dielectric, f0_dielectric);
+    float3 F0_opaque     = lerp(surface.F0, float3(0.04f, 0.04f, 0.04f), coat);
+    float3 F0_brdf       = (surface.is_water() || surface.is_transparent()) ? F0_dielectric : F0_opaque;
+
+    // fade out the mirror sharp reflection on rough surfaces, see band comment at top of file
+    float roughness_fade = 1.0f - smoothstep(reflection_roughness_fade_start, reflection_roughness_fade_end, reflection_roughness);
+    reflection          *= roughness_fade;
+
+    float3 specular_reflection = reflection * (F0_brdf * brdf.x + brdf.y);
+
+    if (surface.is_transparent() && !surface.is_water())
+    {
+        // pbr glass, fresnel can pick up a thin-film rainbow on clear panes, beer lambert uses absorption*thickness so alpha stays a soft coverage term
+        float3 F_glass           = glass_thin_film_fresnel(F, n_dot_v, surface.absorption);
+        float  shell_thickness   = max(surface.thickness, 0.001f);
+        float  optical_path      = max(shell_thickness / max(n_dot_v, 0.15f), shell_thickness);
+        float3 transmission_tint = pow(max(surface.albedo, 0.02f), max(surface.absorption, 0.0f) * optical_path * glass_absorption_scale);
+        float  coverage          = saturate(1.0f - surface.alpha * 0.25f);
+        float3 reflection_total  = tex_uav[thread_id.xy].rgb + specular_reflection;
+        float3 kT                = float3(1.0f, 1.0f, 1.0f) - F_glass;
+        float3 transmission      = refraction * kT * transmission_tint * coverage;
+        tex_uav[thread_id.xy]    = validate_output(float4(reflection_total + transmission, 1.0f));
+    }
+    else if (surface.is_water())
+    {
+        // water has no diffuse layer, light_composition zeroed it, so the column below the surface
+        // has to be transmitted in here, the frame only holds its analytic specular and fog
+        float3 kT            = float3(1.0f, 1.0f, 1.0f) - F;
+        float3 surface_color = specular_reflection + refraction * kT;
+        tex_uav[thread_id.xy] += float4(surface_color, 0.0f);
+    }
+    else
+    {
+        // an opaque pixel already holds its complete shading, so the traced lobe is the only thing
+        // missing, ibl zeroes its specular when rt reflections are on, adding the frame back in as a
+        // transmission term counted every opaque surface twice, auto exposure then halved the whole
+        // image and the reflection read as a faint tint on top of a washed out base
+        tex_uav[thread_id.xy] += float4(specular_reflection, 0.0f);
+    }
+
+    // overlay lit foam on top of the composited water, whitewater is a bright near-white lambertian cap so it
+    // must replace the reflection and refraction below rather than tint them, additive blending only desaturates the water
+    if (foam > 0.0f)
+    {
+        // whitewater receives the sun as a wrap-lit diffuse term plus the reflected sky as an ambient fill, near-white albedo
+        float  n_dot_l   = saturate(dot(surface.normal, -light_parameters[0].direction));
+        float3 sun_diff  = get_sun_radiance() * (n_dot_l * 0.5f + 0.5f) * (1.0f / PI);
+        float3 sky       = tex[thread_id.xy].rgb;
+        float3 incoming  = sun_diff + sky;
+
+        // keep some of the water colour so foam is a veil, not a coat of paint
+        float  luma       = luminance(incoming);
+        float3 foam_color = lerp(incoming, luma.xxx, 0.35f) * float3(0.96f, 0.97f, 1.0f) * 1.15f;
+
+        float3 base  = tex_uav[thread_id.xy].rgb;
+        float  cover = saturate(foam * 0.55f);
+        tex_uav[thread_id.xy].rgb = lerp(base, foam_color, cover);
+    }
+}

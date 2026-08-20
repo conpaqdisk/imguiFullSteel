@@ -1,0 +1,30 @@
+{
+  "BaseConfig": {
+    "Url": "file://config.base.json",
+    "IgnoredProperties": [ "IgnoredFunctions" ]
+  },
+  "Namespace": "Hexa.NET.ImGui",
+  "ApiName": "ImGui",
+  "LibName": "cimgui",
+  "GenerateConstants": false,
+  "GenerateEnums": false,
+  "GenerateExtensions": false,
+  "GenerateFunctions": true,
+  "GenerateTypes": false,
+  "GenerateHandles": false,
+  "GenerateDelegates": false,
+  "AllowedFunctions": [
+    "igInputText",
+    "igInputTextMultiline",
+    "igInputTextWithHint",
+    "igImFormatString",
+    "igImFormatStringV",
+    "igImParseFormatTrimDecorations",
+    "igImTextStrToUtf8",
+    "igImTextStrFromUtf8",
+    "igGetKeyChordName",
+    "igDataTypeFormatString",
+    "igInputTextEx",
+    "igTempInputText"
+  ]
+}

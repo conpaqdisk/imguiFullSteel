@@ -1,0 +1,16 @@
+{
+  "BaseConfig": {
+    "Url": "file://config.backends.base.json"
+  },
+  "Namespace": "Hexa.NET.ImGui.Backends",
+  "ApiName": "ImGuiBackends",
+  "LibName": "cimgui_impl",
+  "IgnoredEnums": [ "VkStructureType" ],
+  "TypeMappings": {
+    "VkPipelineRenderingCreateInfoKHR": "VkPipelineRenderingCreateInfo",
+    "VkStructureType": "uint",
+    "ImGui_ImplVulkanH_Frame": "ImGuiImplVulkanHFrame",
+    "ImGui_ImplVulkanH_FrameSemaphores": "ImGuiImplVulkanHFrameSemaphores",
+    "VkImageUsageFlagBits": "VkImageUsageFlags"
+  }
+}

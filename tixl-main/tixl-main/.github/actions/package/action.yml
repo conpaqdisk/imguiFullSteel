@@ -1,0 +1,13 @@
+name: "Publish"
+description: "Package installer with Inno Setup"
+runs:
+  using: "composite"
+  steps:
+  - name: Install innosetup
+    uses: crazy-max/ghaction-chocolatey@v3
+    with:
+      args: install innosetup
+
+  - name: Package Application
+    shell: pwsh
+    run: iscc Installer\installer.iss /DMyAppName=Tooll-v${{ github.event.release.tag_name }} /DMyAppVersion=${{ github.event.release.tag_name }}

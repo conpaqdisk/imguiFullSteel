@@ -1,0 +1,23 @@
+
+# directories
+/thirdparty/            @hoffstadt
+/scripts/               @hoffstadt
+/docs/*                 @hoffstadt
+
+# specific files
+/src/distribution.cmake @hoffstadt
+/src/embedded.cmake     @hoffstadt
+/src/CMakeLists.txt     @hoffstadt
+/src/.gitignore         @hoffstadt
+CMakeLists.txt          @hoffstadt
+CMakeSettings.json      @hoffstadt
+setup.py                @hoffstadt
+.gitattributes          @hoffstadt
+.gitignore              @hoffstadt
+.gitmodules             @hoffstadt
+.readthedocs.yaml       @hoffstadt
+
+# no owners
+README.md
+/docs/source/
+/assets

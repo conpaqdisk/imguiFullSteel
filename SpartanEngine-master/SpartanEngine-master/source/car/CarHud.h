@@ -1,0 +1,40 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+#pragma once
+
+namespace spartan
+{
+    class Car;
+    class Physics;
+
+    namespace car_hud
+    {
+        // always-on cockpit overlay anchored to the bottom of the viewport
+        void draw_driver_hud(Physics* physics);
+
+        // single scrollable telemetry funnel, p_open is bound to the toggle state
+        void draw_telemetry_window(Car* car, Physics* physics, bool* p_open);
+
+        // car bench window opened from the telemetry bench button
+        void draw_car_bench_window(Car* car, Physics* physics);
+    }
+}

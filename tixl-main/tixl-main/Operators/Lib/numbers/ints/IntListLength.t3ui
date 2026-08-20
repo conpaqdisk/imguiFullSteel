@@ -1,0 +1,24 @@
+{
+  "FormatVersion": 3,
+  "Id": "9a90890f-f5e2-4f96-9d6d-f5229f8b7531"/*IntListLength*/,
+  "Description": "Returns the number of elements in the connected int list.",
+  "InputUis": [
+    {
+      "InputId": "6acfd752-dbf6-409c-99a5-25fb684fe830"/*Input*/,
+      "Position": {
+        "X": -200.0,
+        "Y": 0.0
+      }
+    }
+  ],
+  "SymbolChildUis": [],
+  "OutputUis": [
+    {
+      "OutputId": "35bb296e-4056-4c32-91bf-86f63183fda7"/*Length*/,
+      "Position": {
+        "X": 300.0,
+        "Y": 200.0
+      }
+    }
+  ]
+}

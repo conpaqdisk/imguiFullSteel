@@ -1,0 +1,12 @@
+{
+  "BaseConfig": {
+    "Url": "file://config.backends.base.json",
+    "IgnoredProperties": [ "IgnoredFunctions" ]
+  },
+  "Namespace": "Hexa.NET.ImGui.Backends.GLFW",
+  "ApiName": "ImGuiImplGLFW",
+  "LibName": "cimgui_impl",
+  "Defines": [
+    "CIMGUI_USE_GLFW=1"
+  ]
+}

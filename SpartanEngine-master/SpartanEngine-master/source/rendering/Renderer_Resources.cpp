@@ -1,0 +1,1544 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES =============================
+#include "pch.h"
+#include "Window.h"
+#include "Renderer_Internal.h"
+#include "Material.h"
+#include "../geometry/Mesh.h"
+#include "../geometry/GeometryGeneration.h"
+#include "../world/components/Light.h"
+#include "../resource/ResourceCache.h"
+#include "../display/Display.h"
+#include "../rhi/RHI_Texture.h"
+#include "../rhi/RHI_Shader.h"
+#include "../rhi/RHI_Sampler.h"
+#include "../rhi/RHI_BlendState.h"
+#include "../rhi/RHI_RasterizerState.h"
+#include "../rhi/RHI_DepthStencilState.h"
+#include "../rhi/RHI_Buffer.h"
+#include "../rhi/RHI_Device.h"
+#include "../rhi/RHI_SyncPrimitive.h"
+#include "../profiling/Profiler.h"
+#include "../xr/Xr.h"
+#include "../core/ThreadPool.h"
+#include "../core/Debugging.h"
+#include <fstream>
+#ifdef _MSC_VER
+#include "../rhi/RHI_VendorTechnology.h"
+#endif
+//========================================
+
+//= NAMESPACES ===============
+using namespace std;
+using namespace spartan::math;
+//============================
+
+namespace spartan
+{
+    namespace
+    {
+        template<typename E, typename A>
+        auto& at(A& arr, E e) { return arr[static_cast<size_t>(e)]; }
+
+        // graphics states
+        array<shared_ptr<RHI_RasterizerState>, static_cast<uint32_t>(Renderer_RasterizerState::Max)>     rasterizer_states;
+        array<shared_ptr<RHI_DepthStencilState>, static_cast<uint32_t>(Renderer_DepthStencilState::Max)> depth_stencil_states;
+        array<shared_ptr<RHI_BlendState>, static_cast<uint32_t>(Renderer_BlendState::Max)>               blend_states;
+
+        // renderer resources
+        array<shared_ptr<RHI_Texture>, static_cast<uint32_t>(Renderer_RenderTarget::max)> render_targets;
+        array<shared_ptr<RHI_Shader>,  static_cast<uint32_t>(Renderer_Shader::max)>       shaders;
+        array<shared_ptr<RHI_Sampler>, static_cast<uint32_t>(Renderer_Sampler::Max)>      samplers;
+        array<shared_ptr<RHI_Buffer>,  static_cast<uint32_t>(Renderer_Buffer::Max)>       buffers;
+
+        // asset resources
+        array<shared_ptr<RHI_Texture>, static_cast<uint32_t>(Renderer_StandardTexture::Max)> standard_textures;
+        array<shared_ptr<Mesh>, static_cast<uint32_t>(MeshType::Max)>                        standard_meshes;
+        shared_ptr<Font>                                                                     standard_font;
+        shared_ptr<Material>                                                                 standard_material;
+
+        // five reservoirs across current, previous and spatial slots, the 5th slot holds the source g-buffer for brdf and jacobian
+        const uint32_t restir_reservoir_slot_count = restir_reservoir_textures * 3;
+
+        // visit every restir reservoir slot offset by index, fn signature is void(uint32_t i, Renderer_RenderTarget rt)
+        template<typename F>
+        void for_restir_reservoir_slot(F fn)
+        {
+            for (uint32_t i = 0; i < restir_reservoir_slot_count; i++)
+                fn(i, static_cast<Renderer_RenderTarget>(static_cast<uint32_t>(Renderer_RenderTarget::restir_reservoir0) + i));
+        }
+    }
+
+    void Renderer::CreateBuffers()
+    {
+        const bool capture_mode                  = Debugging::IsRenderdocEnabled();
+        const uint32_t indirect_draw_capacity    = capture_mode ? 32 * 1024 : renderer_max_indirect_draws;
+        const uint32_t cull_task_capacity        = capture_mode ? 2 * 1024 * 1024 : renderer_max_cull_tasks;
+        const uint32_t meshlet_instance_capacity = capture_mode ? 1024 * 1024 : renderer_max_meshlet_instances;
+        const uint32_t visible_triangle_capacity = capture_mode ? 8 * 1024 * 1024 : renderer_max_visible_triangles;
+
+        uint32_t element_count = renderer_draw_data_buffer_count;
+
+        // initialization values
+        uint32_t spd_counter_value = 0;
+        array<Instance, renderer_max_instance_count> identity;
+        identity.fill(Instance::GetIdentity());
+
+        at(buffers, Renderer_Buffer::ConstantFrame)      = make_shared<RHI_Buffer>(RHI_Buffer_Type::Constant, sizeof(Cb_Frame),                           element_count,                          nullptr,            true, "frame");
+        at(buffers, Renderer_Buffer::SpdCounter)         = make_shared<RHI_Buffer>(RHI_Buffer_Type::Storage,  static_cast<uint32_t>(sizeof(uint32_t)),    1,                                      &spd_counter_value, true, "spd_counter");
+        at(buffers, Renderer_Buffer::SpdCounterCompute)  = make_shared<RHI_Buffer>(RHI_Buffer_Type::Storage,  static_cast<uint32_t>(sizeof(uint32_t)),    1,                                      &spd_counter_value, true, "spd_counter_compute");
+        at(buffers, Renderer_Buffer::MaterialParameters) = make_shared<RHI_Buffer>(RHI_Buffer_Type::Storage,  static_cast<uint32_t>(sizeof(Sb_Material)), rhi_max_array_size,                     nullptr,            true, "materials");
+        at(buffers, Renderer_Buffer::LightParameters)    = make_shared<RHI_Buffer>(RHI_Buffer_Type::Storage,  static_cast<uint32_t>(sizeof(Sb_Light)),    rhi_max_array_size,                     nullptr,            true, "lights");
+        at(buffers, Renderer_Buffer::DummyInstance)      = make_shared<RHI_Buffer>(RHI_Buffer_Type::Instance, sizeof(Instance),                           static_cast<uint32_t>(identity.size()), &identity,          true, "dummy_instance_buffer");
+        at(buffers, Renderer_Buffer::GeometryInfo)       = make_shared<RHI_Buffer>(RHI_Buffer_Type::Storage,  static_cast<uint32_t>(sizeof(Sb_GeometryInfo)), rhi_max_array_size,                     nullptr,            true, "geometry_info");
+
+        // one buffer for every frame, each writes its own offset region so the bindless descriptors never change under in-flight commands
+        at(buffers, Renderer_Buffer::DrawData) = make_shared<RHI_Buffer>(
+            RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(Sb_DrawData)),
+            renderer_max_draw_calls * renderer_draw_data_buffer_count, nullptr, true,
+            "draw_data"
+        );
+        at(buffers, Renderer_Buffer::AABBs) = make_shared<RHI_Buffer>(
+            RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(Sb_Aabb)),
+            rhi_max_array_size * renderer_draw_data_buffer_count, nullptr, true,
+            "aabbs"
+        );
+
+        // per-frame rotated buffers
+        for (uint32_t i = 0; i < renderer_draw_data_buffer_count; i++)
+        {
+            FrameResource& fr = m_frame_resources[i];
+
+            // two-slot args buffer for the final non-indexed indirect draws, slot 0 opaque slot 1 alpha-tested
+            // vertex_count of each slot is bumped atomically by the triangle cull pass for its half of the survivor list
+            fr.indirect_draw_args = make_shared<RHI_Buffer>(
+                RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(Sb_IndirectDrawArgs)),
+                2, nullptr, true,
+                (string("indirect_draw_args_") + to_string(i)).c_str()
+            );
+
+            fr.cpu_indirect_draw_args = make_shared<RHI_Buffer>(
+                RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(Sb_IndirectDrawArgs)),
+                renderer_max_cpu_indirect_draws, nullptr, true,
+                (string("cpu_indirect_draw_args_") + to_string(i)).c_str()
+            );
+
+            fr.indirect_draw_data = make_shared<RHI_Buffer>(
+                RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(Sb_DrawData)),
+                indirect_draw_capacity, nullptr, true,
+                (string("indirect_draw_data_") + to_string(i)).c_str()
+            );
+
+            // meshlet-cull survivors, gpu-only (compute writes, vs reads), keep it off the host-visible heap
+            fr.meshlet_instances = make_shared<RHI_Buffer>(
+                RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(Sb_MeshletInstance)),
+                meshlet_instance_capacity, nullptr, false,
+                (string("meshlet_instances_") + to_string(i)).c_str()
+            );
+
+            // triangle-cull survivors, gpu-only and the largest of the cull buffers, must not land in bar memory
+            fr.visible_triangles = make_shared<RHI_Buffer>(
+                RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(uint32_t)),
+                visible_triangle_capacity, nullptr, false,
+                (string("visible_triangles_") + to_string(i)).c_str()
+            );
+
+            // single-slot for vs triangle cull, two-slot for mesh path (0 opaque, 1 alpha)
+            fr.triangle_dispatch_args = make_shared<RHI_Buffer>(
+                RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(Sb_IndirectDispatchArgs)),
+                2, nullptr, true,
+                (string("triangle_dispatch_args_") + to_string(i)).c_str()
+            );
+
+            fr.cull_tasks = make_shared<RHI_Buffer>(
+                RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(Sb_CullTask)),
+                cull_task_capacity, nullptr, true,
+                (string("cull_tasks_") + to_string(i)).c_str()
+            );
+
+            // phase a survivors, gpu-only (compute writes, phase b reads), one entry per visible instance
+            fr.surviving_instances = make_shared<RHI_Buffer>(
+                RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(Sb_SurvivingInstance)),
+                cull_task_capacity, nullptr, false,
+                (string("surviving_instances_") + to_string(i)).c_str()
+            );
+
+            // single-slot indirect dispatch args for the meshlet cull pass, group_count_x is bumped atomically by the instance cull
+            fr.instance_dispatch_args = make_shared<RHI_Buffer>(
+                RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(Sb_IndirectDispatchArgs)),
+                1, nullptr, true,
+                (string("instance_dispatch_args_") + to_string(i)).c_str()
+            );
+        }
+
+        // point the active buffer slots at frame 0
+        const FrameResource& fr = m_frame_resources[0];
+        at(buffers, Renderer_Buffer::IndirectDrawArgs)     = fr.indirect_draw_args;
+        at(buffers, Renderer_Buffer::CpuIndirectDrawArgs)  = fr.cpu_indirect_draw_args;
+        at(buffers, Renderer_Buffer::IndirectDrawData)     = fr.indirect_draw_data;
+        at(buffers, Renderer_Buffer::MeshletInstances)     = fr.meshlet_instances;
+        at(buffers, Renderer_Buffer::VisibleTriangles)     = fr.visible_triangles;
+        at(buffers, Renderer_Buffer::TriangleDispatchArgs) = fr.triangle_dispatch_args;
+        at(buffers, Renderer_Buffer::CullTasks)            = fr.cull_tasks;
+        at(buffers, Renderer_Buffer::SurvivingInstances)   = fr.surviving_instances;
+        at(buffers, Renderer_Buffer::InstanceDispatchArgs) = fr.instance_dispatch_args;
+
+        // grid holds (first_index, count) per cluster, one grid serves both vr eyes since they diverge by well under a tile
+        at(buffers, Renderer_Buffer::ClusterLightGrid) = make_shared<RHI_Buffer>(
+            RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(uint32_t) * 2),
+            CLUSTER_COUNT_TOTAL, nullptr, false, "cluster_light_grid"
+        );
+        at(buffers, Renderer_Buffer::ClusterLightIndices) = make_shared<RHI_Buffer>(
+            RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(uint32_t)),
+            CLUSTER_COUNT_TOTAL * CLUSTER_MAX_LIGHTS, nullptr, false, "cluster_light_indices"
+        );
+
+        // one overflow counter bumped when a cluster exceeds CLUSTER_MAX_LIGHTS, host visible for editor telemetry
+        at(buffers, Renderer_Buffer::ClusterStats) = make_shared<RHI_Buffer>(
+            RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(uint32_t)),
+            1, nullptr, true, "cluster_stats"
+        );
+
+        // rebuilt each frame from every emissive material, capped at restir_emissive_tri_max to bound the cpu walk
+        at(buffers, Renderer_Buffer::EmissiveTriangles) = make_shared<RHI_Buffer>(
+            RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(Sb_EmissiveTriangle)),
+            restir_emissive_tri_max, nullptr, true, "emissive_triangles"
+        );
+
+        // three concatenated tileable pairing tables, uploaded once when the restir reservoirs initialize
+        at(buffers, Renderer_Buffer::RestirPairing) = make_shared<RHI_Buffer>(
+            RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(uint32_t)),
+            restir_pairing_element_count, nullptr, true, "restir_pairing"
+        );
+
+        // volumetric light index list, compact list of light slot indices with the volumetric flag set
+        // built each frame on the cpu in UpdateLights, scanned per pixel by the volumetric fog loop
+        at(buffers, Renderer_Buffer::VolumetricLightIndices) = make_shared<RHI_Buffer>(
+            RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(uint32_t)),
+            rhi_max_array_size, nullptr, true, "volumetric_light_indices"
+        );
+
+        // gpu displacement cache for buoyancy
+        at(buffers, Renderer_Buffer::OceanHeights) = make_shared<RHI_Buffer>(
+            RHI_Buffer_Type::Storage,
+            static_cast<uint32_t>(sizeof(Vector4)),
+            renderer_ocean_heights_resolution *
+            renderer_ocean_heights_resolution *
+            renderer_ocean_max_cascades,
+            nullptr,
+            false,
+            "ocean_heights"
+        );
+        // zero before the first gpu write
+        {
+            RHI_Buffer* ocean_heights = at(buffers, Renderer_Buffer::OceanHeights).get();
+            if (void* mapped = ocean_heights->GetMappedData())
+            {
+                memset(mapped, 0, ocean_heights->GetObjectSize());
+            }
+            else
+            {
+                vector<uint8_t> zeros(ocean_heights->GetObjectSize(), 0);
+                ocean_heights->UploadSubRegion(zeros.data(), 0, zeros.size());
+            }
+        }
+        static_assert(
+            renderer_draw_data_buffer_count == 4
+        );
+        for (
+            uint32_t i = 0;
+            i < renderer_draw_data_buffer_count;
+            i++
+        )
+        {
+            Renderer_Buffer type = static_cast<Renderer_Buffer>(
+                static_cast<uint32_t>(
+                    Renderer_Buffer::OceanHeightsReadback0
+                ) +
+                i
+            );
+            at(buffers, type) = make_shared<RHI_Buffer>(
+                RHI_Buffer_Type::Readback,
+                static_cast<uint32_t>(sizeof(Vector4)),
+                renderer_ocean_heights_resolution *
+                renderer_ocean_heights_resolution *
+                renderer_ocean_max_cascades,
+                nullptr,
+                true,
+                "ocean_heights_readback"
+            );
+            if (void* mapped = at(buffers, type)->GetMappedData())
+            {
+                memset(
+                    mapped,
+                    0,
+                    at(buffers, type)->GetObjectSize()
+                );
+            }
+        }
+
+        // particle buffers
+        const uint32_t particle_max = 100000;
+        const uint32_t particle_counter_max = 64;
+        uint32_t particle_counter_init[particle_counter_max] = {};
+        at(buffers, Renderer_Buffer::ParticleBufferA) = make_shared<RHI_Buffer>(RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(Sb_Particle)),       particle_max, nullptr,                true, "particle_buffer_a");
+        at(buffers, Renderer_Buffer::ParticleCounter) = make_shared<RHI_Buffer>(RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(uint32_t)),          particle_counter_max, particle_counter_init, true, "particle_counter");
+        const uint32_t particle_emitter_max = 64; // upper bound on simultaneously rendered emitters
+        at(buffers, Renderer_Buffer::ParticleEmitter) = make_shared<RHI_Buffer>(RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(Sb_EmitterParams)),  particle_emitter_max, nullptr,           true, "particle_emitter");
+        const uint32_t particle_volume_voxel_count = renderer_particle_volume_width * renderer_particle_volume_height * renderer_particle_volume_depth;
+        at(buffers, Renderer_Buffer::ParticleVolumeDensity) = make_shared<RHI_Buffer>(RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(uint32_t)), particle_volume_voxel_count, nullptr, false, "particle_volume_density");
+        at(buffers, Renderer_Buffer::ParticleVolumeColor)   = make_shared<RHI_Buffer>(RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(uint32_t)), particle_volume_voxel_count * 3, nullptr, false, "particle_volume_color");
+
+        // GrassInstance keeps full float xyz, the shared packed format quantizes distant positions onto a visible lattice
+        at(buffers, Renderer_Buffer::GrassInstances) = make_shared<RHI_Buffer>(
+            RHI_Buffer_Type::Instance, static_cast<uint32_t>(sizeof(Sb_GrassInstance)),
+            renderer_max_grass_instances, nullptr, false, "grass_instances"
+        );
+        at(buffers, Renderer_Buffer::GrassCount) = make_shared<RHI_Buffer>(
+            RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(uint32_t)),
+            renderer_max_grass_lod_count, nullptr, true, "grass_count"
+        );
+        at(buffers, Renderer_Buffer::GrassIndirectArgs) = make_shared<RHI_Buffer>(
+            RHI_Buffer_Type::Storage, static_cast<uint32_t>(sizeof(Sb_IndirectDrawArgs)),
+            renderer_max_grass_lod_count, nullptr, true, "grass_indirect_args"
+        );
+    }
+
+    void Renderer::CreateDepthStencilStates()
+    {
+        // arguments: depth_test, depth_write, depth_function, stencil_test, stencil_write, stencil_function
+        at(depth_stencil_states, Renderer_DepthStencilState::Off)              = make_shared<RHI_DepthStencilState>(false, false, RHI_Comparison_Function::Never);
+        at(depth_stencil_states, Renderer_DepthStencilState::ReadEqual)        = make_shared<RHI_DepthStencilState>(true,  false, RHI_Comparison_Function::Equal);
+        at(depth_stencil_states, Renderer_DepthStencilState::ReadGreaterEqual) = make_shared<RHI_DepthStencilState>(true,  false, RHI_Comparison_Function::GreaterEqual);
+        at(depth_stencil_states, Renderer_DepthStencilState::ReadWrite)        = make_shared<RHI_DepthStencilState>(true,  true,  RHI_Comparison_Function::GreaterEqual);
+    }
+
+    void Renderer::CreateRasterizerStates()
+    {
+        // bias is done in the shader, hw bias is uncontrollable across cascades
+        const float line_width = 3.0f;
+
+        //                                                                                                  fill mode,             depth clip, bias, bias clamp, slope scaled bias, line width
+        at(rasterizer_states, Renderer_RasterizerState::Solid)             = make_shared<RHI_RasterizerState>(RHI_PolygonMode::Solid,     true,  0.0f, 0.0f, 0.0f, line_width);
+        at(rasterizer_states, Renderer_RasterizerState::Wireframe)         = make_shared<RHI_RasterizerState>(RHI_PolygonMode::Wireframe, true,  0.0f, 0.0f, 0.0f, line_width);
+        at(rasterizer_states, Renderer_RasterizerState::Light_point_spot)  = make_shared<RHI_RasterizerState>(RHI_PolygonMode::Solid,     true,  0.0f, 0.0f, 0.0f, line_width);
+        at(rasterizer_states, Renderer_RasterizerState::Light_directional) = make_shared<RHI_RasterizerState>(RHI_PolygonMode::Solid,     false, 0.0f, 0.0f, 0.0f, line_width);
+    }
+
+    void Renderer::CreateBlendStates()
+    {
+        // blend_enabled, source_blend, dest_blend, blend_op, source_blend_alpha, dest_blend_alpha, blend_op_alpha, blend_factor
+        at(blend_states, Renderer_BlendState::Off)           = make_shared<RHI_BlendState>(false);
+        at(blend_states, Renderer_BlendState::Alpha)         = make_shared<RHI_BlendState>(true, RHI_Blend::Src_Alpha, RHI_Blend::Inv_Src_Alpha, RHI_Blend_Operation::Add, RHI_Blend::One, RHI_Blend::One, RHI_Blend_Operation::Add, 0.0f);
+        at(blend_states, Renderer_BlendState::Premultiplied) = make_shared<RHI_BlendState>(true, RHI_Blend::One,       RHI_Blend::Inv_Src_Alpha, RHI_Blend_Operation::Add, RHI_Blend::One, RHI_Blend::One, RHI_Blend_Operation::Add, 0.0f);
+        at(blend_states, Renderer_BlendState::Additive)      = make_shared<RHI_BlendState>(true, RHI_Blend::One,       RHI_Blend::One,           RHI_Blend_Operation::Add, RHI_Blend::One, RHI_Blend::One, RHI_Blend_Operation::Add, 1.0f);
+    }
+
+    void Renderer::CreateSamplers()
+    {
+        auto create_sampler = [](Renderer_Sampler type, RHI_Filter filter_min, RHI_Filter filter_mag, RHI_Filter filter_mip,
+            RHI_Sampler_Address_Mode address_mode, RHI_Comparison_Function comparison_func, float anisotropy, bool comparison_enabled, float mip_bias)
+        {
+            at(samplers, type) = make_shared<RHI_Sampler>(filter_min, filter_mag, filter_mip, address_mode, comparison_func, anisotropy, comparison_enabled, mip_bias);
+        };
+
+        // non anisotropic
+        {
+            static bool samplers_created = false;
+            if (!samplers_created)
+            {
+                create_sampler(Renderer_Sampler::Compare_depth,         RHI_Filter::Linear,  RHI_Filter::Linear,  RHI_Filter::Nearest, RHI_Sampler_Address_Mode::ClampToZero, RHI_Comparison_Function::Greater, 0.0f, true,  0.0f); // reverse-z
+                create_sampler(Renderer_Sampler::Point_clamp_edge,      RHI_Filter::Nearest, RHI_Filter::Nearest, RHI_Filter::Nearest, RHI_Sampler_Address_Mode::Clamp,       RHI_Comparison_Function::Never,   0.0f, false, 0.0f);
+                create_sampler(Renderer_Sampler::Point_clamp_border,    RHI_Filter::Nearest, RHI_Filter::Nearest, RHI_Filter::Nearest, RHI_Sampler_Address_Mode::ClampToZero, RHI_Comparison_Function::Never,   0.0f, false, 0.0f);
+                create_sampler(Renderer_Sampler::Point_wrap,            RHI_Filter::Nearest, RHI_Filter::Nearest, RHI_Filter::Nearest, RHI_Sampler_Address_Mode::Wrap,        RHI_Comparison_Function::Never,   0.0f, false, 0.0f);
+                create_sampler(Renderer_Sampler::Bilinear_clamp_edge,   RHI_Filter::Linear,  RHI_Filter::Linear,  RHI_Filter::Nearest, RHI_Sampler_Address_Mode::Clamp,       RHI_Comparison_Function::Never,   0.0f, false, 0.0f);
+                create_sampler(Renderer_Sampler::Bilinear_clamp_border, RHI_Filter::Linear,  RHI_Filter::Linear,  RHI_Filter::Nearest, RHI_Sampler_Address_Mode::ClampToZero, RHI_Comparison_Function::Never,   0.0f, false, 0.0f);
+                create_sampler(Renderer_Sampler::Bilinear_wrap,         RHI_Filter::Linear,  RHI_Filter::Linear,  RHI_Filter::Nearest, RHI_Sampler_Address_Mode::Wrap,        RHI_Comparison_Function::Never,   0.0f, false, 0.0f);
+                create_sampler(Renderer_Sampler::Trilinear_clamp,       RHI_Filter::Linear,  RHI_Filter::Linear,  RHI_Filter::Linear,  RHI_Sampler_Address_Mode::Clamp,       RHI_Comparison_Function::Never,   0.0f, false, 0.0f);
+
+                samplers_created = true;
+            }
+        }
+
+        // anisotropic (negative mip bias when upscaling to keep textures sharp)
+        {
+            float mip_bias_new = 0.0f;
+            if (GetResolutionOutput().x > GetResolutionRender().x)
+            {
+                mip_bias_new = log2(GetResolutionRender().x / GetResolutionOutput().x) - 1.0f;
+            }
+
+            static float mip_bias = numeric_limits<float>::max();
+            if (mip_bias_new != mip_bias)
+            {
+                mip_bias         = mip_bias_new;
+                float anisotropy = cvar_anisotropy.GetValue();
+                create_sampler(Renderer_Sampler::Anisotropic_wrap, RHI_Filter::Linear, RHI_Filter::Linear, RHI_Filter::Linear, RHI_Sampler_Address_Mode::Wrap, RHI_Comparison_Function::Always, anisotropy, false, mip_bias);
+            }
+        }
+
+        m_bindless_samplers_dirty = true;
+    }
+
+    void Renderer::UpdateOptionalRenderTargets()
+    {
+        uint32_t width  = static_cast<uint32_t>(GetResolutionRender().x);
+        uint32_t height = static_cast<uint32_t>(GetResolutionRender().y);
+        uint32_t flags  = RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ClearBlit | RHI_Texture_ConcurrentSharing;
+
+        // ssao
+        bool need_ssao = cvar_ssao.GetValueAs<bool>();
+        if (need_ssao)
+        {
+            if (!at(render_targets, Renderer_RenderTarget::ssao))
+            {
+                at(render_targets, Renderer_RenderTarget::ssao) = make_shared<RHI_Texture>(
+                    RHI_Texture_Type::Type2D,
+                    width,
+                    height,
+                    1,
+                    1,
+                    RHI_Format::R16G16B16A16_Float,
+                    flags,
+                    "ssao"
+                );
+            }
+            if (!at(render_targets, Renderer_RenderTarget::ssao_history_0))
+            {
+                at(render_targets, Renderer_RenderTarget::ssao_history_0) = make_shared<RHI_Texture>(
+                    RHI_Texture_Type::Type2D,
+                    width,
+                    height,
+                    1,
+                    1,
+                    RHI_Format::R16G16B16A16_Float,
+                    flags,
+                    "ssao_history_0"
+                );
+                at(render_targets, Renderer_RenderTarget::ssao_history_1) = make_shared<RHI_Texture>(
+                    RHI_Texture_Type::Type2D,
+                    width,
+                    height,
+                    1,
+                    1,
+                    RHI_Format::R16G16B16A16_Float,
+                    flags,
+                    "ssao_history_1"
+                );
+                m_pass_state.ssao_history.Reset();
+            }
+        }
+        else if (at(render_targets, Renderer_RenderTarget::ssao))
+        {
+            at(render_targets, Renderer_RenderTarget::ssao)           = nullptr;
+            at(render_targets, Renderer_RenderTarget::ssao_history_0) = nullptr;
+            at(render_targets, Renderer_RenderTarget::ssao_history_1) = nullptr;
+            m_pass_state.ssao_history.Reset();
+        }
+        
+        // ray traced reflections gbuffer, concurrent sharing so rt reflections can run on the compute queue
+        bool need_rt_reflections = cvar_ray_traced_reflections.GetValueAs<bool>() && RHI_Device::IsSupportedRayTracing();
+        if (need_rt_reflections && !at(render_targets, Renderer_RenderTarget::gbuffer_reflections_position))
+        {
+            at(render_targets, Renderer_RenderTarget::gbuffer_reflections_position) = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width, height, 1, 1, RHI_Format::R32G32B32A32_Float, flags, "gbuffer_reflections_position");
+            at(render_targets, Renderer_RenderTarget::gbuffer_reflections_normal)   = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width, height, 1, 1, RHI_Format::R16G16B16A16_Float, flags, "gbuffer_reflections_normal");
+            at(render_targets, Renderer_RenderTarget::gbuffer_reflections_albedo)   = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width, height, 1, 1, RHI_Format::R8G8B8A8_Unorm,     flags, "gbuffer_reflections_albedo");
+        }
+        else if (!need_rt_reflections && at(render_targets, Renderer_RenderTarget::gbuffer_reflections_position))
+        {
+            at(render_targets, Renderer_RenderTarget::gbuffer_reflections_position) = nullptr;
+            at(render_targets, Renderer_RenderTarget::gbuffer_reflections_normal)   = nullptr;
+            at(render_targets, Renderer_RenderTarget::gbuffer_reflections_albedo)   = nullptr;
+        }
+        
+        // restir, allocate or free both the reservoirs and the output ring together so the feature is fully on or fully off
+        bool need_restir          = cvar_restir_pt.GetValueAs<bool>() && RHI_Device::IsSupportedRayTracing();
+        float restir_scale        = cvar_restir_pt_scale.GetValue();
+        static float last_restir_scale = -1.0f;
+        bool restir_scale_changed = need_restir && at(render_targets, Renderer_RenderTarget::restir_reservoir0) && (last_restir_scale != restir_scale);
+
+        auto release_restir_resources = [&]()
+        {
+            for_restir_reservoir_slot([&](uint32_t, Renderer_RenderTarget rt) { at(render_targets, rt) = nullptr; });
+            at(render_targets, Renderer_RenderTarget::restir_shift0)                   = nullptr;
+            at(render_targets, Renderer_RenderTarget::restir_shift1)                   = nullptr;
+            at(render_targets, Renderer_RenderTarget::restir_shift2)                   = nullptr;
+            at(render_targets, Renderer_RenderTarget::restir_output)                   = nullptr;
+            at(render_targets, Renderer_RenderTarget::restir_duplication)              = nullptr;
+            at(render_targets, Renderer_RenderTarget::restir_denoised)                 = nullptr;
+            at(render_targets, Renderer_RenderTarget::nrd_in_mv)                       = nullptr;
+            at(render_targets, Renderer_RenderTarget::nrd_in_normal_roughness)         = nullptr;
+            at(render_targets, Renderer_RenderTarget::nrd_in_viewz)                    = nullptr;
+            at(render_targets, Renderer_RenderTarget::nrd_in_diff_radiance)            = nullptr;
+            at(render_targets, Renderer_RenderTarget::nrd_out_diff_radiance)           = nullptr;
+        };
+
+        auto allocate_restir_resources = [&]()
+        {
+            uint32_t restir_width  = max(static_cast<uint32_t>(width * restir_scale), renderer_resolution_restir_min);
+            uint32_t restir_height = max(static_cast<uint32_t>(height * restir_scale), renderer_resolution_restir_min);
+            uint32_t restir_flags  = flags | RHI_Texture_ConcurrentSharing;
+
+            static const char* reservoir_names[] =
+            {
+                "restir_reservoir0",         "restir_reservoir1",         "restir_reservoir2",         "restir_reservoir3",         "restir_reservoir4",
+                "restir_reservoir_prev0",    "restir_reservoir_prev1",    "restir_reservoir_prev2",    "restir_reservoir_prev3",    "restir_reservoir_prev4",
+                "restir_reservoir_spatial0", "restir_reservoir_spatial1", "restir_reservoir_spatial2", "restir_reservoir_spatial3", "restir_reservoir_spatial4",
+            };
+            for_restir_reservoir_slot([&](uint32_t i, Renderer_RenderTarget rt)
+            {
+                at(render_targets, rt) = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, restir_width, restir_height, 1, 1, RHI_Format::R32G32B32A32_Float, restir_flags, reservoir_names[i]);
+            });
+            // paired spatial reuse shift results, rgb = f_dst, a = jacobian, lin 2026 3
+            at(render_targets, Renderer_RenderTarget::restir_shift0)                   = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, restir_width, restir_height, 1, 1, RHI_Format::R16G16B16A16_Float, restir_flags, "restir_shift0");
+            at(render_targets, Renderer_RenderTarget::restir_shift1)                   = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, restir_width, restir_height, 1, 1, RHI_Format::R16G16B16A16_Float, restir_flags, "restir_shift1");
+            at(render_targets, Renderer_RenderTarget::restir_shift2)                   = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, restir_width, restir_height, 1, 1, RHI_Format::R16G16B16A16_Float, restir_flags, "restir_shift2");
+            at(render_targets, Renderer_RenderTarget::restir_output)                   = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, restir_width, restir_height, 1, 1, RHI_Format::R16G16B16A16_Float, restir_flags, "restir_output");
+            at(render_targets, Renderer_RenderTarget::restir_duplication)              = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, restir_width, restir_height, 1, 1, RHI_Format::R8_Unorm,           restir_flags, "restir_duplication");
+            at(render_targets, Renderer_RenderTarget::restir_denoised)                 = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, restir_width, restir_height, 1, 1, RHI_Format::R16G16B16A16_Float, restir_flags, "restir_denoised");
+            at(render_targets, Renderer_RenderTarget::nrd_in_mv)                       = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, restir_width, restir_height, 1, 1, RHI_Format::R16G16B16A16_Float, restir_flags, "nrd_in_mv");
+            at(render_targets, Renderer_RenderTarget::nrd_in_normal_roughness)         = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, restir_width, restir_height, 1, 1, RHI_Format::R10G10B10A2_Unorm, restir_flags, "nrd_in_normal_roughness");
+            at(render_targets, Renderer_RenderTarget::nrd_in_viewz)                    = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, restir_width, restir_height, 1, 1, RHI_Format::R32_Float,         restir_flags, "nrd_in_viewz");
+            at(render_targets, Renderer_RenderTarget::nrd_in_diff_radiance)            = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, restir_width, restir_height, 1, 1, RHI_Format::R16G16B16A16_Float, restir_flags, "nrd_in_diff_radiance");
+            at(render_targets, Renderer_RenderTarget::nrd_out_diff_radiance)           = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, restir_width, restir_height, 1, 1, RHI_Format::R16G16B16A16_Float, restir_flags, "nrd_out_diff_radiance");
+
+            last_restir_scale = restir_scale;
+        };
+
+        if (restir_scale_changed)
+        {
+            release_restir_resources();
+            allocate_restir_resources();
+            m_pass_state.restir_reservoirs_initialized = false;
+        }
+        else if (need_restir && !at(render_targets, Renderer_RenderTarget::restir_reservoir0))
+        {
+            allocate_restir_resources();
+            m_pass_state.restir_reservoirs_initialized = false;
+        }
+        else if (!need_restir && at(render_targets, Renderer_RenderTarget::restir_reservoir0))
+        {
+            release_restir_resources();
+            last_restir_scale = -1.0f;
+            m_pass_state.restir_reservoirs_initialized = false;
+        }
+    }
+
+    void Renderer::CreateRenderTargets(const bool create_render, const bool create_output, const bool create_dynamic)
+    {
+        // release old render targets before allocating replacements
+        if (create_render)
+        {
+            at(render_targets, Renderer_RenderTarget::frame_render)                = nullptr;
+            at(render_targets, Renderer_RenderTarget::frame_render_opaque)         = nullptr;
+            at(render_targets, Renderer_RenderTarget::gbuffer_color)               = nullptr;
+            at(render_targets, Renderer_RenderTarget::gbuffer_normal)              = nullptr;
+            at(render_targets, Renderer_RenderTarget::gbuffer_normal_previous)     = nullptr;
+            at(render_targets, Renderer_RenderTarget::gbuffer_material)            = nullptr;
+            at(render_targets, Renderer_RenderTarget::gbuffer_velocity)            = nullptr;
+            at(render_targets, Renderer_RenderTarget::gbuffer_depth)               = nullptr;
+            at(render_targets, Renderer_RenderTarget::gbuffer_depth_previous)      = nullptr;
+            at(render_targets, Renderer_RenderTarget::light_diffuse)               = nullptr;
+            at(render_targets, Renderer_RenderTarget::light_specular)              = nullptr;
+            at(render_targets, Renderer_RenderTarget::particle_volume)             = nullptr;
+            at(render_targets, Renderer_RenderTarget::cloud_raw)                   = nullptr;
+            at(render_targets, Renderer_RenderTarget::cloud_raw_distance)          = nullptr;
+            at(render_targets, Renderer_RenderTarget::cloud_resolved_0)            = nullptr;
+            at(render_targets, Renderer_RenderTarget::cloud_resolved_distance_0)   = nullptr;
+            at(render_targets, Renderer_RenderTarget::cloud_resolved_1)            = nullptr;
+            at(render_targets, Renderer_RenderTarget::cloud_resolved_distance_1)   = nullptr;
+            at(render_targets, Renderer_RenderTarget::cloud_composite)             = nullptr;
+            at(render_targets, Renderer_RenderTarget::cloud_velocity)              = nullptr;
+            at(render_targets, Renderer_RenderTarget::gbuffer_depth_occluders)     = nullptr;
+            at(render_targets, Renderer_RenderTarget::gbuffer_depth_occluders_hiz) = nullptr;
+            at(render_targets, Renderer_RenderTarget::sss)                         = nullptr;
+            at(render_targets, Renderer_RenderTarget::ssao)                        = nullptr;
+            at(render_targets, Renderer_RenderTarget::ssao_history_0)              = nullptr;
+            at(render_targets, Renderer_RenderTarget::ssao_history_1)              = nullptr;
+            at(render_targets, Renderer_RenderTarget::reflections)                 = nullptr;
+            at(render_targets, Renderer_RenderTarget::gbuffer_reflections_position)= nullptr;
+            at(render_targets, Renderer_RenderTarget::gbuffer_reflections_normal)  = nullptr;
+            at(render_targets, Renderer_RenderTarget::gbuffer_reflections_albedo)  = nullptr;
+            at(render_targets, Renderer_RenderTarget::ray_traced_shadows)             = nullptr;
+            at(render_targets, Renderer_RenderTarget::ray_traced_shadows_local)       = nullptr;
+            at(render_targets, Renderer_RenderTarget::restir_output)                   = nullptr;
+            at(render_targets, Renderer_RenderTarget::restir_shift0)                   = nullptr;
+            at(render_targets, Renderer_RenderTarget::restir_shift1)                   = nullptr;
+            at(render_targets, Renderer_RenderTarget::restir_shift2)                   = nullptr;
+            at(render_targets, Renderer_RenderTarget::restir_duplication)              = nullptr;
+            at(render_targets, Renderer_RenderTarget::restir_denoised)                 = nullptr;
+            at(render_targets, Renderer_RenderTarget::nrd_in_mv)                       = nullptr;
+            at(render_targets, Renderer_RenderTarget::nrd_in_normal_roughness)         = nullptr;
+            at(render_targets, Renderer_RenderTarget::nrd_in_viewz)                    = nullptr;
+            at(render_targets, Renderer_RenderTarget::nrd_in_diff_radiance)            = nullptr;
+            at(render_targets, Renderer_RenderTarget::nrd_out_diff_radiance)           = nullptr;
+            at(render_targets, Renderer_RenderTarget::nrd_screen_mv)                   = nullptr;
+            at(render_targets, Renderer_RenderTarget::nrd_screen_normal_roughness)     = nullptr;
+            at(render_targets, Renderer_RenderTarget::nrd_screen_viewz)                = nullptr;
+            at(render_targets, Renderer_RenderTarget::nrd_in_spec_radiance)            = nullptr;
+            at(render_targets, Renderer_RenderTarget::nrd_out_spec_radiance)           = nullptr;
+            at(render_targets, Renderer_RenderTarget::nrd_in_penumbra)                 = nullptr;
+            at(render_targets, Renderer_RenderTarget::nrd_out_shadow)                  = nullptr;
+            for_restir_reservoir_slot([](uint32_t, Renderer_RenderTarget rt) { at(render_targets, rt) = nullptr; });
+            at(render_targets, Renderer_RenderTarget::shading_rate)                 = nullptr;
+            at(render_targets, Renderer_RenderTarget::shadow_atlas)                 = nullptr;
+            at(render_targets, Renderer_RenderTarget::debug_output)                 = nullptr;
+        }
+        if (create_output)
+        {
+            at(render_targets, Renderer_RenderTarget::frame_output)                = nullptr;
+            at(render_targets, Renderer_RenderTarget::frame_output_2)              = nullptr;
+            at(render_targets, Renderer_RenderTarget::taau_history)                = nullptr;
+            at(render_targets, Renderer_RenderTarget::frame_output_stereo)         = nullptr;
+            at(render_targets, Renderer_RenderTarget::bloom)                       = nullptr;
+            at(render_targets, Renderer_RenderTarget::outline)                     = nullptr;
+            at(render_targets, Renderer_RenderTarget::gbuffer_depth_opaque_output) = nullptr;
+        }
+
+        uint32_t width_render  = static_cast<uint32_t>(GetResolutionRender().x);
+        uint32_t height_render = static_cast<uint32_t>(GetResolutionRender().y);
+        uint32_t width_output  = static_cast<uint32_t>(GetResolutionOutput().x);
+        uint32_t height_output = static_cast<uint32_t>(GetResolutionOutput().y);
+
+        auto compute_mip_count = [](const uint32_t width, const uint32_t height, const uint32_t smallest_dimension)
+        {
+            uint32_t max_dimension = max(width, height);
+            uint32_t mip_count     = 1;
+            while (max_dimension >= smallest_dimension)
+            {
+                max_dimension /= 2;
+                mip_count++;
+            }
+            return mip_count;
+        };
+
+        // avoid combining uav + rtv on frequently accessed targets (forces suboptimal layouts on amd)
+
+        // vr stereo: render and present at the eye swapchain aspect (beamng ground truth).
+        // using the desktop window aspect here then stretching into the hmd causes stereo distortion.
+        bool xr_stereo           = Xr::IsSessionRunning() && Xr::GetStereoMode();
+        if (xr_stereo && Xr::GetRecommendedWidth() > 0 && Xr::GetRecommendedHeight() > 0)
+        {
+            width_output  = Xr::GetRecommendedWidth();
+            height_output = Xr::GetRecommendedHeight();
+            width_render  = GetScaledDimension(width_output);
+            height_render = GetScaledDimension(height_output);
+        }
+        RHI_Texture_Type rt_type = xr_stereo ? RHI_Texture_Type::Type2DArray : RHI_Texture_Type::Type2D;
+        uint32_t rt_layers       = xr_stereo ? Xr::eye_count : 1;
+
+        // grouped builders, each owns one cohesive slice of allocations
+        auto create_gbuffer = [&]()
+        {
+            // concurrent sharing, the compute batch writes it and the graphics queue reads it from the blit onward
+            at(render_targets, Renderer_RenderTarget::frame_render)        = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_render, height_render, 1, 1, RHI_Format::R16G16B16A16_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_Rtv | RHI_Texture_ClearBlit | RHI_Texture_ConcurrentSharing, "frame_render");
+            at(render_targets, Renderer_RenderTarget::frame_render_opaque) = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_render, height_render, 1, 1, RHI_Format::R16G16B16A16_Float, RHI_Texture_Srv | RHI_Texture_Rtv | RHI_Texture_ClearBlit, "frame_render_opaque");
+            at(render_targets, Renderer_RenderTarget::particle_volume)     = make_shared<RHI_Texture>(RHI_Texture_Type::Type3D, renderer_particle_volume_width, renderer_particle_volume_height, renderer_particle_volume_depth, 1, RHI_Format::R16G16B16A16_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ClearBlit | RHI_Texture_ConcurrentSharing, "particle_volume");
+
+            // debug output sits at render resolution so debug raster passes can share gbuffer_depth for read-equal tests
+            at(render_targets, Renderer_RenderTarget::debug_output) = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_render, height_render, 1, 1, RHI_Format::R16G16B16A16_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_Rtv | RHI_Texture_ClearBlit, "debug_output");
+
+            // gbuffer, concurrent sharing so async compute (ssao, sss) can read while graphics writes
+            uint32_t flags = RHI_Texture_Rtv | RHI_Texture_Srv | RHI_Texture_ClearBlit | RHI_Texture_ConcurrentSharing;
+            at(render_targets, Renderer_RenderTarget::gbuffer_color)    = make_shared<RHI_Texture>(rt_type, width_render, height_render, rt_layers, 1, RHI_Format::R8G8B8A8_Unorm,     flags, "gbuffer_color");
+            at(render_targets, Renderer_RenderTarget::gbuffer_normal)   = make_shared<RHI_Texture>(rt_type, width_render, height_render, rt_layers, 1, RHI_Format::R16G16B16A16_Float, flags, "gbuffer_normal");
+            at(render_targets, Renderer_RenderTarget::gbuffer_material) = make_shared<RHI_Texture>(rt_type, width_render, height_render, rt_layers, 1, RHI_Format::R8G8B8A8_Unorm,     flags, "gbuffer_material");
+            // rgba: xy = ndc velocity, z = radial motion blur mask, w unused
+            at(render_targets, Renderer_RenderTarget::gbuffer_velocity) = make_shared<RHI_Texture>(rt_type, width_render, height_render, rt_layers, 1, RHI_Format::R16G16B16A16_Float, flags, "gbuffer_velocity");
+            at(render_targets, Renderer_RenderTarget::gbuffer_depth)    = make_shared<RHI_Texture>(rt_type, width_render, height_render, rt_layers, 1, RHI_Format::D32_Float,          flags, "gbuffer_depth");
+            // restir's temporal gate tests disocclusion against the prior depth, the current frame's depth ghosts moving objects
+            at(render_targets, Renderer_RenderTarget::gbuffer_depth_previous) = make_shared<RHI_Texture>(rt_type, width_render, height_render, rt_layers, 1, RHI_Format::D32_Float, flags, "gbuffer_depth_previous");
+            // previous frame normals for the same gate, sampling the current normal buffer at
+            // prev_uv reads a different surface whenever anything moved
+            at(render_targets, Renderer_RenderTarget::gbuffer_normal_previous) = make_shared<RHI_Texture>(rt_type, width_render, height_render, rt_layers, 1, RHI_Format::R16G16B16A16_Float, flags, "gbuffer_normal_previous");
+
+            // hi-z occluders, amd depth format restrictions force a separate texture for uav and a manual blit
+            at(render_targets, Renderer_RenderTarget::gbuffer_depth_occluders) = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_render, height_render, 1, 1, RHI_Format::D32_Float, RHI_Texture_Rtv | RHI_Texture_Srv, "depth_occluders");
+
+            // full mip chain so the cull shader can pick a level where the aabb fits in ~1-2 texels
+            uint32_t hiz_mip_count = static_cast<uint32_t>(floor(log2(static_cast<float>(max(width_render, height_render))))) + 1;
+            at(render_targets, Renderer_RenderTarget::gbuffer_depth_occluders_hiz) = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_render, height_render, 1, hiz_mip_count, RHI_Format::R32_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ClearBlit | RHI_Texture_PerMipViews, "depth_occluders_hiz");
+        };
+
+        auto create_clouds = [&]()
+        {
+            const uint32_t width_cloud  = max((width_render + 1) / 2, 1u);
+            const uint32_t height_cloud = max((height_render + 1) / 2, 1u);
+            const uint32_t flags        = RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ClearBlit;
+            at(render_targets, Renderer_RenderTarget::cloud_raw)                 = make_shared<RHI_Texture>(rt_type, width_cloud, height_cloud, rt_layers, 1, RHI_Format::R16G16B16A16_Float, flags, "cloud_raw");
+            at(render_targets, Renderer_RenderTarget::cloud_raw_distance)        = make_shared<RHI_Texture>(rt_type, width_cloud, height_cloud, rt_layers, 1, RHI_Format::R32_Float, flags, "cloud_raw_distance");
+            at(render_targets, Renderer_RenderTarget::cloud_resolved_0)          = make_shared<RHI_Texture>(rt_type, width_cloud, height_cloud, rt_layers, 1, RHI_Format::R16G16B16A16_Float, flags, "cloud_resolved_0");
+            at(render_targets, Renderer_RenderTarget::cloud_resolved_distance_0) = make_shared<RHI_Texture>(rt_type, width_cloud, height_cloud, rt_layers, 1, RHI_Format::R32_Float, flags, "cloud_resolved_distance_0");
+            at(render_targets, Renderer_RenderTarget::cloud_resolved_1)          = make_shared<RHI_Texture>(rt_type, width_cloud, height_cloud, rt_layers, 1, RHI_Format::R16G16B16A16_Float, flags, "cloud_resolved_1");
+            at(render_targets, Renderer_RenderTarget::cloud_resolved_distance_1) = make_shared<RHI_Texture>(rt_type, width_cloud, height_cloud, rt_layers, 1, RHI_Format::R32_Float, flags, "cloud_resolved_distance_1");
+            at(render_targets, Renderer_RenderTarget::cloud_composite)           = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_render, height_render, 1, 1, RHI_Format::R16G16B16A16_Float, flags, "cloud_composite");
+            at(render_targets, Renderer_RenderTarget::cloud_velocity)            = make_shared<RHI_Texture>(rt_type, width_render, height_render, rt_layers, 1, RHI_Format::R16G16B16A16_Float, flags, "cloud_velocity");
+            m_pass_state.cloud_history.Reset();
+        };
+
+        auto create_lighting_buffers = [&]()
+        {
+            // light_* textures are produced by the compute lighting batch, concurrent sharing keeps
+            // them safe if any future graphics pass samples them without ownership transfer
+            uint32_t flags = RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ClearBlit | RHI_Texture_ConcurrentSharing;
+            at(render_targets, Renderer_RenderTarget::light_diffuse)    = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_render, height_render, 1, 1, RHI_Format::R11G11B10_Float, flags, "light_diffuse");
+            at(render_targets, Renderer_RenderTarget::light_specular)   = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_render, height_render, 1, 1, RHI_Format::R11G11B10_Float, flags, "light_specular");
+
+            at(render_targets, Renderer_RenderTarget::sss)                = make_shared<RHI_Texture>(RHI_Texture_Type::Type2DArray, width_render, height_render, 4, 1, RHI_Format::R16_Float,          RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ClearBlit | RHI_Texture_ConcurrentSharing, "sss");
+            at(render_targets, Renderer_RenderTarget::reflections)        = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D,      width_render, height_render, 1, 1, RHI_Format::R16G16B16A16_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ClearBlit | RHI_Texture_ConcurrentSharing, "reflections");
+            at(render_targets, Renderer_RenderTarget::ray_traced_shadows)       = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D,      width_render, height_render, 1, 1, RHI_Format::R16G16B16A16_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ClearBlit | RHI_Texture_ConcurrentSharing, "ray_traced_shadows");
+            at(render_targets, Renderer_RenderTarget::ray_traced_shadows_local) = make_shared<RHI_Texture>(RHI_Texture_Type::Type2DArray, width_render, height_render, nrd_local_shadow_max, 1, RHI_Format::R16G16B16A16_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ClearBlit | RHI_Texture_ConcurrentSharing, "ray_traced_shadows_local");
+
+            // nrd screen guides and signals for reflections (reblur specular) and shadows (sigma)
+            // must share one resolution: both presets use the same nrd pool_screen
+            at(render_targets, Renderer_RenderTarget::nrd_screen_mv)               = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_render, height_render, 1, 1, RHI_Format::R16G16B16A16_Float, flags, "nrd_screen_mv");
+            at(render_targets, Renderer_RenderTarget::nrd_screen_normal_roughness) = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_render, height_render, 1, 1, RHI_Format::R10G10B10A2_Unorm, flags, "nrd_screen_normal_roughness");
+            at(render_targets, Renderer_RenderTarget::nrd_screen_viewz)            = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_render, height_render, 1, 1, RHI_Format::R32_Float,         flags, "nrd_screen_viewz");
+            at(render_targets, Renderer_RenderTarget::nrd_in_spec_radiance)        = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_render, height_render, 1, 1, RHI_Format::R16G16B16A16_Float, flags, "nrd_in_spec_radiance");
+            at(render_targets, Renderer_RenderTarget::nrd_out_spec_radiance)       = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_render, height_render, 1, 1, RHI_Format::R16G16B16A16_Float, flags, "nrd_out_spec_radiance");
+            at(render_targets, Renderer_RenderTarget::nrd_in_penumbra)             = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_render, height_render, 1, 1, RHI_Format::R32_Float,         flags, "nrd_in_penumbra");
+            // sigma_shadow writes a 1-component texel, rgba16f fails vk image write component count
+            at(render_targets, Renderer_RenderTarget::nrd_out_shadow)              = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_render, height_render, 1, 1, RHI_Format::R16_Float, flags, "nrd_out_shadow");
+        };
+
+        // gated by cvar_restir_pt so disabling restir frees the output ring as well as the reservoir slots managed by UpdateOptionalRenderTargets
+        auto create_shadow_atlas_and_misc = [&]()
+        {
+            if (RHI_Device::IsSupportedVrs())
+            {
+                // vrs texture dimensions must match the gpu's reported texel size
+                uint32_t texel_size_x = max(RHI_Device::PropertyGetMaxShadingRateTexelSizeX(), 1u);
+                uint32_t texel_size_y = max(RHI_Device::PropertyGetMaxShadingRateTexelSizeY(), 1u);
+                uint32_t vrs_width    = (width_render + texel_size_x - 1) / texel_size_x;
+                uint32_t vrs_height   = (height_render + texel_size_y - 1) / texel_size_y;
+                at(render_targets, Renderer_RenderTarget::shading_rate) = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, vrs_width, vrs_height, 1, 1, RHI_Format::R8_Uint, RHI_Texture_Srv | RHI_Texture_Uav | RHI_Texture_Rtv | RHI_Texture_Vrs | RHI_Texture_ClearBlit | RHI_Texture_ConcurrentSharing, "shading_rate");
+            }
+            // concurrent sharing, the opaque light compute batch reads the atlas after the graphics shadow pass writes it
+            at(render_targets, Renderer_RenderTarget::shadow_atlas) = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, renderer_resolution_shadow_atlas, renderer_resolution_shadow_atlas, 1, 1, RHI_Format::D32_Float, RHI_Texture_Rtv | RHI_Texture_Srv | RHI_Texture_ClearBlit | RHI_Texture_ConcurrentSharing, "shadow_atlas");
+        };
+
+        auto create_output_targets = [&]()
+        {
+            uint32_t mip_count = compute_mip_count(width_output, height_output, 16);
+            at(render_targets, Renderer_RenderTarget::frame_output)   = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_output, height_output, 1, mip_count, RHI_Format::R16G16B16A16_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_Rtv | RHI_Texture_ClearBlit | RHI_Texture_PerMipViews | RHI_Texture_ConcurrentSharing, "frame_output");
+            at(render_targets, Renderer_RenderTarget::frame_output_2) = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_output, height_output, 1, 1,         RHI_Format::R16G16B16A16_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_Rtv | RHI_Texture_ClearBlit, "frame_output_2");
+            at(render_targets, Renderer_RenderTarget::screenshot_sdr)   = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_output, height_output, 1, 1,       RHI_Format::R16G16B16A16_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_Rtv | RHI_Texture_ClearBlit, "screenshot_sdr");
+            at(render_targets, Renderer_RenderTarget::screenshot_sdr_2) = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_output, height_output, 1, 1,       RHI_Format::R16G16B16A16_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_Rtv | RHI_Texture_ClearBlit, "screenshot_sdr_2");
+            // stereo needs one history layer per eye, frame_render and frame_output stay 2d and are reused per eye
+            if (xr_stereo)
+            {
+                at(render_targets, Renderer_RenderTarget::taau_history) = make_shared<RHI_Texture>(
+                    RHI_Texture_Type::Type2DArray,
+                    width_output,
+                    height_output,
+                    Xr::eye_count,
+                    1,
+                    RHI_Format::R16G16B16A16_Float,
+                    RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_Rtv | RHI_Texture_ClearBlit,
+                    "taau_history"
+                );
+            }
+            else
+            {
+                at(render_targets, Renderer_RenderTarget::taau_history) = make_shared<RHI_Texture>(
+                    RHI_Texture_Type::Type2D,
+                    width_output,
+                    height_output,
+                    1,
+                    1,
+                    RHI_Format::R16G16B16A16_Float,
+                    RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_Rtv | RHI_Texture_ClearBlit,
+                    "taau_history"
+                );
+            }
+
+            // stereo output, 2-layer array for xr swapchain blit (only when vr is active)
+            if (xr_stereo)
+            {
+                at(render_targets, Renderer_RenderTarget::frame_output_stereo) = make_shared<RHI_Texture>(RHI_Texture_Type::Type2DArray, width_output, height_output, Xr::eye_count, 1, RHI_Format::R16G16B16A16_Float, RHI_Texture_Srv | RHI_Texture_Rtv | RHI_Texture_ClearBlit, "frame_output_stereo");
+            }
+
+            at(render_targets, Renderer_RenderTarget::bloom)                       = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, max(1u, width_output / 2), max(1u, height_output / 2), 1, mip_count, RHI_Format::R16G16B16A16_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_PerMipViews, "bloom");
+            at(render_targets, Renderer_RenderTarget::outline)                     = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_output, height_output, 1, 1,         RHI_Format::R8G8B8A8_Unorm,     RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_Rtv,         "outline");
+            at(render_targets, Renderer_RenderTarget::gbuffer_depth_opaque_output) = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, width_output, height_output, 1, 1,         RHI_Format::D32_Float,          RHI_Texture_Srv | RHI_Texture_Rtv | RHI_Texture_ClearBlit,   "depth_opaque_output");
+        };
+
+        auto create_atmosphere_luts = [&]()
+        {
+            at(render_targets, Renderer_RenderTarget::lut_brdf_specular)            = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, renderer_resolution_brdf_lut, renderer_resolution_brdf_lut,  1, 1, RHI_Format::R16G16_Float,       RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ConcurrentSharing, "lut_brdf_specular");
+            at(render_targets, Renderer_RenderTarget::lut_atmosphere_transmittance) = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, 256, 64,    1, 1,                                                  RHI_Format::R16G16B16A16_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ConcurrentSharing, "lut_atmosphere_transmittance");
+            at(render_targets, Renderer_RenderTarget::lut_atmosphere_multiscatter)  = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, 32,  32,    1, 1,                                                  RHI_Format::R16G16B16A16_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ConcurrentSharing, "lut_atmosphere_multiscatter");
+            // sky view lut, two vertically packed 192x108 halves, sun sky on top rows, moonlit sky below
+            at(render_targets, Renderer_RenderTarget::lut_sky_view)                 = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, 192, 216,   1, 1,                                                  RHI_Format::R16G16B16A16_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ConcurrentSharing, "lut_sky_view");
+            // 16-bit, the density remaps amplify by up to the inverse coverage so 8-bit steps showed as contour stripes on cloud bulbs
+            at(render_targets, Renderer_RenderTarget::cloud_noise)                  = make_shared<RHI_Texture>(RHI_Texture_Type::Type3D, 128, 128,  128, 1,                                                RHI_Format::R16G16B16A16_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ConcurrentSharing, "cloud_noise");
+            // cumulus transmittance toward the sun, projected on the cloud base plane, read by lighting and fog
+            // float4 so the shared gaussian blur can soften it in place, mips kill distant screen-space moire
+            at(render_targets, Renderer_RenderTarget::cloud_shadow)                 = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, 1024, 1024, 1, compute_mip_count(1024, 1024, 16),                 RHI_Format::R16G16B16A16_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_PerMipViews | RHI_Texture_ConcurrentSharing, "cloud_shadow");
+            at(render_targets, Renderer_RenderTarget::cloud_environment)            = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, renderer_resolution_cloud_environment_w, renderer_resolution_cloud_environment_h, 1, compute_mip_count(renderer_resolution_cloud_environment_w, renderer_resolution_cloud_environment_h, 16), RHI_Format::R11G11B10_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_PerMipViews | RHI_Texture_ClearBlit | RHI_Texture_ConcurrentSharing, "cloud_environment");
+
+            at(render_targets, Renderer_RenderTarget::blur)      = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, renderer_resolution_blur_scratch, renderer_resolution_blur_scratch, 1, 1, RHI_Format::R16G16B16A16_Float, RHI_Texture_Uav | RHI_Texture_Srv, "blur_scratch");
+            const uint32_t lowest_dimension                 = 16; // lowest mip is 16x16, preserving directional detail for diffuse IBL (1x1 loses directionality)
+            at(render_targets, Renderer_RenderTarget::skysphere) = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, renderer_resolution_skysphere_w, renderer_resolution_skysphere_h, 1, compute_mip_count(renderer_resolution_skysphere_w, renderer_resolution_skysphere_h, lowest_dimension), RHI_Format::R11G11B10_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_PerMipViews | RHI_Texture_ClearBlit | RHI_Texture_ConcurrentSharing, "skysphere");
+            // l2 sh coeffs for directional diffuse ibl, 9 float4s in a 9x1 texture
+            at(render_targets, Renderer_RenderTarget::sky_sh) = make_shared<RHI_Texture>(
+                RHI_Texture_Type::Type2D,
+                9,
+                1,
+                1,
+                1,
+                RHI_Format::R32G32B32A32_Float,
+                RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ClearBlit | RHI_Texture_ConcurrentSharing,
+                "sky_sh"
+            );
+
+            at(render_targets, Renderer_RenderTarget::auto_exposure)          = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, 1, 1, 1, 1, RHI_Format::R32_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ClearBlit, "auto_exposure_1");
+            at(render_targets, Renderer_RenderTarget::auto_exposure_previous) = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, 1, 1, 1, 1, RHI_Format::R32_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ClearBlit, "auto_exposure_2");
+            at(render_targets, Renderer_RenderTarget::dof_focus)              = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, 1, 1, 1, 1, RHI_Format::R32_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ClearBlit, "dof_focus_1");
+            at(render_targets, Renderer_RenderTarget::dof_focus_previous)     = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, 1, 1, 1, 1, RHI_Format::R32_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ClearBlit, "dof_focus_2");
+        };
+
+        auto create_wind = [&]()
+        {
+            // wind field, baked once per frame, sampled by all wind-driven geometry
+            at(render_targets, Renderer_RenderTarget::wind_field) = make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, 256, 256, 1, 1, RHI_Format::R16G16B16A16_Float, RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ConcurrentSharing, "wind_field");
+        };
+
+        auto create_ocean = [&]()
+        {
+            // fft ocean cascades, one array slice per cascade, recomputed each frame while a water component is active
+            const uint32_t n      = renderer_ocean_resolution;
+            const uint32_t slices = renderer_ocean_max_cascades;
+            const uint32_t flags  = RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ConcurrentSharing;
+
+            at(render_targets, Renderer_RenderTarget::ocean_spectrum) = make_shared<RHI_Texture>(
+                RHI_Texture_Type::Type2DArray, n, n, slices, 1,
+                RHI_Format::R32G32B32A32_Float, flags, "ocean_spectrum"
+            );
+            at(render_targets, Renderer_RenderTarget::ocean_fft_a) = make_shared<RHI_Texture>(
+                RHI_Texture_Type::Type2DArray, n, n, slices, 1,
+                RHI_Format::R32G32B32A32_Float, flags, "ocean_fft_a"
+            );
+            at(render_targets, Renderer_RenderTarget::ocean_fft_b) = make_shared<RHI_Texture>(
+                RHI_Texture_Type::Type2DArray, n, n, slices, 1,
+                RHI_Format::R32G32B32A32_Float, flags, "ocean_fft_b"
+            );
+            at(render_targets, Renderer_RenderTarget::ocean_displacement) = make_shared<RHI_Texture>(
+                RHI_Texture_Type::Type2DArray, n, n, slices, 1,
+                RHI_Format::R16G16B16A16_Float, flags, "ocean_displacement"
+            );
+            at(render_targets, Renderer_RenderTarget::ocean_displacement_previous) = make_shared<RHI_Texture>(
+                RHI_Texture_Type::Type2DArray, n, n, slices, 1,
+                RHI_Format::R16G16B16A16_Float, flags, "ocean_displacement_previous"
+            );
+            at(render_targets, Renderer_RenderTarget::ocean_normal) = make_shared<RHI_Texture>(
+                RHI_Texture_Type::Type2DArray, n, n, slices, 1,
+                RHI_Format::R16G16B16A16_Float, flags, "ocean_normal"
+            );
+        };
+
+        if (create_render)
+        {
+            create_gbuffer();
+            create_clouds();
+            create_lighting_buffers();
+            UpdateOptionalRenderTargets(); // ssao, rt reflections, restir (reservoirs and output ring)
+            create_shadow_atlas_and_misc();
+        }
+
+        if (create_output)
+        {
+            create_output_targets();
+        }
+
+        // fixed dimension targets, allocated once and reused across resolution changes
+        if (!at(render_targets, Renderer_RenderTarget::lut_brdf_specular))
+        {
+            create_atmosphere_luts();
+            create_wind();
+            create_ocean();
+        }
+
+        if (!at(render_targets, Renderer_RenderTarget::fog_scatter))
+        {
+            const uint32_t fog_flags = RHI_Texture_Uav | RHI_Texture_Srv | RHI_Texture_ClearBlit | RHI_Texture_ConcurrentSharing;
+            at(render_targets, Renderer_RenderTarget::fog_scatter) = make_shared<RHI_Texture>(
+                RHI_Texture_Type::Type3D,
+                renderer_fog_volume_width,
+                renderer_fog_volume_height,
+                renderer_fog_volume_depth,
+                1,
+                RHI_Format::R16G16B16A16_Float,
+                fog_flags,
+                "fog_scatter"
+            );
+            at(render_targets, Renderer_RenderTarget::fog_scatter_history) = make_shared<RHI_Texture>(
+                RHI_Texture_Type::Type3D,
+                renderer_fog_volume_width,
+                renderer_fog_volume_height,
+                renderer_fog_volume_depth,
+                1,
+                RHI_Format::R16G16B16A16_Float,
+                fog_flags,
+                "fog_scatter_history"
+            );
+            at(render_targets, Renderer_RenderTarget::fog_integrated) = make_shared<RHI_Texture>(
+                RHI_Texture_Type::Type3D,
+                renderer_fog_volume_width,
+                renderer_fog_volume_height,
+                renderer_fog_volume_depth,
+                1,
+                RHI_Format::R16G16B16A16_Float,
+                fog_flags,
+                "fog_integrated"
+            );
+            m_pass_state.fog_history.Reset();
+        }
+    }
+
+    namespace
+    {
+        void compile_shader(
+            Renderer_Shader id, RHI_Shader_Type type, const string& path,
+            bool async             = true,
+            RHI_Vertex_Type vtype  = RHI_Vertex_Type::Max,
+            const char* define     = nullptr,
+            const char* define_ext = nullptr,
+            const char* define2    = nullptr
+        )
+        {
+            auto& slot = shaders[static_cast<uint8_t>(id)];
+            slot = make_shared<RHI_Shader>();
+            if (define)
+            {
+                slot->AddDefine(define);
+            }
+            if (define_ext)
+            {
+                slot->AddDefine(define_ext);
+            }
+            if (define2)
+            {
+                slot->AddDefine(define2);
+            }
+            slot->Compile(type, path, async, vtype);
+        }
+    }
+
+    void Renderer::CreateShaders()
+    {
+        const string sd = ResourceCache::GetResourceDirectory(ResourceDirectory::Shaders) + "/";
+
+        // shader compile table, set rt_only / ms_only for shaders that need optional device features
+        struct ShaderEntry
+        {
+            Renderer_Shader id;
+            RHI_Shader_Type stage;
+            const char*     file;
+            RHI_Vertex_Type vtype   = RHI_Vertex_Type::Max;
+            const char*     define  = nullptr;
+            bool            async   = true;
+            bool            rt_only = false;
+            const char*     define2 = nullptr;
+            bool            ms_only = false;
+        };
+
+        const bool rt = RHI_Device::IsSupportedRayTracing();
+        const bool ms = RHI_Device::IsSupportedMeshShaders();
+
+        const ShaderEntry table[] =
+        {
+            // debug
+            { Renderer_Shader::line_v,                                RHI_Shader_Type::Vertex,  "line.hlsl",                                  RHI_Vertex_Type::PosCol       },
+            { Renderer_Shader::line_p,                                RHI_Shader_Type::Pixel,   "line.hlsl"                                                                  },
+            { Renderer_Shader::grid_v,                                RHI_Shader_Type::Vertex,  "grid.hlsl",                                  RHI_Vertex_Type::PosUvNorTan  },
+            { Renderer_Shader::grid_p,                                RHI_Shader_Type::Pixel,   "grid.hlsl"                                                                  },
+            { Renderer_Shader::outline_v,                             RHI_Shader_Type::Vertex,  "outline.hlsl",                               RHI_Vertex_Type::PosUvNorTan  },
+            { Renderer_Shader::outline_p,                             RHI_Shader_Type::Pixel,   "outline.hlsl"                                                               },
+            { Renderer_Shader::outline_c,                             RHI_Shader_Type::Compute, "outline.hlsl"                                                               },
+
+            // depth
+            { Renderer_Shader::depth_prepass_v,                       RHI_Shader_Type::Vertex,  "depth_prepass.hlsl",                         RHI_Vertex_Type::PosUvNorTan  },
+            { Renderer_Shader::depth_prepass_multi_draw_v,            RHI_Shader_Type::Vertex,  "depth_prepass.hlsl",                         RHI_Vertex_Type::PosUvNorTan, "INDEXED_MULTI_DRAW" },
+            { Renderer_Shader::depth_light_v,                         RHI_Shader_Type::Vertex,  "depth_light.hlsl",                           RHI_Vertex_Type::PosUvNorTan  },
+            { Renderer_Shader::depth_light_multi_draw_v,              RHI_Shader_Type::Vertex,  "depth_light.hlsl",                           RHI_Vertex_Type::PosUvNorTan, "INDEXED_MULTI_DRAW" },
+            { Renderer_Shader::depth_light_alpha_color_p,             RHI_Shader_Type::Pixel,   "depth_light.hlsl"                                                           },
+            { Renderer_Shader::depth_light_multi_draw_alpha_color_p,  RHI_Shader_Type::Pixel,   "depth_light.hlsl",                           RHI_Vertex_Type::Max,         "INDEXED_MULTI_DRAW" },
+
+            // g-buffer
+            { Renderer_Shader::gbuffer_v,                             RHI_Shader_Type::Vertex,  "g_buffer.hlsl",                              RHI_Vertex_Type::PosUvNorTan  },
+            { Renderer_Shader::gbuffer_p,                             RHI_Shader_Type::Pixel,   "g_buffer.hlsl"                                                              },
+
+            // tessellation
+            { Renderer_Shader::tessellation_h,                        RHI_Shader_Type::Hull,    "common_tessellation.hlsl"                                                   },
+            { Renderer_Shader::tessellation_d,                        RHI_Shader_Type::Domain,  "common_tessellation.hlsl"                                                   },
+
+            // light
+            { Renderer_Shader::light_integration_brdf_specular_lut_c, RHI_Shader_Type::Compute, "light_integration.hlsl",                     RHI_Vertex_Type::Max, "BRDF_SPECULAR_LUT" },
+            { Renderer_Shader::light_integration_environment_filter_c,RHI_Shader_Type::Compute, "light_integration.hlsl",                     RHI_Vertex_Type::Max, "ENVIRONMENT_FILTER"      },
+            { Renderer_Shader::light_c,                               RHI_Shader_Type::Compute, "light.hlsl",                                 RHI_Vertex_Type::Max, rt ? "RAY_TRACING_ENABLED" : nullptr },
+            { Renderer_Shader::light_cluster_assign_c,                RHI_Shader_Type::Compute, "light_cluster_assign.hlsl"                                                  },
+            { Renderer_Shader::light_cluster_visualize_c,             RHI_Shader_Type::Compute, "light_cluster_visualize.hlsl"                                               },
+            { Renderer_Shader::light_flare_v,                         RHI_Shader_Type::Vertex,  "light_flare.hlsl"                                                           },
+            { Renderer_Shader::light_flare_p,                         RHI_Shader_Type::Pixel,   "light_flare.hlsl"                                                           },
+            { Renderer_Shader::light_composition_c,                   RHI_Shader_Type::Compute, "light_composition.hlsl"                                                     },
+            { Renderer_Shader::fog_inject_c,                          RHI_Shader_Type::Compute, "fog_froxel.hlsl",                            RHI_Vertex_Type::Max, "FOG_INJECT"    },
+            { Renderer_Shader::fog_integrate_c,                       RHI_Shader_Type::Compute, "fog_froxel.hlsl",                            RHI_Vertex_Type::Max, "FOG_INTEGRATE" },
+            { Renderer_Shader::light_image_based_c,                   RHI_Shader_Type::Compute, "light_image_based.hlsl"                                                     },
+
+            // blur
+            { Renderer_Shader::blur_gaussian_c,                       RHI_Shader_Type::Compute, "blur.hlsl"                                                                  },
+            { Renderer_Shader::blur_gaussian_bilateral_c,             RHI_Shader_Type::Compute, "blur.hlsl",                                  RHI_Vertex_Type::Max, "PASS_BLUR_GAUSSIAN_BILATERAL" },
+
+            // bloom
+            { Renderer_Shader::bloom_luminance_c,                     RHI_Shader_Type::Compute, "bloom.hlsl",                                 RHI_Vertex_Type::Max, "LUMINANCE"           },
+            { Renderer_Shader::bloom_downsample_c,                    RHI_Shader_Type::Compute, "bloom.hlsl",                                 RHI_Vertex_Type::Max, "DOWNSAMPLE"          },
+            { Renderer_Shader::bloom_upsample_blend_mip_c,            RHI_Shader_Type::Compute, "bloom.hlsl",                                 RHI_Vertex_Type::Max, "UPSAMPLE_BLEND_MIP"  },
+            { Renderer_Shader::bloom_blend_frame_c,                   RHI_Shader_Type::Compute, "bloom.hlsl",                                 RHI_Vertex_Type::Max, "BLEND_FRAME"         },
+
+            // amd fidelityfx
+            { Renderer_Shader::ffx_cas_c,                             RHI_Shader_Type::Compute, "amd_fidelity_fx/cas.hlsl"                                                   },
+            { Renderer_Shader::ffx_spd_average_c,                     RHI_Shader_Type::Compute, "amd_fidelity_fx/spd.hlsl",                   RHI_Vertex_Type::Max, "AVERAGE" },
+            { Renderer_Shader::ffx_spd_min_c,                         RHI_Shader_Type::Compute, "amd_fidelity_fx/spd.hlsl",                   RHI_Vertex_Type::Max, "MIN"     },
+            { Renderer_Shader::ffx_spd_max_c,                         RHI_Shader_Type::Compute, "amd_fidelity_fx/spd.hlsl",                   RHI_Vertex_Type::Max, "MAX"     },
+            { Renderer_Shader::ffx_spd_average_one_c,                 RHI_Shader_Type::Compute, "amd_fidelity_fx/spd.hlsl",                   RHI_Vertex_Type::Max, "AVERAGE", true, false, "ONE_MIP" },
+            { Renderer_Shader::ffx_spd_min_one_c,                     RHI_Shader_Type::Compute, "amd_fidelity_fx/spd.hlsl",                   RHI_Vertex_Type::Max, "MIN",     true, false, "ONE_MIP" },
+            { Renderer_Shader::ffx_spd_max_one_c,                     RHI_Shader_Type::Compute, "amd_fidelity_fx/spd.hlsl",                   RHI_Vertex_Type::Max, "MAX",     true, false, "ONE_MIP" },
+
+            // sky
+            { Renderer_Shader::skysphere_c,                           RHI_Shader_Type::Compute, "sky/skysphere.hlsl"                                                         },
+            { Renderer_Shader::skysphere_sh_project_c,                RHI_Shader_Type::Compute, "sky/skysphere_sh_project.hlsl"                                               },
+            { Renderer_Shader::skysphere_transmittance_lut_c,         RHI_Shader_Type::Compute, "sky/skysphere.hlsl",                         RHI_Vertex_Type::Max, "TRANSMITTANCE_LUT" },
+            { Renderer_Shader::skysphere_multiscatter_lut_c,          RHI_Shader_Type::Compute, "sky/skysphere.hlsl",                         RHI_Vertex_Type::Max, "MULTISCATTER_LUT"  },
+            { Renderer_Shader::skysphere_sky_view_lut_c,              RHI_Shader_Type::Compute, "sky/skysphere.hlsl",                         RHI_Vertex_Type::Max, "SKY_VIEW_LUT"      },
+            { Renderer_Shader::clouds_noise_c,                        RHI_Shader_Type::Compute, "sky/clouds.hlsl",                            RHI_Vertex_Type::Max, "CLOUD_NOISE"       },
+            { Renderer_Shader::clouds_shadow_c,                       RHI_Shader_Type::Compute, "sky/clouds.hlsl",                            RHI_Vertex_Type::Max, "CLOUD_SHADOW"      },
+            { Renderer_Shader::clouds_render_c,                       RHI_Shader_Type::Compute, "sky/clouds.hlsl",                            RHI_Vertex_Type::Max, "CLOUD_RENDER"      },
+            { Renderer_Shader::clouds_temporal_c,                     RHI_Shader_Type::Compute, "sky/clouds.hlsl",                            RHI_Vertex_Type::Max, "CLOUD_TEMPORAL"    },
+            { Renderer_Shader::clouds_composite_c,                    RHI_Shader_Type::Compute, "sky/clouds.hlsl",                            RHI_Vertex_Type::Max, "CLOUD_COMPOSITE"   },
+            { Renderer_Shader::clouds_environment_c,                  RHI_Shader_Type::Compute, "sky/clouds.hlsl",                            RHI_Vertex_Type::Max, "CLOUD_ENVIRONMENT" },
+
+            // post-process
+            { Renderer_Shader::fxaa_c,                                RHI_Shader_Type::Compute, "fxaa/fxaa.hlsl"                                                             },
+            { Renderer_Shader::taau_c,                                RHI_Shader_Type::Compute, "taau.hlsl"                                                                  },
+            { Renderer_Shader::font_v,                                RHI_Shader_Type::Vertex,  "font.hlsl",                                  RHI_Vertex_Type::PosUv         },
+            { Renderer_Shader::font_p,                                RHI_Shader_Type::Pixel,   "font.hlsl"                                                                  },
+            { Renderer_Shader::film_grain_c,                          RHI_Shader_Type::Compute, "film_grain.hlsl"                                                            },
+            { Renderer_Shader::chromatic_aberration_c,                RHI_Shader_Type::Compute, "chromatic_aberration.hlsl"                                                  },
+            { Renderer_Shader::vhs_c,                                 RHI_Shader_Type::Compute, "vhs.hlsl"                                                                   },
+
+            { Renderer_Shader::underwater_c,                          RHI_Shader_Type::Compute, "underwater.hlsl"                                                            },
+            { Renderer_Shader::output_c,                              RHI_Shader_Type::Compute, "output.hlsl"                                                                },
+            { Renderer_Shader::motion_blur_c,                         RHI_Shader_Type::Compute, "motion_blur.hlsl"                                                           },
+            { Renderer_Shader::ssao_c,                                RHI_Shader_Type::Compute, "ssao.hlsl"                                                                  },
+            { Renderer_Shader::sss_c_bend,                            RHI_Shader_Type::Compute, "screen_space_shadows/bend_sss.hlsl"                                         },
+            { Renderer_Shader::depth_of_field_c,                      RHI_Shader_Type::Compute, "depth_of_field.hlsl"                                                        },
+            { Renderer_Shader::variable_rate_shading_c,               RHI_Shader_Type::Compute, "variable_rate_shading.hlsl"                                                 },
+            { Renderer_Shader::blit_c,                                RHI_Shader_Type::Compute, "blit.hlsl"                                                                  },
+
+            // indirect draw
+            { Renderer_Shader::instance_cull_c,                       RHI_Shader_Type::Compute, "instance_cull.hlsl"                                                         },
+            { Renderer_Shader::indirect_cull_c,                       RHI_Shader_Type::Compute, "indirect_cull.hlsl"                                                         },
+            { Renderer_Shader::indirect_cull_triangle_c,              RHI_Shader_Type::Compute, "indirect_cull_triangle.hlsl"                                                },
+            { Renderer_Shader::gbuffer_indirect_v,                    RHI_Shader_Type::Vertex,  "g_buffer.hlsl",                              RHI_Vertex_Type::Max, "INDIRECT_DRAW"        },
+            { Renderer_Shader::gbuffer_indirect_p,                    RHI_Shader_Type::Pixel,   "g_buffer.hlsl",                              RHI_Vertex_Type::Max, "INDIRECT_DRAW"        },
+            { Renderer_Shader::depth_prepass_indirect_v,              RHI_Shader_Type::Vertex,  "depth_prepass.hlsl",                         RHI_Vertex_Type::Max, "INDIRECT_DRAW"        },
+            { Renderer_Shader::depth_prepass_indirect_alpha_test_p,   RHI_Shader_Type::Pixel,   "depth_prepass.hlsl",                         RHI_Vertex_Type::Max, "ALPHA_TEST_INDIRECT"  },
+            { Renderer_Shader::depth_prepass_mesh_alpha_p,            RHI_Shader_Type::Pixel,   "depth_prepass.hlsl",                         RHI_Vertex_Type::Max, "ALPHA_TEST_INDIRECT", true, false, "DEPTH_MESH_ALPHA", true },
+            { Renderer_Shader::meshlet_mesh_m,                        RHI_Shader_Type::MeshShader,    "meshlet_mesh.hlsl",                          RHI_Vertex_Type::Max, nullptr, true, false, nullptr, true },
+            { Renderer_Shader::meshlet_mesh_alpha_m,                  RHI_Shader_Type::MeshShader,    "meshlet_mesh.hlsl",                          RHI_Vertex_Type::Max, "GBUFFER_ALPHA", true, false, nullptr, true },
+            { Renderer_Shader::meshlet_mesh_depth_m,                  RHI_Shader_Type::MeshShader,    "meshlet_mesh_depth.hlsl",                    RHI_Vertex_Type::Max, nullptr, true, false, nullptr, true },
+            { Renderer_Shader::meshlet_mesh_depth_alpha_m,            RHI_Shader_Type::MeshShader,    "meshlet_mesh_depth.hlsl",                    RHI_Vertex_Type::Max, "DEPTH_ALPHA", true, false, nullptr, true },
+            { Renderer_Shader::meshlet_visualize_v,                   RHI_Shader_Type::Vertex,  "meshlet_visualize.hlsl"                                                     },
+            { Renderer_Shader::meshlet_visualize_p,                   RHI_Shader_Type::Pixel,   "meshlet_visualize.hlsl"                                                     },
+
+            // misc
+            { Renderer_Shader::icon_v,                                RHI_Shader_Type::Vertex,  "icon.hlsl",                                  RHI_Vertex_Type::PosUv         },
+            { Renderer_Shader::icon_p,                                RHI_Shader_Type::Pixel,   "icon.hlsl"                                                                  },
+            { Renderer_Shader::dithering_c,                           RHI_Shader_Type::Compute, "dithering.hlsl"                                                             },
+            { Renderer_Shader::reflections_apply_c,                   RHI_Shader_Type::Compute, "reflections_apply.hlsl"                                                     },
+            { Renderer_Shader::auto_exposure_c,                       RHI_Shader_Type::Compute, "auto_exposure.hlsl"                                                         },
+            { Renderer_Shader::preview_studio_c,                      RHI_Shader_Type::Compute, "preview_studio.hlsl"                                                        },
+
+            // ray tracing, only compiled when supported
+            { Renderer_Shader::reflections_ray_generation_r,          RHI_Shader_Type::RayGeneration, "reflections_trace.hlsl",               RHI_Vertex_Type::Max, nullptr,                       true,  true },
+            { Renderer_Shader::reflections_ray_miss_r,                RHI_Shader_Type::RayMiss,       "reflections_trace.hlsl",               RHI_Vertex_Type::Max, nullptr,                       true,  true },
+            { Renderer_Shader::reflections_ray_hit_r,                 RHI_Shader_Type::RayHit,        "reflections_trace.hlsl",               RHI_Vertex_Type::Max, nullptr,                       true,  true },
+            { Renderer_Shader::reflections_shade_c,                   RHI_Shader_Type::Compute,       "reflections_shade.hlsl",               RHI_Vertex_Type::Max, nullptr,                       true,  true },
+            { Renderer_Shader::nrd_pack_reflections_c,                RHI_Shader_Type::Compute,       "nrd_pack_reflections.hlsl",            RHI_Vertex_Type::Max, nullptr,                       true,  true },
+            { Renderer_Shader::nrd_unpack_reflections_c,              RHI_Shader_Type::Compute,       "nrd_unpack_reflections.hlsl",          RHI_Vertex_Type::Max, nullptr,                       true,  true },
+            { Renderer_Shader::shadows_ray_generation_r,              RHI_Shader_Type::RayGeneration, "ray_traced_shadows.hlsl",              RHI_Vertex_Type::Max, nullptr,                       true,  true },
+            { Renderer_Shader::shadows_ray_miss_r,                    RHI_Shader_Type::RayMiss,       "ray_traced_shadows.hlsl",              RHI_Vertex_Type::Max, nullptr,                       true,  true },
+            { Renderer_Shader::shadows_ray_hit_r,                     RHI_Shader_Type::RayHit,        "ray_traced_shadows.hlsl",              RHI_Vertex_Type::Max, nullptr,                       true,  true },
+            { Renderer_Shader::nrd_pack_shadows_c,                    RHI_Shader_Type::Compute,       "nrd_pack_shadows.hlsl",                RHI_Vertex_Type::Max, nullptr,                       true,  true },
+            { Renderer_Shader::nrd_unpack_shadows_c,                  RHI_Shader_Type::Compute,       "nrd_unpack_shadows.hlsl",              RHI_Vertex_Type::Max, nullptr,                       true,  true },
+            { Renderer_Shader::restir_pt_ray_generation_r,            RHI_Shader_Type::RayGeneration, "restir_pt.hlsl",                       RHI_Vertex_Type::Max, nullptr,                       true,  true },
+            { Renderer_Shader::restir_pt_ray_miss_r,                  RHI_Shader_Type::RayMiss,       "restir_pt.hlsl",                       RHI_Vertex_Type::Max, "MAIN_MISS",                   true,  true },
+            { Renderer_Shader::restir_pt_ray_hit_r,                   RHI_Shader_Type::RayHit,        "restir_pt.hlsl",                       RHI_Vertex_Type::Max, "MAIN_HIT",                    true,  true },
+            { Renderer_Shader::restir_pt_temporal_c,                  RHI_Shader_Type::Compute,       "restir_pt_temporal.hlsl",              RHI_Vertex_Type::Max, nullptr,                       true,  true },
+            { Renderer_Shader::restir_pt_spatial_shift_c,             RHI_Shader_Type::Compute,       "restir_pt_spatial_shift.hlsl",         RHI_Vertex_Type::Max, nullptr,                       true,  true },
+            { Renderer_Shader::restir_pt_spatial_c,                   RHI_Shader_Type::Compute,       "restir_pt_spatial.hlsl",               RHI_Vertex_Type::Max, nullptr,                       true,  true },
+            { Renderer_Shader::restir_pt_duplication_c,               RHI_Shader_Type::Compute,       "restir_pt_duplication.hlsl",           RHI_Vertex_Type::Max, nullptr,                       true,  true },
+            { Renderer_Shader::restir_pt_nrd_pack_c,                  RHI_Shader_Type::Compute,       "restir_pt_nrd_pack.hlsl",            RHI_Vertex_Type::Max, nullptr,                       true,  true },
+            { Renderer_Shader::restir_pt_nrd_unpack_c,                RHI_Shader_Type::Compute,       "restir_pt_nrd_unpack.hlsl",          RHI_Vertex_Type::Max, nullptr,                       true,  true },
+
+            // wind field
+            { Renderer_Shader::wind_field_c,                          RHI_Shader_Type::Compute, "wind_field.hlsl"                                                                                    },
+
+            // fft ocean
+            { Renderer_Shader::ocean_spectrum_init_c,                 RHI_Shader_Type::Compute, "ocean/ocean_spectrum.hlsl",                  RHI_Vertex_Type::Max, "INIT"                           },
+            { Renderer_Shader::ocean_spectrum_update_c,               RHI_Shader_Type::Compute, "ocean/ocean_spectrum.hlsl",                  RHI_Vertex_Type::Max, "UPDATE"                         },
+            { Renderer_Shader::ocean_fft_horizontal_c,                RHI_Shader_Type::Compute, "ocean/ocean_fft.hlsl",                       RHI_Vertex_Type::Max, "HORIZONTAL"                     },
+            { Renderer_Shader::ocean_fft_vertical_c,                  RHI_Shader_Type::Compute, "ocean/ocean_fft.hlsl",                       RHI_Vertex_Type::Max, "VERTICAL"                       },
+            { Renderer_Shader::ocean_assemble_c,                      RHI_Shader_Type::Compute, "ocean/ocean_assemble.hlsl"                                                                          },
+
+            // gpu-driven particles
+            { Renderer_Shader::particle_emit_c,                       RHI_Shader_Type::Compute, "particles.hlsl",                             RHI_Vertex_Type::Max, "EMIT"                           },
+            { Renderer_Shader::particle_simulate_c,                   RHI_Shader_Type::Compute, "particles.hlsl",                             RHI_Vertex_Type::Max, "SIMULATE"                       },
+            { Renderer_Shader::particle_render_v,                     RHI_Shader_Type::Vertex,  "particles.hlsl",                             RHI_Vertex_Type::Max, "RENDER"                         },
+            { Renderer_Shader::particle_render_p,                     RHI_Shader_Type::Pixel,   "particles.hlsl",                             RHI_Vertex_Type::Max, "RENDER"                         },
+            { Renderer_Shader::particle_volume_clear_c,                RHI_Shader_Type::Compute, "particles_volumetric.hlsl",                  RHI_Vertex_Type::Max, "VOLUME_CLEAR"                   },
+            { Renderer_Shader::particle_volume_splat_c,                RHI_Shader_Type::Compute, "particles_volumetric.hlsl",                  RHI_Vertex_Type::Max, "VOLUME_SPLAT"                   },
+            { Renderer_Shader::particle_volume_resolve_c,              RHI_Shader_Type::Compute, "particles_volumetric.hlsl",                  RHI_Vertex_Type::Max, "VOLUME_RESOLVE"                 },
+            { Renderer_Shader::particle_volume_composite_c,            RHI_Shader_Type::Compute, "particles_volumetric.hlsl",                  RHI_Vertex_Type::Max, "VOLUME_COMPOSITE"               },
+
+            // gpu procedural grass
+            { Renderer_Shader::grass_populate_c,                      RHI_Shader_Type::Compute, "grass_populate.hlsl"                                                                              },
+            { Renderer_Shader::grass_indirect_args_c,                 RHI_Shader_Type::Compute, "grass_indirect_args.hlsl"                                                                         },
+            { Renderer_Shader::grass_gbuffer_v,                       RHI_Shader_Type::Vertex,  "g_buffer.hlsl",                              RHI_Vertex_Type::PosUvNorTan, "GRASS_INSTANCED"        },
+
+            // gpu texture compression, synchronous so encode-on-load can wait
+            { Renderer_Shader::texture_compress_bc1_c,                RHI_Shader_Type::Compute, "texture_compress_bc1.hlsl",                  RHI_Vertex_Type::Max, nullptr,                         false },
+            { Renderer_Shader::texture_compress_bc3_c,                RHI_Shader_Type::Compute, "texture_compress_bc3.hlsl",                  RHI_Vertex_Type::Max, nullptr,                         false },
+            { Renderer_Shader::texture_compress_bc5_c,                RHI_Shader_Type::Compute, "texture_compress_bc5.hlsl",                  RHI_Vertex_Type::Max, nullptr,                         false },
+        };
+
+        for (const ShaderEntry& e : table)
+        {
+            if (e.rt_only && !rt)
+            {
+                continue;
+            }
+            if (e.ms_only && !ms)
+            {
+                continue;
+            }
+            // the tlas declaration in common_resources.hlsl is gated behind this define so that modules
+            // built for devices without ray tracing never carry the spir-v ray query capability
+            const bool needs_ray_tracing_define =
+                e.rt_only ||
+                e.id == Renderer_Shader::particle_render_p ||
+                e.id == Renderer_Shader::particle_volume_resolve_c ||
+                e.id == Renderer_Shader::particle_volume_composite_c ||
+                e.id == Renderer_Shader::fog_inject_c;
+            const char* define_ext = (rt && needs_ray_tracing_define) ? "RAY_TRACING_ENABLED" : nullptr;
+            compile_shader(e.id, e.stage, sd + e.file, e.async, e.vtype, e.define, define_ext, e.define2);
+        }
+    }
+
+    void Renderer::CreateFonts()
+    {
+        const string dir_font = ResourceCache::GetResourceDirectory(ResourceDirectory::Fonts) + "/";
+
+        uint32_t size = static_cast<uint32_t>(10 * Window::GetDpiScale());
+        standard_font = make_shared<Font>(dir_font + "OpenSans/OpenSans-Medium.ttf", size, Color(0.9f, 0.9f, 0.9f, 1.0f));
+    }
+
+    void Renderer::CreateStandardMeshes()
+    {
+        using VertexVec = vector<RHI_Vertex_PosTexNorTan>;
+        using IndexVec  = vector<uint32_t>;
+
+        struct MeshDef
+        {
+            MeshType type;
+            void (*generate)(VertexVec*, IndexVec*);
+            const char* name;
+        };
+
+        // wrappers to bind default arguments for functions with extra parameters
+        auto gen_sphere   = [](VertexVec* v, IndexVec* i) { geometry_generation::generate_sphere(v, i);   };
+        auto gen_cylinder = [](VertexVec* v, IndexVec* i) { geometry_generation::generate_cylinder(v, i); };
+        auto gen_cone     = [](VertexVec* v, IndexVec* i) { geometry_generation::generate_cone(v, i);     };
+
+        const MeshDef defs[] =
+        {
+            { MeshType::Cube,     geometry_generation::generate_cube, "standard_cube"     },
+            { MeshType::Quad,     geometry_generation::generate_quad, "standard_quad"     },
+            { MeshType::Sphere,   +gen_sphere,                        "standard_sphere"   },
+            { MeshType::Cylinder, +gen_cylinder,                      "standard_cylinder" },
+            { MeshType::Cone,     +gen_cone,                          "standard_cone"     },
+        };
+
+        const string project_directory = ResourceCache::GetProjectDirectory();
+        for (const MeshDef& def : defs)
+        {
+            shared_ptr<Mesh> mesh = make_shared<Mesh>();
+            VertexVec vertices;
+            IndexVec indices;
+
+            def.generate(&vertices, &indices);
+            mesh->SetResourceFilePath(project_directory + def.name + EXTENSION_MESH);
+            mesh->SetFlag(static_cast<uint32_t>(MeshFlags::PostProcessOptimize), false);
+            mesh->AddGeometry(vertices, indices, false);
+            mesh->SetType(def.type);
+            mesh->CreateGpuBuffers();
+
+            standard_meshes[static_cast<uint8_t>(def.type)] = mesh;
+        }
+
+        m_lines_vertex_buffer = make_shared<RHI_Buffer>();
+    }
+
+    void Renderer::CreateStandardTextures()
+    {
+        const string dir_texture = ResourceCache::GetResourceDirectory(ResourceDirectory::Textures) + "/";
+        const string dir_icon    = ResourceCache::GetResourceDirectory(ResourceDirectory::Icons) + "/";
+        const string dir_shaders = ResourceCache::GetResourceDirectory(ResourceDirectory::Shaders) + "/";
+
+        struct TexDef
+        {
+            Renderer_StandardTexture id;
+            string path;
+        };
+
+        const TexDef file_textures[] =
+        {
+            { Renderer_StandardTexture::Noise_perlin,             dir_texture + "noise_perlin.png"       },
+            { Renderer_StandardTexture::Noise_blue,               dir_texture + "noise_blue_0.png"       },
+            { Renderer_StandardTexture::Gizmo_light_directional,  dir_icon + "light_directional.png"     },
+            { Renderer_StandardTexture::Gizmo_light_point,        dir_icon + "light_point.png"           },
+            { Renderer_StandardTexture::Gizmo_light_spot,         dir_icon + "light_spot.png"            },
+            { Renderer_StandardTexture::Gizmo_audio_source,       dir_icon + "audio.png"                 },
+            { Renderer_StandardTexture::Gizmo_camera,             dir_icon + "camera.png"                },
+            { Renderer_StandardTexture::Gizmo_particle,           dir_icon + "particle.png"              },
+            { Renderer_StandardTexture::Gizmo_physics,            dir_icon + "physics.png"               },
+            { Renderer_StandardTexture::Gizmo_volume,             dir_icon + "volume.png"                },
+            { Renderer_StandardTexture::Gizmo_script,             dir_icon + "script.png"                },
+            { Renderer_StandardTexture::Gizmo_spline,             dir_icon + "spline.png"                },
+            { Renderer_StandardTexture::Gizmo_spline_follower,    dir_icon + "spline_follower.png"       },
+            { Renderer_StandardTexture::Gizmo_terrain,            dir_icon + "terrain.png"               },
+            { Renderer_StandardTexture::Gizmo_skid_marks,         dir_icon + "skid_marks.png"            },
+            { Renderer_StandardTexture::Gizmo_water,              dir_icon + "water.png"                 },
+            { Renderer_StandardTexture::Gizmo_traffic,            dir_icon + "traffic.png"               },
+            { Renderer_StandardTexture::Gizmo_pedestrians,        dir_icon + "pedestrians.png"           },
+            { Renderer_StandardTexture::Gizmo_spawn_point,        dir_icon + "spawn_point.png"           },
+            { Renderer_StandardTexture::Gizmo_car_reset,          dir_icon + "car_reset.png"             },
+            { Renderer_StandardTexture::Gizmo_text_3d,            dir_icon + "text_3d.png"               },
+            { Renderer_StandardTexture::Gizmo_animator,           dir_icon + "animator.png"              },
+            { Renderer_StandardTexture::Gizmo_ragdoll,            dir_icon + "ragdoll.png"               },
+            { Renderer_StandardTexture::Checkerboard,             dir_texture + "no_texture.png"         },
+        };
+
+        // decode and upload file textures in parallel, ImmediateExecution is mutexed per queue
+        const uint32_t tex_count = static_cast<uint32_t>(sizeof(file_textures) / sizeof(file_textures[0]));
+        ThreadPool::ParallelLoop([&](uint32_t start, uint32_t end)
+        {
+            for (uint32_t i = start; i < end; i++)
+            {
+                at(standard_textures, file_textures[i].id) = make_shared<RHI_Texture>(file_textures[i].path);
+            }
+        }, tex_count);
+
+        // solid 1x1 textures
+        {
+            auto create_solid_texture = [](const char* name, std::byte r, std::byte g, std::byte b, std::byte a)
+            {
+                std::vector<RHI_Texture_Mip>   mips   = { RHI_Texture_Mip{std::vector<std::byte>{r, g, b, a}} };
+                std::vector<RHI_Texture_Slice> slices  = { RHI_Texture_Slice{mips} };
+                return make_shared<RHI_Texture>(RHI_Texture_Type::Type2D, 1, 1, 1, 1, RHI_Format::R8G8B8A8_Unorm, RHI_Texture_Srv | RHI_Texture_Uav, name, slices);
+            };
+
+            at(standard_textures, Renderer_StandardTexture::Black) = create_solid_texture("black_texture", std::byte{0},   std::byte{0},   std::byte{0},   std::byte{255});
+            at(standard_textures, Renderer_StandardTexture::White) = create_solid_texture("white_texture", std::byte{255}, std::byte{255}, std::byte{255}, std::byte{255});
+        }
+
+        // yale bright star catalog, sorted into an angular grid for the night sky draw
+        {
+            const string stars_path = dir_shaders + "sky/stars.bin";
+            ifstream file(stars_path, ios::binary);
+            struct StarRaw
+            {
+                float dir_x, dir_y, dir_z;
+                float col_r, col_g, col_b;
+                float radius;
+            };
+
+            uint32_t magic = 0;
+            uint32_t version = 0;
+            uint32_t star_count = 0;
+            vector<StarRaw> stars;
+            if (file.is_open())
+            {
+                file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+                file.read(reinterpret_cast<char*>(&version), sizeof(version));
+                file.read(reinterpret_cast<char*>(&star_count), sizeof(star_count));
+                if (magic == 0x52545353 && version == 1 && star_count > 0 && star_count < 100000)
+                {
+                    stars.resize(star_count);
+                    file.read(reinterpret_cast<char*>(stars.data()), static_cast<streamsize>(star_count * sizeof(StarRaw)));
+                }
+            }
+
+            constexpr uint32_t grid_w = 256;
+            constexpr uint32_t grid_h = 128;
+            vector<vector<uint32_t>> cells(grid_w * grid_h);
+            auto direction_to_uv = [](float x, float y, float z) -> pair<float, float>
+            {
+                float u = 0.5f + atan2f(z, x) / (2.0f * pi);
+                float v = 0.5f - asinf(clamp(y, -1.0f, 1.0f)) / pi;
+                u = u - floorf(u);
+                return { u, v };
+            };
+
+            for (uint32_t i = 0; i < static_cast<uint32_t>(stars.size()); i++)
+            {
+                const StarRaw& s = stars[i];
+                auto [u, v] = direction_to_uv(s.dir_x, s.dir_y, s.dir_z);
+                uint32_t cx = min(grid_w - 1u, static_cast<uint32_t>(u * grid_w));
+                uint32_t cy = min(grid_h - 1u, static_cast<uint32_t>(v * grid_h));
+                cells[cy * grid_w + cx].push_back(i);
+            }
+
+            vector<StarRaw> sorted;
+            sorted.reserve(stars.size());
+            vector<uint32_t> cell_offset(grid_w * grid_h, 0);
+            vector<uint32_t> cell_count(grid_w * grid_h, 0);
+            uint32_t running = 0;
+            for (uint32_t c = 0; c < grid_w * grid_h; c++)
+            {
+                cell_offset[c] = running;
+                cell_count[c]  = static_cast<uint32_t>(cells[c].size());
+                for (uint32_t idx : cells[c])
+                {
+                    sorted.push_back(stars[idx]);
+                }
+                running += cell_count[c];
+            }
+
+            const uint32_t count = max(1u, static_cast<uint32_t>(sorted.size()));
+            vector<std::byte> star_bytes(static_cast<size_t>(count) * 2u * 16u, std::byte{0});
+            for (uint32_t i = 0; i < static_cast<uint32_t>(sorted.size()); i++)
+            {
+                const StarRaw& s = sorted[i];
+                float row0[4] = { s.dir_x, s.dir_y, s.dir_z, s.radius };
+                float row1[4] = { s.col_r, s.col_g, s.col_b, 0.0f };
+                memcpy(star_bytes.data() + (static_cast<size_t>(i) * 16u), row0, 16);
+                memcpy(star_bytes.data() + (static_cast<size_t>(count + i) * 16u), row1, 16);
+            }
+
+            vector<std::byte> grid_bytes(static_cast<size_t>(grid_w * grid_h) * 16u, std::byte{0});
+            for (uint32_t c = 0; c < grid_w * grid_h; c++)
+            {
+                float cell[4];
+                uint32_t offset = cell_offset[c];
+                uint32_t count  = cell_count[c];
+                memcpy(&cell[0], &offset, 4);
+                memcpy(&cell[1], &count, 4);
+                cell[2] = 0.0f;
+                cell[3] = 0.0f;
+                memcpy(grid_bytes.data() + static_cast<size_t>(c) * 16u, cell, 16);
+            }
+
+            {
+                vector<RHI_Texture_Mip> mips = { RHI_Texture_Mip{ move(star_bytes) } };
+                vector<RHI_Texture_Slice> slices = { RHI_Texture_Slice{ move(mips) } };
+                at(standard_textures, Renderer_StandardTexture::Sky_stars) = make_shared<RHI_Texture>(
+                    RHI_Texture_Type::Type2D, count, sorted.empty() ? 1u : 2u, 1, 1,
+                    RHI_Format::R32G32B32A32_Float, RHI_Texture_Srv, "sky_stars", slices);
+            }
+            {
+                vector<RHI_Texture_Mip> mips = { RHI_Texture_Mip{ move(grid_bytes) } };
+                vector<RHI_Texture_Slice> slices = { RHI_Texture_Slice{ move(mips) } };
+                at(standard_textures, Renderer_StandardTexture::Sky_star_grid) = make_shared<RHI_Texture>(
+                    RHI_Texture_Type::Type2D, grid_w, grid_h, 1, 1,
+                    RHI_Format::R32G32B32A32_Float, RHI_Texture_Srv, "sky_star_grid", slices);
+            }
+
+            if (!sorted.empty())
+            {
+                SP_LOG_INFO("loaded %u catalog stars for the night sky", static_cast<uint32_t>(sorted.size()));
+            }
+            else
+            {
+                SP_LOG_WARNING("night sky catalog missing or empty (%s)", stars_path.c_str());
+            }
+        }
+    }
+
+    void Renderer::CreateStandardMaterials()
+    {
+        const string data_dir = string(ResourceCache::GetDataDirectory()) + "/";
+        FileSystem::CreateDirectory_(data_dir);
+
+        standard_material = make_shared<Material>();
+        standard_material->SetResourceName("standard" + string(EXTENSION_MATERIAL));
+        standard_material->SetProperty(MaterialProperty::TextureTilingX, 1.0f);
+        standard_material->SetProperty(MaterialProperty::TextureTilingY, 1.0f);
+        standard_material->SetProperty(MaterialProperty::ColorR,         1.0f);
+        standard_material->SetProperty(MaterialProperty::ColorG,         1.0f);
+        standard_material->SetProperty(MaterialProperty::ColorB,         1.0f);
+        standard_material->SetProperty(MaterialProperty::ColorA,         1.0f);
+        standard_material->SetProperty(MaterialProperty::WorldSpaceUv,   1.0f);
+        standard_material->SetTexture(MaterialTextureType::Color,        Renderer::GetStandardTexture(Renderer_StandardTexture::Checkerboard));
+    }
+
+    void Renderer::DestroyResources()
+    {
+        render_targets.fill(nullptr);
+        shaders.fill(nullptr);
+        samplers.fill(nullptr);
+        standard_textures.fill(nullptr);
+        standard_meshes.fill(nullptr);
+        buffers.fill(nullptr);
+
+        m_frame_resources.fill(FrameResource{});
+
+        standard_font     = nullptr;
+        standard_material = nullptr;
+    }
+
+    array<shared_ptr<RHI_Texture>, static_cast<uint32_t>(Renderer_RenderTarget::max)>& Renderer::GetRenderTargets()
+    {
+        return render_targets;
+    }
+
+    array<shared_ptr<RHI_Shader>, static_cast<uint32_t>(Renderer_Shader::max)>& Renderer::GetShaders()
+    {
+        return shaders;
+    }
+
+    array<shared_ptr<RHI_Buffer>, static_cast<uint32_t>(Renderer_Buffer::Max)>& Renderer::GetStructuredBuffers()
+    {
+        return buffers;
+    }
+
+    array<shared_ptr<RHI_Sampler>, static_cast<uint32_t>(Renderer_Sampler::Max)>& Renderer::GetSamplers()
+    {
+        static_assert(static_cast<uint32_t>(Renderer_Sampler::Max) == rhi_max_sampler_count);
+        return samplers;
+    }
+
+    array<RHI_Texture*, rhi_max_array_size>& Renderer::GetBindlessMaterialTextures()
+    {
+        return m_bindless_textures;
+    }
+
+    RHI_RasterizerState* Renderer::GetRasterizerState(const Renderer_RasterizerState type)
+    {
+        return rasterizer_states[static_cast<uint8_t>(type)].get();
+    }
+
+    RHI_DepthStencilState* Renderer::GetDepthStencilState(const Renderer_DepthStencilState type)
+    {
+        return depth_stencil_states[static_cast<uint8_t>(type)].get();
+    }
+
+    RHI_BlendState* Renderer::GetBlendState(const Renderer_BlendState type)
+    {
+        return blend_states[static_cast<uint8_t>(type)].get();
+    }
+
+    RHI_Texture* Renderer::GetRenderTarget(const Renderer_RenderTarget type)
+    {
+        return render_targets[static_cast<uint8_t>(type)].get();
+    }
+
+    RHI_Shader* Renderer::GetShader(const Renderer_Shader type)
+    {
+        return shaders[static_cast<uint8_t>(type)].get();
+    }
+
+    RHI_Buffer* Renderer::GetBuffer(const Renderer_Buffer type)
+    {
+        return buffers[static_cast<uint8_t>(type)].get();
+    }
+
+    void Renderer::RotateFrameBuffers()
+    {
+        m_frame_resource_index =
+            (
+                m_frame_resource_index +
+                1
+            ) %
+            renderer_draw_data_buffer_count;
+        FrameResource& fr =
+            m_frame_resources[m_frame_resource_index];
+
+        if (
+            fr.completion_timeline &&
+            fr.completion_value != 0
+        )
+        {
+            ScopedTimeBlock time_block(
+                "frame_slot_wait"
+            );
+            fr.completion_timeline->Wait(
+                numeric_limits<uint64_t>::max(),
+                fr.completion_value
+            );
+            fr.completion_timeline = nullptr;
+            fr.completion_value    = 0;
+        }
+
+        buffers[static_cast<uint8_t>(Renderer_Buffer::IndirectDrawArgs)]     = fr.indirect_draw_args;
+        buffers[static_cast<uint8_t>(Renderer_Buffer::CpuIndirectDrawArgs)]  = fr.cpu_indirect_draw_args;
+        buffers[static_cast<uint8_t>(Renderer_Buffer::IndirectDrawData)]     = fr.indirect_draw_data;
+        buffers[static_cast<uint8_t>(Renderer_Buffer::MeshletInstances)]     = fr.meshlet_instances;
+        buffers[static_cast<uint8_t>(Renderer_Buffer::VisibleTriangles)]     = fr.visible_triangles;
+        buffers[static_cast<uint8_t>(Renderer_Buffer::TriangleDispatchArgs)] = fr.triangle_dispatch_args;
+        buffers[static_cast<uint8_t>(Renderer_Buffer::CullTasks)]            = fr.cull_tasks;
+        buffers[static_cast<uint8_t>(Renderer_Buffer::SurvivingInstances)]   = fr.surviving_instances;
+        buffers[static_cast<uint8_t>(Renderer_Buffer::InstanceDispatchArgs)] = fr.instance_dispatch_args;
+        m_cpu_indirect_draw_arg_count = 0;
+    }
+
+    RHI_Texture* Renderer::GetStandardTexture(const Renderer_StandardTexture type)
+    {
+        return standard_textures[static_cast<uint8_t>(type)].get();
+    }
+
+    shared_ptr<Mesh>& Renderer::GetStandardMesh(const MeshType type)
+    {
+        return standard_meshes[static_cast<uint8_t>(type)];
+    }
+
+    shared_ptr<Font>& Renderer::GetFont()
+    {
+        return standard_font;
+    }
+
+    shared_ptr<Material>& Renderer::GetStandardMaterial()
+    {
+        return standard_material;
+    }
+
+    void Renderer::ClearMaterialTextureReferences()
+    {
+        // clear cached texture pointers that become dangling when resource cache shuts down
+        if (standard_material)
+        {
+            standard_material->ClearPackedTextures();
+        }
+    }
+}

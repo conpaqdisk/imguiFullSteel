@@ -1,0 +1,924 @@
+/*
+Copyright(c) 2016-2024 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES ========================
+#include "pch.h"
+#include "../RHI_Implementation.h"
+#include "../RHI_Pipeline.h"
+#include "../RHI_Device.h"
+#include "../RHI_RasterizerState.h"
+#include "../RHI_Shader.h"
+#include "../RHI_BlendState.h"
+#include "../RHI_DepthStencilState.h"
+#include "../RHI_InputLayout.h"
+#include "../RHI_SwapChain.h"
+#include "../RHI_Texture.h"
+#include "../rendering/Renderer.h"
+#include "D3D12_Internal.h"
+#include <wrl/client.h>
+#include <cstring>
+#include <cmath>
+//===================================
+
+using namespace std;
+
+namespace spartan
+{
+    // forward declarations
+    static ID3D12RootSignature* get_or_create_bindless_root_signature();
+    static void create_root_signature_bindless(RHI_Pipeline* pipeline);
+    static void create_compute_pipeline(RHI_Pipeline* pipeline, RHI_PipelineState& state);
+    static void create_graphics_pipeline(RHI_Pipeline* pipeline, RHI_PipelineState& state);
+    static void create_ray_tracing_pipeline(RHI_Pipeline* pipeline, RHI_PipelineState& state);
+
+    static bool pso_is_imgui(const RHI_PipelineState& state)
+    {
+        return state.name != nullptr && strcmp(state.name, "imgui") == 0;
+    }
+
+    // shaders reading sv_viewid require the pso to declare view instancing, which only the stream api exposes
+    static bool view_instancing_supported()
+    {
+        static int supported = -1;
+        if (supported == -1)
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS3 options3 = {};
+            const bool queried = SUCCEEDED(RHI_Context::device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options3, sizeof(options3)));
+            supported = (queried && options3.ViewInstancingTier != D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED) ? 1 : 0;
+        }
+        return supported == 1;
+    }
+
+    // pso stream subobject wrapper, replaces the CD3DX12 helpers which are not vendored
+    template<typename T, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE SubobjectType>
+    struct alignas(void*) pso_subobject
+    {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = SubobjectType;
+        T value = {};
+    };
+
+    struct pso_stream_graphics
+    {
+        pso_subobject<ID3D12RootSignature*, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE> root_signature;
+        pso_subobject<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS> vs;
+        pso_subobject<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS> hs;
+        pso_subobject<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS> ds;
+        pso_subobject<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS> ps;
+        pso_subobject<D3D12_BLEND_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND> blend;
+        pso_subobject<UINT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK> sample_mask;
+        pso_subobject<D3D12_RASTERIZER_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER> rasterizer;
+        pso_subobject<D3D12_DEPTH_STENCIL_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL> depth_stencil;
+        pso_subobject<D3D12_INPUT_LAYOUT_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT> input_layout;
+        pso_subobject<D3D12_PRIMITIVE_TOPOLOGY_TYPE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY> topology;
+        pso_subobject<D3D12_RT_FORMAT_ARRAY, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS> rtv_formats;
+        pso_subobject<DXGI_FORMAT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT> dsv_format;
+        pso_subobject<DXGI_SAMPLE_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC> sample_desc;
+        pso_subobject<D3D12_VIEW_INSTANCING_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING> view_instancing;
+    };
+
+    // mesh pipelines cannot use the classic graphics desc, they require an ms subobject and no vs/input layout
+    struct pso_stream_mesh
+    {
+        pso_subobject<ID3D12RootSignature*, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE> root_signature;
+        pso_subobject<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS> ms;
+        pso_subobject<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS> ps;
+        pso_subobject<D3D12_BLEND_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND> blend;
+        pso_subobject<UINT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK> sample_mask;
+        pso_subobject<D3D12_RASTERIZER_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER> rasterizer;
+        pso_subobject<D3D12_DEPTH_STENCIL_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL> depth_stencil;
+        pso_subobject<D3D12_PRIMITIVE_TOPOLOGY_TYPE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY> topology;
+        pso_subobject<D3D12_RT_FORMAT_ARRAY, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS> rtv_formats;
+        pso_subobject<DXGI_FORMAT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT> dsv_format;
+        pso_subobject<DXGI_SAMPLE_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC> sample_desc;
+        pso_subobject<D3D12_VIEW_INSTANCING_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING> view_instancing;
+    };
+
+    RHI_Pipeline::RHI_Pipeline(RHI_PipelineState& pipeline_state, RHI_DescriptorSetLayout* descriptor_set_layout)
+    {
+        m_state = pipeline_state;
+
+        if (pipeline_state.IsCompute())
+        {
+            create_compute_pipeline(this, m_state);
+        }
+        else if (pipeline_state.IsGraphics())
+        {
+            create_graphics_pipeline(this, m_state);
+        }
+        else if (pipeline_state.IsRayTracing())
+        {
+            create_ray_tracing_pipeline(this, m_state);
+        }
+    }
+
+    static void pso_hash_to_name(uint64_t hash, wchar_t* out)
+    {
+        static const wchar_t* hex = L"0123456789ABCDEF";
+        for (int i = 15; i >= 0; i--)
+        {
+            out[15 - i] = hex[(hash >> (i * 4)) & 0xF];
+        }
+        out[16] = 0;
+    }
+
+    static void create_compute_pipeline(RHI_Pipeline* pipeline, RHI_PipelineState& state)
+    {
+        // compute always uses the bindless root signature
+        create_root_signature_bindless(pipeline);
+
+        if (!pipeline->GetRhiResourceLayout())
+        {
+            SP_LOG_ERROR("Failed to create root signature for compute pipeline '%s'", state.name ? state.name : "?");
+            return;
+        }
+
+        D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
+        desc.pRootSignature = static_cast<ID3D12RootSignature*>(pipeline->GetRhiResourceLayout());
+
+        if (state.shaders[RHI_Shader_Type::Compute])
+        {
+            desc.CS.pShaderBytecode = state.shaders[RHI_Shader_Type::Compute]->GetRhiResource();
+            desc.CS.BytecodeLength  = state.shaders[RHI_Shader_Type::Compute]->GetObjectSize();
+        }
+
+        wchar_t pso_name[17];
+        pso_hash_to_name(state.GetHash(), pso_name);
+
+        void* resource = nullptr;
+        ID3D12PipelineLibrary* lib = static_cast<ID3D12PipelineLibrary*>(RHI_Device::GetPipelineCache());
+        if (lib && d3d12_pipeline_library::can_load())
+        {
+            HRESULT hr_load = lib->LoadComputePipeline(pso_name, &desc, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(&resource)));
+            if (SUCCEEDED(hr_load))
+            {
+                pipeline->SetRhiResource(resource);
+                return;
+            }
+        }
+
+        HRESULT hr = RHI_Context::device->CreateComputePipelineState(&desc, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(&resource)));
+        if (FAILED(hr))
+        {
+            SP_LOG_ERROR("Failed to create compute pipeline state '%s': %s", state.name ? state.name : "?", d3d12_utility::error::dxgi_error_to_string(hr));
+        }
+        else if (lib && resource)
+        {
+            lib->StorePipeline(pso_name, static_cast<ID3D12PipelineState*>(resource));
+        }
+        pipeline->SetRhiResource(resource);
+    }
+
+    static void create_graphics_pipeline(RHI_Pipeline* pipeline, RHI_PipelineState& state)
+    {
+        // every graphics pso, including imgui, shares the unified bindless root signature
+        create_root_signature_bindless(pipeline);
+
+        if (!pipeline->GetRhiResourceLayout())
+        {
+            SP_LOG_ERROR("Failed to create root signature for graphics pipeline '%s'", state.name ? state.name : "?");
+            return;
+        }
+
+        // rasterizer description
+        D3D12_RASTERIZER_DESC desc_rasterizer = {};
+        if (state.rasterizer_state)
+        {
+            desc_rasterizer.FillMode              = d3d12_polygon_mode[static_cast<uint32_t>(state.rasterizer_state->GetPolygonMode())];
+            desc_rasterizer.CullMode              = pso_is_imgui(state) ? D3D12_CULL_MODE_NONE : d3d12_cull_mode[static_cast<uint32_t>(state.cull_mode)];
+            desc_rasterizer.FrontCounterClockwise = false;
+            // d3d12 expects an integer bias in units of the depth format's smallest representable value,
+            // scale by 2^24 to match the vulkan depthBiasConstantFactor so both backends produce the same offset
+            desc_rasterizer.DepthBias             = static_cast<INT>(floorf(state.rasterizer_state->GetDepthBias() * static_cast<float>(1 << 24)));
+            desc_rasterizer.DepthBiasClamp        = state.rasterizer_state->GetDepthBiasClamp();
+            desc_rasterizer.SlopeScaledDepthBias  = state.rasterizer_state->GetDepthBiasSlopeScaled();
+            desc_rasterizer.DepthClipEnable       = state.rasterizer_state->GetDepthClipEnabled();
+        }
+        else
+        {
+            desc_rasterizer.FillMode        = D3D12_FILL_MODE_SOLID;
+            desc_rasterizer.CullMode        = D3D12_CULL_MODE_NONE;
+            desc_rasterizer.DepthClipEnable = true;
+        }
+
+        // for hdr swapchains (r10g10b10a2_unorm), dwm uses the alpha channel during compositing,
+        // imgui's standard alpha blending overwrites alpha to 0 which makes the window transparent on hdr displays,
+        // so for the imgui pso we strip alpha out of the write mask to keep the cleared alpha value (1)
+        const UINT8 imgui_write_mask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
+        const UINT8 write_mask       = pso_is_imgui(state) ? imgui_write_mask : D3D12_COLOR_WRITE_ENABLE_ALL;
+
+        D3D12_BLEND_DESC desc_blend_state = {};
+        {
+            // build a single attachment blend desc then replicate it across all targets, matches the vulkan path
+            D3D12_RENDER_TARGET_BLEND_DESC rt_blend = {};
+            if (state.blend_state)
+            {
+                rt_blend.BlendEnable           = state.blend_state->GetBlendEnabled();
+                rt_blend.SrcBlend              = d3d12_blend_factor[static_cast<uint32_t>(state.blend_state->GetSourceBlend())];
+                rt_blend.DestBlend             = d3d12_blend_factor[static_cast<uint32_t>(state.blend_state->GetDestBlend())];
+                rt_blend.BlendOp               = d3d12_blend_operation[static_cast<uint32_t>(state.blend_state->GetBlendOp())];
+                rt_blend.SrcBlendAlpha         = d3d12_blend_factor[static_cast<uint32_t>(state.blend_state->GetSourceBlendAlpha())];
+                rt_blend.DestBlendAlpha        = d3d12_blend_factor[static_cast<uint32_t>(state.blend_state->GetDestBlendAlpha())];
+                rt_blend.BlendOpAlpha          = d3d12_blend_operation[static_cast<uint32_t>(state.blend_state->GetBlendOpAlpha())];
+                rt_blend.RenderTargetWriteMask = write_mask;
+            }
+            else
+            {
+                rt_blend.BlendEnable           = false;
+                rt_blend.RenderTargetWriteMask = write_mask;
+            }
+
+            // per-target blend state requires IndependentBlendEnable, the desc is identical for every target so it is harmless
+            desc_blend_state.IndependentBlendEnable = TRUE;
+            for (uint32_t i = 0; i < rhi_max_render_target_count; i++)
+            {
+                desc_blend_state.RenderTarget[i] = rt_blend;
+            }
+        }
+
+        // depth-stencil state
+        D3D12_DEPTH_STENCIL_DESC desc_depth_stencil_state = {};
+        if (state.depth_stencil_state)
+        {
+            desc_depth_stencil_state.DepthEnable                  = state.depth_stencil_state->GetDepthTestEnabled();
+            desc_depth_stencil_state.DepthWriteMask               = state.depth_stencil_state->GetDepthWriteEnabled() ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+            desc_depth_stencil_state.DepthFunc                    = d3d12_comparison_function[static_cast<uint32_t>(state.depth_stencil_state->GetDepthComparisonFunction())];
+            desc_depth_stencil_state.StencilEnable                = static_cast<BOOL>(state.depth_stencil_state->GetStencilTestEnabled() || state.depth_stencil_state->GetStencilWriteEnabled());
+            desc_depth_stencil_state.StencilReadMask              = state.depth_stencil_state->GetStencilReadMask();
+            desc_depth_stencil_state.StencilWriteMask             = state.depth_stencil_state->GetStencilWriteMask();
+            desc_depth_stencil_state.FrontFace.StencilFailOp      = d3d12_stencil_operation[static_cast<uint32_t>(state.depth_stencil_state->GetStencilFailOperation())];
+            desc_depth_stencil_state.FrontFace.StencilDepthFailOp = d3d12_stencil_operation[static_cast<uint32_t>(state.depth_stencil_state->GetStencilDepthFailOperation())];
+            desc_depth_stencil_state.FrontFace.StencilPassOp      = d3d12_stencil_operation[static_cast<uint32_t>(state.depth_stencil_state->GetStencilPassOperation())];
+            desc_depth_stencil_state.FrontFace.StencilFunc        = d3d12_comparison_function[static_cast<uint32_t>(state.depth_stencil_state->GetStencilComparisonFunction())];
+            desc_depth_stencil_state.BackFace                     = desc_depth_stencil_state.FrontFace;
+        }
+        else
+        {
+            desc_depth_stencil_state.DepthEnable    = false;
+            desc_depth_stencil_state.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+            desc_depth_stencil_state.StencilEnable  = false;
+        }
+
+        // input layout
+        D3D12_INPUT_LAYOUT_DESC desc_input_layout = {};
+        vector<D3D12_INPUT_ELEMENT_DESC> vertex_attributes;
+        RHI_Shader* shader_vertex = state.shaders[RHI_Shader_Type::Vertex];
+        if (shader_vertex)
+        {
+            if (RHI_InputLayout* input_layout = shader_vertex->GetInputLayout().get())
+            {
+                vertex_attributes.reserve(input_layout->GetAttributeDescriptions().size());
+
+                for (const VertexAttribute& attribute : input_layout->GetAttributeDescriptions())
+                {
+                    vertex_attributes.push_back
+                    ({
+                        attribute.name.c_str(),
+                        0,
+                        d3d12_format[rhi_format_to_index(attribute.format)],
+                        0,
+                        attribute.offset,
+                        D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                        0
+                    });
+                }
+            }
+
+            desc_input_layout.pInputElementDescs = vertex_attributes.data();
+            desc_input_layout.NumElements        = static_cast<uint32_t>(vertex_attributes.size());
+        }
+
+        // determine render target formats from pso (supports mrt)
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+        uint32_t rt_count = 0;
+        for (uint32_t i = 0; i < rhi_max_render_target_count; i++)
+        {
+            if (state.render_target_color_textures[i])
+            {
+                desc.RTVFormats[i] = d3d12_format[rhi_format_to_index(state.render_target_color_textures[i]->GetFormat())];
+                rt_count           = i + 1;
+            }
+        }
+        if (rt_count == 0 && state.render_target_swapchain)
+        {
+            desc.RTVFormats[0] = d3d12_format[rhi_format_to_index(state.render_target_swapchain->GetFormat())];
+            rt_count           = 1;
+        }
+        desc.NumRenderTargets = rt_count;
+
+        // depth format
+        if (state.render_target_depth_texture)
+        {
+            DXGI_FORMAT dsv = DXGI_FORMAT_D32_FLOAT;
+            switch (state.render_target_depth_texture->GetFormat())
+            {
+                case RHI_Format::D16_Unorm:             dsv = DXGI_FORMAT_D16_UNORM; break;
+                case RHI_Format::D32_Float:             dsv = DXGI_FORMAT_D32_FLOAT; break;
+                case RHI_Format::D32_Float_S8X24_Uint:  dsv = DXGI_FORMAT_D32_FLOAT_S8X24_UINT; break;
+                default: break;
+            }
+            desc.DSVFormat = dsv;
+        }
+
+        desc.InputLayout           = desc_input_layout;
+        desc.pRootSignature        = static_cast<ID3D12RootSignature*>(pipeline->GetRhiResourceLayout());
+        desc.RasterizerState       = desc_rasterizer;
+        desc.BlendState            = desc_blend_state;
+        desc.DepthStencilState     = desc_depth_stencil_state;
+        desc.SampleMask            = UINT_MAX;
+        desc.PrimitiveTopologyType =
+            d3d12_primitive_topology[
+                static_cast<uint32_t>(
+                    state.primitive_topology
+                )
+            ];
+        desc.SampleDesc.Count      = 1;
+
+        // tessellation draws consume control point patches, matches the vulkan patch list topology
+        if (state.HasTessellation())
+        {
+            desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+        }
+
+        if (state.shaders[RHI_Shader_Type::Vertex])
+        {
+            desc.VS.pShaderBytecode = state.shaders[RHI_Shader_Type::Vertex]->GetRhiResource();
+            desc.VS.BytecodeLength  = state.shaders[RHI_Shader_Type::Vertex]->GetObjectSize();
+        }
+        if (state.shaders[RHI_Shader_Type::Hull])
+        {
+            desc.HS.pShaderBytecode = state.shaders[RHI_Shader_Type::Hull]->GetRhiResource();
+            desc.HS.BytecodeLength  = state.shaders[RHI_Shader_Type::Hull]->GetObjectSize();
+        }
+        if (state.shaders[RHI_Shader_Type::Domain])
+        {
+            desc.DS.pShaderBytecode = state.shaders[RHI_Shader_Type::Domain]->GetRhiResource();
+            desc.DS.BytecodeLength  = state.shaders[RHI_Shader_Type::Domain]->GetObjectSize();
+        }
+        if (state.shaders[RHI_Shader_Type::Pixel])
+        {
+            desc.PS.pShaderBytecode = state.shaders[RHI_Shader_Type::Pixel]->GetRhiResource();
+            desc.PS.BytecodeLength  = state.shaders[RHI_Shader_Type::Pixel]->GetObjectSize();
+        }
+
+        // stable wide name from pso hash for pipeline library load/store
+        wchar_t pso_name[17];
+        pso_hash_to_name(state.GetHash(), pso_name);
+
+        void* resource = nullptr;
+        ID3D12PipelineLibrary* lib = static_cast<ID3D12PipelineLibrary*>(RHI_Device::GetPipelineCache());
+
+        // mesh shader pipelines require a dedicated stream with an ms subobject
+        if (state.HasMeshShaders())
+        {
+            Microsoft::WRL::ComPtr<ID3D12Device2> device2;
+            if (FAILED(RHI_Context::device->QueryInterface(IID_PPV_ARGS(&device2))))
+            {
+                SP_LOG_ERROR("Mesh pipeline '%s' requires ID3D12Device2", state.name ? state.name : "?");
+                return;
+            }
+
+            D3D12_VIEW_INSTANCE_LOCATION view_locations[2] = { { 0, 0 }, { 0, 1 } };
+            D3D12_SHADER_BYTECODE ms_bytecode = {};
+            if (state.shaders[RHI_Shader_Type::MeshShader])
+            {
+                ms_bytecode.pShaderBytecode = state.shaders[RHI_Shader_Type::MeshShader]->GetRhiResource();
+                ms_bytecode.BytecodeLength  = state.shaders[RHI_Shader_Type::MeshShader]->GetObjectSize();
+            }
+
+            pso_stream_mesh stream                                  = {};
+            stream.root_signature.value                             = desc.pRootSignature;
+            stream.ms.value                                         = ms_bytecode;
+            stream.ps.value                                         = desc.PS;
+            stream.blend.value                                      = desc.BlendState;
+            stream.sample_mask.value                                = desc.SampleMask;
+            stream.rasterizer.value                                 = desc.RasterizerState;
+            stream.depth_stencil.value                              = desc.DepthStencilState;
+            stream.topology.value                                   = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            stream.rtv_formats.value.NumRenderTargets               = desc.NumRenderTargets;
+            for (uint32_t i = 0; i < desc.NumRenderTargets; i++)
+            {
+                stream.rtv_formats.value.RTFormats[i] = desc.RTVFormats[i];
+            }
+            stream.dsv_format.value                                 = desc.DSVFormat;
+            stream.sample_desc.value                                = desc.SampleDesc;
+            stream.view_instancing.value.ViewInstanceCount          = state.is_multiview ? 2 : 1;
+            stream.view_instancing.value.pViewInstanceLocations     = view_locations;
+            stream.view_instancing.value.Flags                      = D3D12_VIEW_INSTANCING_FLAG_NONE;
+
+            D3D12_PIPELINE_STATE_STREAM_DESC stream_desc = {};
+            stream_desc.SizeInBytes                      = sizeof(stream);
+            stream_desc.pPipelineStateSubobjectStream    = &stream;
+
+            Microsoft::WRL::ComPtr<ID3D12PipelineLibrary1> lib1;
+            if (lib && SUCCEEDED(lib->QueryInterface(IID_PPV_ARGS(&lib1))) && d3d12_pipeline_library::can_load())
+            {
+                if (SUCCEEDED(lib1->LoadPipeline(pso_name, &stream_desc, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(&resource)))))
+                {
+                    pipeline->SetRhiResource(resource);
+                    return;
+                }
+            }
+
+            HRESULT hr = device2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(&resource)));
+            if (FAILED(hr))
+            {
+                SP_LOG_ERROR("Failed to create mesh pipeline state '%s': %s", state.name ? state.name : "?", d3d12_utility::error::dxgi_error_to_string(hr));
+            }
+            else if (lib && resource)
+            {
+                lib->StorePipeline(pso_name, static_cast<ID3D12PipelineState*>(resource));
+            }
+            pipeline->SetRhiResource(resource);
+            return;
+        }
+
+        // stream-based creation declares view instancing, required by shaders reading sv_viewid (vulkan multiview parity)
+        Microsoft::WRL::ComPtr<ID3D12Device2> device2;
+        if (view_instancing_supported() && SUCCEEDED(RHI_Context::device->QueryInterface(IID_PPV_ARGS(&device2))))
+        {
+            // view n renders to render target array slice n, mono psos declare a single view which is a no-op
+            D3D12_VIEW_INSTANCE_LOCATION view_locations[2] = { { 0, 0 }, { 0, 1 } };
+
+            pso_stream_graphics stream                          = {};
+            stream.root_signature.value                         = desc.pRootSignature;
+            stream.vs.value                                     = desc.VS;
+            stream.hs.value                                     = desc.HS;
+            stream.ds.value                                     = desc.DS;
+            stream.ps.value                                     = desc.PS;
+            stream.blend.value                                  = desc.BlendState;
+            stream.sample_mask.value                            = desc.SampleMask;
+            stream.rasterizer.value                             = desc.RasterizerState;
+            stream.depth_stencil.value                          = desc.DepthStencilState;
+            stream.input_layout.value                           = desc.InputLayout;
+            stream.topology.value                               = desc.PrimitiveTopologyType;
+            stream.rtv_formats.value.NumRenderTargets           = desc.NumRenderTargets;
+            for (uint32_t i = 0; i < desc.NumRenderTargets; i++)
+            {
+                stream.rtv_formats.value.RTFormats[i] = desc.RTVFormats[i];
+            }
+            stream.dsv_format.value                             = desc.DSVFormat;
+            stream.sample_desc.value                            = desc.SampleDesc;
+            stream.view_instancing.value.ViewInstanceCount      = state.is_multiview ? 2 : 1;
+            stream.view_instancing.value.pViewInstanceLocations = view_locations;
+            stream.view_instancing.value.Flags                  = D3D12_VIEW_INSTANCING_FLAG_NONE;
+
+            D3D12_PIPELINE_STATE_STREAM_DESC stream_desc = {};
+            stream_desc.SizeInBytes                      = sizeof(stream);
+            stream_desc.pPipelineStateSubobjectStream    = &stream;
+
+            Microsoft::WRL::ComPtr<ID3D12PipelineLibrary1> lib1;
+            if (lib && SUCCEEDED(lib->QueryInterface(IID_PPV_ARGS(&lib1))) && d3d12_pipeline_library::can_load())
+            {
+                if (SUCCEEDED(lib1->LoadPipeline(pso_name, &stream_desc, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(&resource)))))
+                {
+                    pipeline->SetRhiResource(resource);
+                    return;
+                }
+            }
+
+            HRESULT hr = device2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(&resource)));
+            if (FAILED(hr))
+            {
+                SP_LOG_ERROR("Failed to create graphics pipeline state '%s': %s", state.name ? state.name : "?", d3d12_utility::error::dxgi_error_to_string(hr));
+            }
+            else if (lib && resource)
+            {
+                lib->StorePipeline(pso_name, static_cast<ID3D12PipelineState*>(resource));
+            }
+            pipeline->SetRhiResource(resource);
+            return;
+        }
+
+        if (state.is_multiview)
+        {
+            SP_LOG_ERROR("Multiview pipeline '%s' requires view instancing, which this device does not support", state.name ? state.name : "?");
+        }
+
+        if (lib && d3d12_pipeline_library::can_load())
+        {
+            HRESULT hr_load = lib->LoadGraphicsPipeline(pso_name, &desc, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(&resource)));
+            if (SUCCEEDED(hr_load))
+            {
+                pipeline->SetRhiResource(resource);
+                return;
+            }
+        }
+
+        HRESULT hr = RHI_Context::device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(&resource)));
+        if (FAILED(hr))
+        {
+            SP_LOG_ERROR("Failed to create graphics pipeline state '%s': %s", state.name ? state.name : "?", d3d12_utility::error::dxgi_error_to_string(hr));
+        }
+        else if (lib && resource)
+        {
+            lib->StorePipeline(pso_name, static_cast<ID3D12PipelineState*>(resource));
+        }
+        pipeline->SetRhiResource(resource);
+    }
+
+    // unified bindless root signature matching common_resources.hlsl layout
+    // root parameter slots (see D3D12_RootSlot below):
+    //   0: CBV b0 space0 (buffer_frame)
+    //   1: 32-bit root constants b1 space0 (buffer_pass - 16 dwords = 64 bytes)
+    //   2: SRV table t0..t31 space0
+    //   3: UAV table u0..u56 space0
+    //   4: SRV table t15 space1 unbounded (material_textures[])
+    //   5: SRV table t16 space2 (material_parameters)
+    //   6: SRV table t17 space3 (light_parameters)
+    //   7: SRV table t18 space4 (aabbs)
+    //   8: SRV table t19 space5 (draw_data)
+    //   9: SRV table t20 space8 (geometry_vertices) + t22 space9 (indices) + t23 space10 (instances)
+    //  10: Sampler table s0 space6 unbounded + s1 space7 unbounded
+    // identical for every pipeline, so it is built once and each pipeline takes a reference released through the deletion queue
+    static void create_root_signature_bindless(RHI_Pipeline* pipeline)
+    {
+        ID3D12RootSignature* root_sig = get_or_create_bindless_root_signature();
+        if (root_sig)
+        {
+            root_sig->AddRef();
+            pipeline->SetRhiResourceLayout(root_sig);
+        }
+    }
+
+    static ID3D12RootSignature* get_or_create_bindless_root_signature()
+    {
+        static ID3D12RootSignature* s_root_signature = nullptr;
+        if (s_root_signature)
+        {
+            return s_root_signature;
+        }
+
+        constexpr uint32_t param_count = 11;
+        D3D12_ROOT_PARAMETER1 params[param_count] = {};
+
+        // root signature 1.1 lets each range declare how volatile its descriptors and data are
+        // everything here stays fully volatile, which is exactly what 1.0 implied, because the engine
+        // rewrites descriptors into the heap zones and mutates buffer contents while recording
+        // tightening an individual range to DATA_STATIC_WHILE_SET_AT_EXECUTE is a per range decision
+        // and lets the driver hoist loads, so it can only be done once that range is known to be stable
+        constexpr D3D12_DESCRIPTOR_RANGE_FLAGS range_flags_volatile =
+            D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
+            D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+
+        // samplers carry no data, so the data flags are invalid on a sampler range
+        constexpr D3D12_DESCRIPTOR_RANGE_FLAGS sampler_range_flags =
+            D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+
+        // 0: CBV b0 (buffer_frame)
+        params[0].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[0].Descriptor.ShaderRegister = 0;
+        params[0].Descriptor.RegisterSpace  = 0;
+        params[0].Descriptor.Flags          = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
+        params[0].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
+
+        // 1: 32-bit constants b1 (buffer_pass)
+        params[1].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[1].Constants.ShaderRegister = 1;
+        params[1].Constants.RegisterSpace  = 0;
+        params[1].Constants.Num32BitValues = 16; // PassBufferData = 64 bytes
+        params[1].ShaderVisibility         = D3D12_SHADER_VISIBILITY_ALL;
+
+        // 2: SRV table t0..t59 space0
+        // highest srv used is t59 (meshlet_micro_indices)
+        static D3D12_DESCRIPTOR_RANGE1 srv0_range = {};
+        srv0_range.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srv0_range.NumDescriptors                    = d3d12_root_slot::srv_space0_count;
+        srv0_range.BaseShaderRegister                = 0;
+        srv0_range.RegisterSpace                     = 0;
+        srv0_range.OffsetInDescriptorsFromTableStart = 0;
+        srv0_range.Flags                             = range_flags_volatile;
+        params[2].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[2].DescriptorTable.NumDescriptorRanges = 1;
+        params[2].DescriptorTable.pDescriptorRanges   = &srv0_range;
+        params[2].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+
+        // 3: UAV table u0..u56 space0
+        // highest uav used is u56 (ocean_heights) in common_resources.hlsl, must cover the full range or compute psos that bind it fail validation
+        static D3D12_DESCRIPTOR_RANGE1 uav0_range = {};
+        uav0_range.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        uav0_range.NumDescriptors                    = d3d12_root_slot::uav_space0_count;
+        uav0_range.BaseShaderRegister                = 0;
+        uav0_range.RegisterSpace                     = 0;
+        uav0_range.OffsetInDescriptorsFromTableStart = 0;
+        uav0_range.Flags                             = range_flags_volatile;
+        params[3].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[3].DescriptorTable.NumDescriptorRanges = 1;
+        params[3].DescriptorTable.pDescriptorRanges   = &uav0_range;
+        params[3].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+
+        // 4: SRV table t15 space1 (material_textures[], unbounded)
+        static D3D12_DESCRIPTOR_RANGE1 mat_tex_range = {};
+        mat_tex_range.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        mat_tex_range.NumDescriptors                    = UINT_MAX; // unbounded
+        mat_tex_range.BaseShaderRegister                = 15;
+        mat_tex_range.RegisterSpace                     = 1;
+        mat_tex_range.OffsetInDescriptorsFromTableStart = 0;
+        mat_tex_range.Flags                             = range_flags_volatile;
+        params[4].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[4].DescriptorTable.NumDescriptorRanges = 1;
+        params[4].DescriptorTable.pDescriptorRanges   = &mat_tex_range;
+        params[4].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+
+        // 5: SRV table t16 space2 (material_parameters)
+        static D3D12_DESCRIPTOR_RANGE1 mat_param_range = {};
+        mat_param_range.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        mat_param_range.NumDescriptors                    = 1;
+        mat_param_range.BaseShaderRegister                = 16;
+        mat_param_range.RegisterSpace                     = 2;
+        mat_param_range.OffsetInDescriptorsFromTableStart = 0;
+        mat_param_range.Flags                             = range_flags_volatile;
+        params[5].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[5].DescriptorTable.NumDescriptorRanges = 1;
+        params[5].DescriptorTable.pDescriptorRanges   = &mat_param_range;
+        params[5].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+
+        // 6: SRV table t17 space3 (light_parameters)
+        static D3D12_DESCRIPTOR_RANGE1 light_range = {};
+        light_range.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        light_range.NumDescriptors                    = 1;
+        light_range.BaseShaderRegister                = 17;
+        light_range.RegisterSpace                     = 3;
+        light_range.OffsetInDescriptorsFromTableStart = 0;
+        light_range.Flags                             = range_flags_volatile;
+        params[6].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[6].DescriptorTable.NumDescriptorRanges = 1;
+        params[6].DescriptorTable.pDescriptorRanges   = &light_range;
+        params[6].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+
+        // 7: SRV table t18 space4 (aabbs)
+        static D3D12_DESCRIPTOR_RANGE1 aabb_range = {};
+        aabb_range.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        aabb_range.NumDescriptors                    = 1;
+        aabb_range.BaseShaderRegister                = 18;
+        aabb_range.RegisterSpace                     = 4;
+        aabb_range.OffsetInDescriptorsFromTableStart = 0;
+        aabb_range.Flags                             = range_flags_volatile;
+        params[7].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[7].DescriptorTable.NumDescriptorRanges = 1;
+        params[7].DescriptorTable.pDescriptorRanges   = &aabb_range;
+        params[7].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+
+        // 8: SRV table t19 space5 (draw_data)
+        static D3D12_DESCRIPTOR_RANGE1 draw_range = {};
+        draw_range.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        draw_range.NumDescriptors                    = 1;
+        draw_range.BaseShaderRegister                = 19;
+        draw_range.RegisterSpace                     = 5;
+        draw_range.OffsetInDescriptorsFromTableStart = 0;
+        draw_range.Flags                             = range_flags_volatile;
+        params[8].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[8].DescriptorTable.NumDescriptorRanges = 1;
+        params[8].DescriptorTable.pDescriptorRanges   = &draw_range;
+        params[8].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+
+        // 9: SRV table - geometry vertices/indices/instances in separate spaces (3 ranges)
+        static D3D12_DESCRIPTOR_RANGE1 geo_ranges[3] = {};
+        geo_ranges[0].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        geo_ranges[0].NumDescriptors                    = 1;
+        geo_ranges[0].BaseShaderRegister                = 20;
+        geo_ranges[0].RegisterSpace                     = 8;
+        geo_ranges[0].OffsetInDescriptorsFromTableStart = 0;
+        geo_ranges[0].Flags                             = range_flags_volatile;
+        geo_ranges[1].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        geo_ranges[1].NumDescriptors                    = 1;
+        geo_ranges[1].BaseShaderRegister                = 22;
+        geo_ranges[1].RegisterSpace                     = 9;
+        geo_ranges[1].OffsetInDescriptorsFromTableStart = 1;
+        geo_ranges[1].Flags                             = range_flags_volatile;
+        geo_ranges[2].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        geo_ranges[2].NumDescriptors                    = 1;
+        geo_ranges[2].BaseShaderRegister                = 23;
+        geo_ranges[2].RegisterSpace                     = 10;
+        geo_ranges[2].OffsetInDescriptorsFromTableStart = 2;
+        geo_ranges[2].Flags                             = range_flags_volatile;
+        params[9].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[9].DescriptorTable.NumDescriptorRanges = 3;
+        params[9].DescriptorTable.pDescriptorRanges   = geo_ranges;
+        params[9].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+
+        // d3d12 forbids anything after an unbounded range, so use bounded counts matching the heap zones, compare 0..63 and regular 64..127
+        static D3D12_DESCRIPTOR_RANGE1 sampler_ranges[2] = {};
+        sampler_ranges[0].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+        sampler_ranges[0].NumDescriptors                    = d3d12_descriptors::GetSamplersCompareCount();
+        sampler_ranges[0].BaseShaderRegister                = 0;
+        sampler_ranges[0].RegisterSpace                     = 6;
+        sampler_ranges[0].OffsetInDescriptorsFromTableStart = 0;
+        sampler_ranges[0].Flags                             = sampler_range_flags;
+        sampler_ranges[1].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+        sampler_ranges[1].NumDescriptors                    = d3d12_descriptors::GetSamplersCount();
+        sampler_ranges[1].BaseShaderRegister                = 1;
+        sampler_ranges[1].RegisterSpace                     = 7;
+        sampler_ranges[1].OffsetInDescriptorsFromTableStart = d3d12_descriptors::GetSamplersCompareCount();
+        sampler_ranges[1].Flags                             = sampler_range_flags;
+        params[10].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[10].DescriptorTable.NumDescriptorRanges = 2;
+        params[10].DescriptorTable.pDescriptorRanges   = sampler_ranges;
+        params[10].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+
+        // 1.1 has shipped in every windows release since 2016 and the agility redist guarantees it,
+        // so this only trips on a runtime far older than the feature level the engine already requires
+        if (d3d12_caps::GetHighestRootSignatureVersion() < D3D_ROOT_SIGNATURE_VERSION_1_1)
+        {
+            SP_LOG_ERROR("Root signature 1.1 is unavailable, the bindless root signature cannot be built");
+            return nullptr;
+        }
+
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_sig_desc = {};
+        root_sig_desc.Version                    = D3D_ROOT_SIGNATURE_VERSION_1_1;
+        root_sig_desc.Desc_1_1.NumParameters     = param_count;
+        root_sig_desc.Desc_1_1.pParameters       = params;
+        root_sig_desc.Desc_1_1.NumStaticSamplers = 0;
+        root_sig_desc.Desc_1_1.pStaticSamplers   = nullptr;
+        root_sig_desc.Desc_1_1.Flags             = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+        ID3DBlob* signature_blob = nullptr;
+        ID3DBlob* error_blob     = nullptr;
+
+        HRESULT hr = D3D12SerializeVersionedRootSignature(&root_sig_desc, &signature_blob, &error_blob);
+        if (FAILED(hr))
+        {
+            if (error_blob)
+            {
+                SP_LOG_ERROR("Failed to serialize bindless root signature: %s", static_cast<char*>(error_blob->GetBufferPointer()));
+                error_blob->Release();
+            }
+            if (signature_blob)
+            {
+                signature_blob->Release();
+            }
+            return nullptr;
+        }
+
+        ID3D12RootSignature* layout = nullptr;
+        hr = RHI_Context::device->CreateRootSignature(0, signature_blob->GetBufferPointer(), signature_blob->GetBufferSize(),
+            IID_PPV_ARGS(&layout));
+        if (FAILED(hr))
+        {
+            SP_LOG_ERROR("Failed to create bindless root signature: %s", d3d12_utility::error::dxgi_error_to_string(hr));
+        }
+
+        if (signature_blob)
+        {
+            signature_blob->Release();
+        }
+        if (error_blob)
+        {
+            error_blob->Release();
+        }
+
+        // cache it, the static holds the original reference so the signature outlives every pipeline that shares it
+        s_root_signature = layout;
+        return s_root_signature;
+    }
+
+    // a dxr state object needs a dxil library per shader, hit groups, shader config, pipeline config and the global root signature
+    static void create_ray_tracing_pipeline(RHI_Pipeline* pipeline, RHI_PipelineState& state)
+    {
+        // dxr is only available on devices that expose ID3D12Device5
+        Microsoft::WRL::ComPtr<ID3D12Device5> device5;
+        if (FAILED(RHI_Context::device->QueryInterface(IID_PPV_ARGS(&device5))))
+        {
+            SP_LOG_ERROR("Ray tracing pipeline requires ID3D12Device5");
+            return;
+        }
+
+        // global root signature, reuse the bindless one so descriptor bindings line up across pipelines
+        create_root_signature_bindless(pipeline);
+        if (!pipeline->GetRhiResourceLayout())
+        {
+            return;
+        }
+
+        // collect ray tracing shaders, the bytecode comes from dxc compiling lib_6_x targets
+        RHI_Shader* shader_raygen  = state.shaders[RHI_Shader_Type::RayGeneration];
+        RHI_Shader* shader_miss    = state.shaders[RHI_Shader_Type::RayMiss];
+        RHI_Shader* shader_hit     = state.shaders[RHI_Shader_Type::RayHit];
+
+        SP_ASSERT_MSG(shader_raygen && shader_miss && shader_hit, "ray tracing pipelines require raygen, miss and closest-hit shaders");
+
+        struct LibInfo
+        {
+            RHI_Shader* shader;
+            const wchar_t* export_name;       // canonical name used by sbt and hit group
+            const wchar_t* hlsl_entry_point;  // actual entry point name in the dxil library
+        };
+
+        // hlsl entry points are lower_snake_case, rename them on export so the sbt/hit-group references keep stable names
+        const LibInfo libs[] =
+        {
+            { shader_raygen, L"RayGen",     L"ray_gen"     },
+            { shader_miss,   L"Miss",       L"miss"        },
+            { shader_hit,    L"ClosestHit", L"closest_hit" }
+        };
+
+        // shader byte code blobs and exports, one library subobject per shader
+        D3D12_DXIL_LIBRARY_DESC lib_descs[3]   = {};
+        D3D12_EXPORT_DESC export_descs[3]      = {};
+        for (uint32_t i = 0; i < 3; ++i)
+        {
+            export_descs[i].Name           = libs[i].export_name;
+            export_descs[i].ExportToRename = libs[i].hlsl_entry_point;
+            export_descs[i].Flags          = D3D12_EXPORT_FLAG_NONE;
+
+            lib_descs[i].DXILLibrary.pShaderBytecode = libs[i].shader->GetRhiResource();
+            lib_descs[i].DXILLibrary.BytecodeLength  = libs[i].shader->GetObjectSize();
+            lib_descs[i].NumExports                  = 1;
+            lib_descs[i].pExports                    = &export_descs[i];
+        }
+
+        // hit group binds the closest hit shader, anyhit and intersection are unused
+        D3D12_HIT_GROUP_DESC hit_group = {};
+        hit_group.HitGroupExport         = L"HitGroup";
+        hit_group.Type                   = D3D12_HIT_GROUP_TYPE_TRIANGLES;
+        hit_group.AnyHitShaderImport     = nullptr;
+        hit_group.ClosestHitShaderImport = L"ClosestHit";
+        hit_group.IntersectionShaderImport = nullptr;
+
+        // 128 bytes covers the largest engine payload with headroom, attributes are the 8 byte triangle barycentrics
+        D3D12_RAYTRACING_SHADER_CONFIG shader_config = {};
+        shader_config.MaxPayloadSizeInBytes   = 128;
+        shader_config.MaxAttributeSizeInBytes = 8;
+
+        // pipeline config: matches vulkan's maxPipelineRayRecursionDepth = 2 for second bounce gi
+        D3D12_RAYTRACING_PIPELINE_CONFIG pipeline_config = {};
+        pipeline_config.MaxTraceRecursionDepth = 2;
+
+        // global root signature subobject points at the bindless root sig so all rt shaders share it
+        ID3D12RootSignature* global_root_sig = static_cast<ID3D12RootSignature*>(pipeline->GetRhiResourceLayout());
+        D3D12_GLOBAL_ROOT_SIGNATURE global_root_sig_subobject = {};
+        global_root_sig_subobject.pGlobalRootSignature = global_root_sig;
+
+        // assemble subobjects, layout: 3 dxil libs + hit group + shader config + pipeline config + global rs = 7
+        constexpr uint32_t subobject_count = 3 + 1 + 1 + 1 + 1;
+        D3D12_STATE_SUBOBJECT subobjects[subobject_count] = {};
+
+        uint32_t idx = 0;
+        for (uint32_t i = 0; i < 3; ++i)
+        {
+            subobjects[idx].Type  = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;
+            subobjects[idx].pDesc = &lib_descs[i];
+            ++idx;
+        }
+        subobjects[idx].Type  = D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP;
+        subobjects[idx].pDesc = &hit_group;
+        ++idx;
+        subobjects[idx].Type  = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG;
+        subobjects[idx].pDesc = &shader_config;
+        ++idx;
+        subobjects[idx].Type  = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG;
+        subobjects[idx].pDesc = &pipeline_config;
+        ++idx;
+        subobjects[idx].Type  = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;
+        subobjects[idx].pDesc = &global_root_sig_subobject;
+        ++idx;
+
+        D3D12_STATE_OBJECT_DESC state_object_desc = {};
+        state_object_desc.Type          = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
+        state_object_desc.NumSubobjects = idx;
+        state_object_desc.pSubobjects   = subobjects;
+
+        ID3D12StateObject* state_object = nullptr;
+        HRESULT hr = device5->CreateStateObject(&state_object_desc, IID_PPV_ARGS(&state_object));
+        if (FAILED(hr))
+        {
+            SP_LOG_ERROR("Failed to create ray tracing pipeline state object '%s': %s", state.name ? state.name : "?", d3d12_utility::error::dxgi_error_to_string(hr));
+            return;
+        }
+
+        pipeline->SetRhiResource(state_object);
+    }
+
+    RHI_Pipeline::~RHI_Pipeline()
+    {
+        // route through the deletion queue so any in-flight cmd lists referencing the pso/root sig finish first
+        if (m_rhi_resource)
+        {
+            RHI_Device::DeletionQueueAdd(RHI_Resource_Type::Pipeline, m_rhi_resource);
+            m_rhi_resource = nullptr;
+        }
+
+        if (m_rhi_resource_layout)
+        {
+            RHI_Device::DeletionQueueAdd(RHI_Resource_Type::PipelineLayout, m_rhi_resource_layout);
+            m_rhi_resource_layout = nullptr;
+        }
+    }
+}

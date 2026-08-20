@@ -1,0 +1,391 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES =======================
+#include "pch.h"
+#include "../RHI_Implementation.h"
+#include "../RHI_Device.h"
+#include "../RHI_Queue.h"
+#include "../RHI_SyncPrimitive.h"
+#include "../RHI_VendorTechnology.h"
+#include "../core/Debugging.h"
+#include "../../profiling/Breadcrumbs.h"
+#include "../../profiling/Profiler.h"
+//==================================
+
+//= NAMESPACES =====
+using namespace std;
+//==================
+
+namespace spartan
+{
+    namespace
+    {
+        array<mutex, static_cast<uint32_t>(RHI_Queue_Type::Max)> mutexes;
+
+        mutex& get_mutex(RHI_Queue* queue)
+        {
+            return mutexes[static_cast<uint32_t>(queue->GetType())];
+        }
+
+        uint32_t command_list_count(
+            const RHI_Queue_Type type
+        )
+        {
+            if (type == RHI_Queue_Type::Graphics)
+            {
+                return 16;
+            }
+
+            if (type == RHI_Queue_Type::Compute)
+            {
+                return 12;
+            }
+
+            return 4;
+        }
+
+        const char* wait_name(const RHI_Queue_Type type)
+        {
+            switch (type)
+            {
+                case RHI_Queue_Type::Graphics:
+                    return "cmd_wait_graphics";
+                case RHI_Queue_Type::Compute:
+                    return "cmd_wait_compute";
+                case RHI_Queue_Type::Copy:
+                    return "cmd_wait_copy";
+                case RHI_Queue_Type::Present:
+                    return "cmd_wait_present";
+                default:
+                    return "cmd_wait";
+            }
+        }
+
+        const char* submit_name(const RHI_Queue_Type type)
+        {
+            switch (type)
+            {
+                case RHI_Queue_Type::Graphics:
+                    return "queue_submit_graphics";
+                case RHI_Queue_Type::Compute:
+                    return "queue_submit_compute";
+                case RHI_Queue_Type::Copy:
+                    return "queue_submit_copy";
+                case RHI_Queue_Type::Present:
+                    return "queue_submit_present";
+                default:
+                    return "queue_submit";
+            }
+        }
+    }
+
+    RHI_Queue::RHI_Queue(const RHI_Queue_Type queue_type, const char* name) : SpartanObject()
+    {
+        m_object_name = name;
+        m_type        = queue_type;
+
+        // command pool
+        {
+            VkCommandPoolCreateInfo cmd_pool_info = {};
+            cmd_pool_info.sType                   = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            cmd_pool_info.queueFamilyIndex        = RHI_Device::GetQueueIndex(queue_type);
+            cmd_pool_info.flags                   = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT |           // short-lived (reset or freed)
+                                                    VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; // can be reset
+
+            // create the first one
+            VkCommandPool cmd_pool = nullptr;
+            SP_ASSERT_VK(vkCreateCommandPool(RHI_Context::device, &cmd_pool_info, nullptr, &cmd_pool));
+            RHI_Device::SetResourceName(cmd_pool, RHI_Resource_Type::CommandPool, m_object_name.c_str());
+            m_rhi_resource = static_cast<void*>(cmd_pool);
+        }
+
+        // command lists
+        m_cmd_lists.resize(
+            command_list_count(queue_type)
+        );
+        m_index = static_cast<uint32_t>(
+            m_cmd_lists.size() - 1
+        );
+        for (uint32_t i = 0; i < static_cast<uint32_t>(m_cmd_lists.size()); i++)
+        {
+            m_cmd_lists[i] = make_shared<RHI_CommandList>(this, m_rhi_resource, (("cmd_list_") + to_string(i)).c_str());
+        }
+    }
+
+    RHI_Queue::~RHI_Queue()
+    {
+        Wait();
+
+        for (uint32_t i = 0; i < static_cast<uint32_t>(m_cmd_lists.size()); i++)
+        {
+            VkCommandBuffer vk_cmd_buffer = reinterpret_cast<VkCommandBuffer>(m_cmd_lists[i]->GetRhiResource());
+            vkFreeCommandBuffers(
+                RHI_Context::device,
+                static_cast<VkCommandPool>(m_rhi_resource),
+                1,
+                &vk_cmd_buffer
+            );
+        }
+
+        vkDestroyCommandPool(RHI_Context::device, static_cast<VkCommandPool>(m_rhi_resource), nullptr);
+    }
+
+    RHI_CommandList* RHI_Queue::NextCommandList()
+    {
+        const uint32_t count =
+            static_cast<uint32_t>(m_cmd_lists.size());
+        const uint32_t first_index =
+            (
+                m_index.load() +
+                1
+            ) %
+            count;
+        uint32_t submitted_index = count;
+
+        for (uint32_t offset = 0; offset < count; offset++)
+        {
+            const uint32_t index =
+                (
+                    first_index +
+                    offset
+                ) %
+                count;
+            auto& cmd_list = m_cmd_lists[index];
+
+            if (
+                cmd_list->GetState() ==
+                RHI_CommandListState::Idle
+            )
+            {
+                m_index = index;
+                return cmd_list.get();
+            }
+
+            if (
+                cmd_list->GetState() ==
+                RHI_CommandListState::Submitted
+            )
+            {
+                if (cmd_list->IsExecutionComplete())
+                {
+                    cmd_list->WaitForExecution();
+                    m_index = index;
+                    return cmd_list.get();
+                }
+
+                if (submitted_index == count)
+                {
+                    submitted_index = index;
+                }
+            }
+        }
+
+        uint32_t index =
+            submitted_index != count
+                ? submitted_index
+                : first_index;
+        auto& cmd_list = m_cmd_lists[index];
+        if (
+            cmd_list->GetState() ==
+            RHI_CommandListState::Recording
+        )
+        {
+            cmd_list->Submit(nullptr, false);
+        }
+
+        if (
+            cmd_list->GetState() ==
+            RHI_CommandListState::Submitted
+        )
+        {
+            ScopedTimeBlock time_block(
+                wait_name(m_type)
+            );
+            cmd_list->WaitForExecution();
+        }
+
+        SP_ASSERT(cmd_list->GetState() == RHI_CommandListState::Idle);
+
+        m_index = index;
+        return cmd_list.get();
+    }
+
+    void RHI_Queue::Wait(const bool flush)
+    {
+        ScopedTimeBlock time_block(
+            "queue_wait_idle"
+        );
+
+        // ensure that any submitted command lists have completed execution
+        for (auto& cmd_list : m_cmd_lists)
+        {
+            bool got_flushed = false;
+            if (cmd_list->GetState() == RHI_CommandListState::Recording && flush)
+            {
+                cmd_list->Submit(0, false); // submit any pending work
+                got_flushed = true;
+            }
+
+            if (cmd_list->GetState() == RHI_CommandListState::Submitted)
+            {
+                cmd_list->WaitForExecution(); // wait for submitted command lists to complete
+            }
+
+            // if we flushed, start recording again (so we don't interfere with external code that may be using it)
+            if (got_flushed)
+            { 
+                cmd_list->Begin();
+            }
+        }
+
+        // lock here, after the potential submit (above), to avoid a deadlock (shared mutex)
+        lock_guard<mutex> lock(get_mutex(this));
+
+        SP_ASSERT_VK(vkQueueWaitIdle(static_cast<VkQueue>(RHI_Device::GetQueueRhiResource(m_type))));
+    }
+
+    uint64_t RHI_Queue::Submit(
+        void* cmd_buffer, const uint32_t wait_flags,
+        RHI_SyncPrimitive* semaphore_wait, RHI_SyncPrimitive* semaphore_signal, RHI_SyncPrimitive* semaphore_timeline_signal,
+        RHI_SyncPrimitive* semaphore_timeline_wait, uint64_t timeline_wait_value
+    )
+    {
+        ScopedTimeBlock time_block(
+            submit_name(m_type)
+        );
+        lock_guard<mutex> lock(get_mutex(this));
+        uint64_t timeline_signal_value = 0;
+    
+        // wait semaphore setup (binary + optional timeline)
+        VkSemaphoreSubmitInfo semaphores_list_wait[2] = {};
+        uint32_t wait_semaphore_count = 0;
+        if (semaphore_wait)
+        {
+            semaphores_list_wait[wait_semaphore_count].sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO_KHR;
+            semaphores_list_wait[wait_semaphore_count].semaphore = static_cast<VkSemaphore>(semaphore_wait->GetRhiResource());
+            semaphores_list_wait[wait_semaphore_count].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR;
+            semaphores_list_wait[wait_semaphore_count].value     = 0; // ignored for binary semaphores
+            wait_semaphore_count++;
+        }
+        if (semaphore_timeline_wait)
+        {
+            semaphores_list_wait[wait_semaphore_count].sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO_KHR;
+            semaphores_list_wait[wait_semaphore_count].semaphore = static_cast<VkSemaphore>(semaphore_timeline_wait->GetRhiResource());
+            semaphores_list_wait[wait_semaphore_count].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR;
+            semaphores_list_wait[wait_semaphore_count].value     = timeline_wait_value;
+            wait_semaphore_count++;
+        }
+    
+        // signal semaphores setup
+        VkSemaphoreSubmitInfo semaphores_list_signal[2] = {};
+        uint32_t signal_semaphore_count = 0;
+        if (semaphore_signal)
+        {
+            semaphores_list_signal[signal_semaphore_count].sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO_KHR;
+            semaphores_list_signal[signal_semaphore_count].semaphore = static_cast<VkSemaphore>(semaphore_signal->GetRhiResource());
+            semaphores_list_signal[signal_semaphore_count].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR;
+            semaphores_list_signal[signal_semaphore_count].value     = 0; // ignored for binary semaphores
+            signal_semaphore_count++;
+        }
+        if (semaphore_timeline_signal)
+        {
+            semaphores_list_signal[signal_semaphore_count].sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO_KHR;
+            semaphores_list_signal[signal_semaphore_count].semaphore = static_cast<VkSemaphore>(semaphore_timeline_signal->GetRhiResource());
+            semaphores_list_signal[signal_semaphore_count].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR;
+            timeline_signal_value = semaphore_timeline_signal->GetNextSignalValue();
+            semaphores_list_signal[signal_semaphore_count].value = timeline_signal_value;
+            signal_semaphore_count++;
+        }
+    
+        // command buffer
+        VkCommandBufferSubmitInfo cmd_buffer_info = {};
+        cmd_buffer_info.sType                     = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO_KHR;
+        cmd_buffer_info.commandBuffer             = reinterpret_cast<VkCommandBuffer>(cmd_buffer);
+    
+        // submit
+        {
+            VkSubmitInfo2 submit_info            = {};
+            submit_info.sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+            submit_info.waitSemaphoreInfoCount   = wait_semaphore_count;
+            submit_info.pWaitSemaphoreInfos      = wait_semaphore_count ? semaphores_list_wait : nullptr;
+            submit_info.signalSemaphoreInfoCount = signal_semaphore_count;
+            submit_info.pSignalSemaphoreInfos    = signal_semaphore_count ? semaphores_list_signal : nullptr;
+            submit_info.commandBufferInfoCount   = 1;
+            submit_info.pCommandBufferInfos      = &cmd_buffer_info;
+    
+            VkResult result = vkQueueSubmit2(static_cast<VkQueue>(RHI_Device::GetQueueRhiResource(m_type)), 1, &submit_info, nullptr);
+    
+            if (result == VK_ERROR_DEVICE_LOST)
+            {
+                if (Debugging::IsBreadcrumbsEnabled())
+                {
+                    Breadcrumbs::OnDeviceLost();
+                    SP_ERROR_WINDOW("GPU crashed. Check 'log.txt' for breadcrumbs report.");
+                }
+                else
+                {
+                    SP_ERROR_WINDOW("GPU crashed. To capture breadcrumbs, enable them in debugging.h and re-run.");
+                }
+            }
+    
+            SP_ASSERT_VK(result);
+        }
+
+        return timeline_signal_value;
+    }
+
+    bool RHI_Queue::Present(void* swapchain, const uint32_t image_index, RHI_SyncPrimitive* semaphore_wait)
+    {
+        ScopedTimeBlock time_block(
+            "queue_present"
+        );
+        lock_guard<mutex> lock(get_mutex(this));
+
+        // get semaphore vulkan resources
+        array<VkSemaphore, 1> vk_wait_semaphores = { nullptr };
+        vk_wait_semaphores[0] = static_cast<VkSemaphore>(semaphore_wait->GetRhiResource());
+
+        VkPresentInfoKHR present_info   = {};
+        present_info.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        present_info.waitSemaphoreCount = 1;
+        present_info.pWaitSemaphores    = vk_wait_semaphores.data();
+        present_info.swapchainCount     = 1;
+        present_info.pSwapchains        = reinterpret_cast<VkSwapchainKHR*>(&swapchain);
+        present_info.pImageIndices      = &image_index;
+
+        VkResult result = vkQueuePresentKHR(static_cast<VkQueue>(RHI_Device::GetQueueRhiResource(m_type)), &present_info);
+
+        // out of date must recreate before the next present, suboptimal presented successfully but should recreate when convenient
+        if (result == VK_ERROR_OUT_OF_DATE_KHR)
+        {
+            return false;
+        }
+
+        if (result == VK_SUBOPTIMAL_KHR)
+        {
+            return true;
+        }
+
+        SP_ASSERT_VK(result);
+        return true;
+    }
+}

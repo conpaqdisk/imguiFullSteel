@@ -1,0 +1,32 @@
+name: golangci-lint
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - v*
+    branches:
+      - master
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  golangci:
+    name: Lint
+    runs-on: macos-latest
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v7
+
+      - name: Setup
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.11.4

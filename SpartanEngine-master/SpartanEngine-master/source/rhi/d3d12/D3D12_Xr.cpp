@@ -1,0 +1,890 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES ===========================
+#include "pch.h"
+#include "../../xr/Xr.h"
+#include "../../rendering/Renderer.h"
+#include "../../commands/console/ConsoleCommands.h"
+#include "../RHI_Implementation.h"
+#include "../RHI_Device.h"
+#include "../../world/World.h"
+#include "../../world/components/Camera.h"
+#include "../../world/Entity.h"
+#include <thread>
+#define XR_USE_GRAPHICS_API_D3D12
+#include <openxr/openxr.h>
+#include <openxr/openxr_platform.h>
+//======================================
+
+//= NAMESPACES =====
+using namespace std;
+//==================
+
+namespace spartan
+{
+    // openxr state (d3d12 implementation)
+    namespace
+    {
+        XrInstance xr_instance           = XR_NULL_HANDLE;
+        XrSystemId xr_system_id          = XR_NULL_SYSTEM_ID;
+        XrSession xr_session             = XR_NULL_HANDLE;
+        XrSpace xr_reference_space       = XR_NULL_HANDLE;
+        XrSwapchain xr_swapchain         = XR_NULL_HANDLE;
+        XrSessionState xr_session_state  = XR_SESSION_STATE_UNKNOWN;
+        XrFrameState xr_frame_state      = {};
+        XrTime xr_predicted_display_time = 0;
+        bool xr_session_state_changed    = false;
+
+        // swapchain state
+        uint32_t swapchain_width       = 0;
+        uint32_t swapchain_height      = 0;
+        uint32_t swapchain_length      = 0;
+        uint32_t swapchain_image_index = 0;
+        DXGI_FORMAT swapchain_format   = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        vector<XrSwapchainImageD3D12KHR> swapchain_images;
+
+        // xrEndFrame must submit zero layers when no image was released, or the runtime returns XR_ERROR_LAYER_INVALID
+        bool swapchain_image_acquired_this_frame = false;
+        bool swapchain_image_released_this_frame = false;
+
+        // views for stereo rendering
+        vector<XrView> xr_views;
+        vector<XrViewConfigurationView> xr_view_configs;
+        XrViewState xr_view_state = {};
+
+        // function pointers (loaded at runtime)
+        PFN_xrGetD3D12GraphicsRequirementsKHR xrGetD3D12GraphicsRequirementsKHR = nullptr;
+
+        // xrCreateInstance with steamvr spawns vrserver.exe and blocks for seconds, so init runs on a worker
+        thread xr_init_thread;
+        atomic<bool> xr_init_in_progress   = false;
+        atomic<bool> xr_post_init_pending  = false;
+
+        // helper to check xr results
+        bool xr_check(XrResult result, const char* operation)
+        {
+            if (XR_FAILED(result))
+            {
+                char result_string[XR_MAX_RESULT_STRING_SIZE];
+                xrResultToString(xr_instance, result, result_string);
+                SP_LOG_ERROR("openxr %s failed: %s", operation, result_string);
+                return false;
+            }
+            return true;
+        }
+
+        // asymmetric left-handed reverse-z from openxr fov angles, matching Camera::ComputeProjection
+        math::Matrix create_projection_matrix(float fov_left, float fov_right, float fov_up, float fov_down, float near_z, float far_z)
+        {
+            const float tan_left  = tanf(fov_left);
+            const float tan_right = tanf(fov_right);
+            const float tan_up    = tanf(fov_up);
+            const float tan_down  = tanf(fov_down);
+
+            const float tan_width  = tan_right - tan_left;
+            const float tan_height = tan_up - tan_down;
+
+            const float x_scale = 2.0f / tan_width;
+            const float y_scale = 2.0f / tan_height;
+            const float x_shift = -(tan_right + tan_left) / tan_width;
+            const float y_shift = -(tan_up + tan_down) / tan_height;
+
+            // reverse-z: at z=near clip.z/w = 1, at z=far clip.z/w = 0
+            const float z_scale = near_z / (near_z - far_z);
+            const float z_bias  = (near_z * far_z) / (far_z - near_z);
+
+            // row-major constructor: rows below correspond to (row, col) = (m00..m03, m10..m13, ...)
+            return math::Matrix(
+                x_scale, 0.0f,    0.0f,    0.0f,
+                0.0f,    y_scale, 0.0f,    0.0f,
+                x_shift, y_shift, z_scale, 1.0f,
+                0.0f,    0.0f,    z_bias,  0.0f
+            );
+        }
+    }
+
+    void Xr::InitializeWorker()
+    {
+        // runs on xr_init_thread so engine boot isn't stalled by steamvr spin-up or by
+        // the ~7s xrCreateInstance pipe wait when no hmd is present
+
+        for (auto& eye : m_eye_views)
+        {
+            eye.view        = math::Matrix::Identity;
+            eye.projection  = math::Matrix::Identity;
+            eye.position    = math::Vector3::Zero;
+            eye.orientation = math::Quaternion::Identity;
+        }
+
+        uint32_t extension_count = 0;
+        xrEnumerateInstanceExtensionProperties(nullptr, 0, &extension_count, nullptr);
+        vector<XrExtensionProperties> extensions(extension_count, { XR_TYPE_EXTENSION_PROPERTIES });
+        xrEnumerateInstanceExtensionProperties(nullptr, extension_count, &extension_count, extensions.data());
+
+        bool d3d12_supported = false;
+        for (const auto& ext : extensions)
+        {
+            if (strcmp(ext.extensionName, XR_KHR_D3D12_ENABLE_EXTENSION_NAME) == 0)
+            {
+                d3d12_supported = true;
+                break;
+            }
+        }
+
+        if (!d3d12_supported)
+        {
+            SP_LOG_INFO("openxr: no runtime with d3d12 support detected");
+            return;
+        }
+
+        const char* enabled_extensions[] = { XR_KHR_D3D12_ENABLE_EXTENSION_NAME };
+
+        XrApplicationInfo app_info  = {};
+        app_info.apiVersion         = XR_API_VERSION_1_0;
+        strcpy_s(app_info.applicationName, XR_MAX_APPLICATION_NAME_SIZE, "Spartan Engine");
+        strcpy_s(app_info.engineName, XR_MAX_ENGINE_NAME_SIZE, "Spartan");
+        app_info.applicationVersion = 1;
+        app_info.engineVersion      = 1;
+
+        XrInstanceCreateInfo create_info  = { XR_TYPE_INSTANCE_CREATE_INFO };
+        create_info.applicationInfo       = app_info;
+        create_info.enabledExtensionCount = 1;
+        create_info.enabledExtensionNames = enabled_extensions;
+
+        if (XR_FAILED(xrCreateInstance(&create_info, &xr_instance)))
+        {
+            SP_LOG_INFO("openxr: no runtime available");
+            xr_instance = XR_NULL_HANDLE;
+            return;
+        }
+
+        XrInstanceProperties instance_props = { XR_TYPE_INSTANCE_PROPERTIES };
+        if (XR_SUCCEEDED(xrGetInstanceProperties(xr_instance, &instance_props)))
+        {
+            m_runtime_name = instance_props.runtimeName;
+            SP_LOG_INFO("openxr runtime: %s", instance_props.runtimeName);
+        }
+
+        xrGetInstanceProcAddr(xr_instance, "xrGetD3D12GraphicsRequirementsKHR", reinterpret_cast<PFN_xrVoidFunction*>(&xrGetD3D12GraphicsRequirementsKHR));
+
+        // this is the call that actually tells steamvr to look for a headset and can
+        // return HmdNotFound if none is plugged in
+        XrSystemGetInfo system_info = { XR_TYPE_SYSTEM_GET_INFO };
+        system_info.formFactor      = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+        const bool hmd_found = XR_SUCCEEDED(xrGetSystem(xr_instance, &system_info, &xr_system_id));
+
+        if (!hmd_found)
+        {
+            // release the runtime so we don't hold onto vrserver while idling
+            SP_LOG_INFO("openxr: no hmd detected, releasing runtime");
+            xrDestroyInstance(xr_instance);
+            xr_instance  = XR_NULL_HANDLE;
+            xr_system_id = XR_NULL_SYSTEM_ID;
+            return;
+        }
+
+        m_hmd_connected = true;
+
+        XrSystemProperties system_props = { XR_TYPE_SYSTEM_PROPERTIES };
+        if (XR_SUCCEEDED(xrGetSystemProperties(xr_instance, xr_system_id, &system_props)))
+        {
+            m_device_name = system_props.systemName;
+        }
+
+        uint32_t view_count = 0;
+        xrEnumerateViewConfigurationViews(xr_instance, xr_system_id, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &view_count, nullptr);
+        if (view_count > 0)
+        {
+            xr_view_configs.resize(view_count, { XR_TYPE_VIEW_CONFIGURATION_VIEW });
+            xrEnumerateViewConfigurationViews(xr_instance, xr_system_id, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, view_count, &view_count, xr_view_configs.data());
+
+            m_recommended_width  = xr_view_configs[0].recommendedImageRectWidth;
+            m_recommended_height = xr_view_configs[0].recommendedImageRectHeight;
+
+            xr_views.resize(view_count, { XR_TYPE_VIEW });
+        }
+
+        // graphics requirements must be queried before session creation per the d3d12 extension spec
+        if (xrGetD3D12GraphicsRequirementsKHR)
+        {
+            XrGraphicsRequirementsD3D12KHR requirements = { XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR };
+            xrGetD3D12GraphicsRequirementsKHR(xr_instance, xr_system_id, &requirements);
+        }
+
+        SP_LOG_INFO("openxr hmd: %s (%ux%u per eye)", m_device_name.c_str(), m_recommended_width, m_recommended_height);
+
+        if (!CreateSession())
+        {
+            SP_LOG_ERROR("openxr: failed to create session");
+            return;
+        }
+
+        // stereo mode flip is deferred to the main thread because it rebuilds render
+        // targets via Renderer::RecreateRenderTargets which is not thread-safe
+        if (IsMultiviewSupported())
+        {
+            xr_post_init_pending = true;
+        }
+    }
+
+    void Xr::Initialize()
+    {
+        // already up or a previous init is still running
+        if (IsAvailable() || xr_init_in_progress.load())
+        {
+            return;
+        }
+
+        // reap any previous attempt so we can spawn a fresh one (e.g. ctrl+0 retry)
+        if (xr_init_thread.joinable())
+        {
+            xr_init_thread.join();
+        }
+
+        xr_init_in_progress = true;
+        SP_LOG_INFO("openxr: initializing on background thread");
+
+        xr_init_thread = thread([]()
+        {
+            InitializeWorker();
+            // release-store: everything written by the worker becomes visible to any
+            // thread that observes m_initialized == true via acquire semantics
+            m_initialized.store(xr_instance != XR_NULL_HANDLE);
+            xr_init_in_progress = false;
+        });
+    }
+
+    void Xr::Shutdown()
+    {
+        // wait for any in-flight init so we don't race on the xr/d3d12 handles
+        if (xr_init_thread.joinable())
+        {
+            xr_init_thread.join();
+        }
+
+        xr_post_init_pending = false;
+
+        if (!m_initialized.load())
+        {
+            return;
+        }
+
+        SetStereoMode(false);
+
+        DestroySwapchain();
+        DestroySession();
+
+        if (xr_instance != XR_NULL_HANDLE)
+        {
+            xrDestroyInstance(xr_instance);
+            xr_instance = XR_NULL_HANDLE;
+        }
+
+        xr_system_id         = XR_NULL_SYSTEM_ID;
+        m_hmd_connected      = false;
+        m_session_running    = false;
+        m_session_focused    = false;
+        m_runtime_name       = "N/A";
+        m_device_name        = "N/A";
+        m_recommended_width  = 0;
+        m_recommended_height = 0;
+        m_initialized.store(false);
+    }
+
+    void Xr::Tick()
+    {
+        if (!m_initialized.load())
+        {
+            return;
+        }
+
+        // apply deferred post-init actions that must run on the main thread
+        if (xr_post_init_pending.exchange(false))
+        {
+            SetStereoMode(true);
+            SP_LOG_INFO("openxr: multiview stereo rendering enabled");
+        }
+
+        if (!m_hmd_connected)
+        {
+            return;
+        }
+
+        ProcessEvents();
+    }
+
+    bool Xr::CreateSession()
+    {
+        if (xr_session != XR_NULL_HANDLE)
+        {
+            return true;
+        }
+
+        if (!RHI_Context::device)
+        {
+            SP_LOG_ERROR("openxr: d3d12 context not ready");
+            return false;
+        }
+
+        // get graphics requirements (required before session creation), also surfaces the adapter
+        // luid the runtime expects the device to be created on
+        if (xrGetD3D12GraphicsRequirementsKHR)
+        {
+            XrGraphicsRequirementsD3D12KHR requirements = { XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR };
+            XrResult req_result = xrGetD3D12GraphicsRequirementsKHR(xr_instance, xr_system_id, &requirements);
+            if (XR_FAILED(req_result))
+            {
+                SP_LOG_ERROR("openxr: failed to get d3d12 graphics requirements");
+                return false;
+            }
+
+            // warn if the engine device was created on a different adapter than the one the runtime wants
+            LUID engine_luid = RHI_Context::device->GetAdapterLuid();
+            if (engine_luid.LowPart != requirements.adapterLuid.LowPart || engine_luid.HighPart != requirements.adapterLuid.HighPart)
+            {
+                SP_LOG_WARNING("openxr: adapter luid mismatch, xr wants a different gpu, this may cause issues");
+            }
+        }
+
+        // the d3d12 graphics binding needs the device and the graphics command queue the runtime synchronizes against
+        ID3D12CommandQueue* graphics_queue = static_cast<ID3D12CommandQueue*>(RHI_Device::GetQueueRhiResource(RHI_Queue_Type::Graphics));
+        if (!graphics_queue)
+        {
+            SP_LOG_ERROR("openxr: graphics command queue not available");
+            return false;
+        }
+
+        XrGraphicsBindingD3D12KHR graphics_binding = { XR_TYPE_GRAPHICS_BINDING_D3D12_KHR };
+        graphics_binding.device = RHI_Context::device;
+        graphics_binding.queue  = graphics_queue;
+
+        XrSessionCreateInfo session_info = {};
+        session_info.type     = XR_TYPE_SESSION_CREATE_INFO;
+        session_info.next     = &graphics_binding;
+        session_info.systemId = xr_system_id;
+
+        if (!xr_check(xrCreateSession(xr_instance, &session_info, &xr_session), "create session"))
+        {
+            return false;
+        }
+
+        // create reference space (local = seated, stage = standing)
+        if (!CreateReferenceSpace())
+        {
+            return false;
+        }
+
+        // create swapchain
+        if (!CreateSwapchain())
+        {
+            return false;
+        }
+
+        SP_LOG_INFO("openxr: session created successfully");
+        return true;
+    }
+
+    void Xr::DestroySession()
+    {
+        if (xr_reference_space != XR_NULL_HANDLE)
+        {
+            xrDestroySpace(xr_reference_space);
+            xr_reference_space = XR_NULL_HANDLE;
+        }
+
+        if (xr_session != XR_NULL_HANDLE)
+        {
+            xrDestroySession(xr_session);
+            xr_session = XR_NULL_HANDLE;
+        }
+
+        m_session_running = false;
+        m_session_focused = false;
+        xr_session_state  = XR_SESSION_STATE_UNKNOWN;
+    }
+
+    bool Xr::CreateSwapchain()
+    {
+        if (xr_swapchain != XR_NULL_HANDLE)
+        {
+            return true;
+        }
+
+        if (xr_session == XR_NULL_HANDLE || xr_view_configs.empty())
+        {
+            return false;
+        }
+
+        // query supported formats
+        uint32_t format_count = 0;
+        xrEnumerateSwapchainFormats(xr_session, 0, &format_count, nullptr);
+        vector<int64_t> formats(format_count);
+        xrEnumerateSwapchainFormats(xr_session, format_count, &format_count, formats.data());
+
+        // tonemap already writes display referred srgb, unorm avoids a second encode on blit
+        int64_t selected_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        bool format_found = false;
+        for (int64_t format : formats)
+        {
+            if (format == DXGI_FORMAT_R8G8B8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_UNORM)
+            {
+                selected_format = format;
+                format_found = true;
+                break;
+            }
+        }
+        if (!format_found)
+        {
+            for (int64_t format : formats)
+            {
+                if (format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
+                {
+                    selected_format = format;
+                    format_found = true;
+                    break;
+                }
+            }
+        }
+        if (!format_found && !formats.empty())
+        {
+            // fallback to first available
+            selected_format = formats[0];
+        }
+
+        swapchain_width  = m_recommended_width;
+        swapchain_height = m_recommended_height;
+        swapchain_format = static_cast<DXGI_FORMAT>(selected_format);
+
+        // create swapchain as array texture for multiview (2 layers = 2 eyes)
+        XrSwapchainCreateInfo swapchain_info = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
+        swapchain_info.usageFlags  = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        swapchain_info.format      = selected_format;
+        swapchain_info.sampleCount = 1;
+        swapchain_info.width       = swapchain_width;
+        swapchain_info.height      = swapchain_height;
+        swapchain_info.faceCount   = 1;
+        swapchain_info.arraySize   = eye_count; // multiview: 2 layers for stereo
+        swapchain_info.mipCount    = 1;
+
+        if (!xr_check(xrCreateSwapchain(xr_session, &swapchain_info, &xr_swapchain), "create swapchain"))
+        {
+            return false;
+        }
+
+        // get swapchain images, on d3d12 each image is an ID3D12Resource* array texture
+        xrEnumerateSwapchainImages(xr_swapchain, 0, &swapchain_length, nullptr);
+        swapchain_images.resize(swapchain_length, { XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR });
+        xrEnumerateSwapchainImages(xr_swapchain, swapchain_length, &swapchain_length,
+            reinterpret_cast<XrSwapchainImageBaseHeader*>(swapchain_images.data()));
+
+        SP_LOG_INFO("openxr: swapchain created (%ux%u, %u images, multiview array)", swapchain_width, swapchain_height, swapchain_length);
+        return true;
+    }
+
+    void Xr::DestroySwapchain()
+    {
+        swapchain_images.clear();
+
+        if (xr_swapchain != XR_NULL_HANDLE)
+        {
+            xrDestroySwapchain(xr_swapchain);
+            xr_swapchain = XR_NULL_HANDLE;
+        }
+
+        swapchain_width  = 0;
+        swapchain_height = 0;
+        swapchain_length = 0;
+        swapchain_format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    }
+
+    bool Xr::CreateReferenceSpace()
+    {
+        // LOCAL puts the origin near the initial head pose, so the hmd pose composes onto the game camera instead of the room floor
+        const XrReferenceSpaceType space_type = XR_REFERENCE_SPACE_TYPE_LOCAL;
+        SP_LOG_INFO("openxr: using local reference space (origin near initial head pose)");
+
+        XrPosef identity_pose = {};
+        identity_pose.orientation.w = 1.0f;
+
+        XrReferenceSpaceCreateInfo space_info = { XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
+        space_info.referenceSpaceType = space_type;
+        space_info.poseInReferenceSpace = identity_pose;
+
+        return xr_check(xrCreateReferenceSpace(xr_session, &space_info, &xr_reference_space), "create reference space");
+    }
+
+    void Xr::ProcessEvents()
+    {
+        // a change in the effective stereo state rebuilds the render targets, the g-buffer switches between Type2D and Type2DArray
+        const bool stereo_active_before = m_session_running && m_stereo_3d;
+
+        XrEventDataBuffer event_buffer = { XR_TYPE_EVENT_DATA_BUFFER };
+
+        while (xrPollEvent(xr_instance, &event_buffer) == XR_SUCCESS)
+        {
+            switch (event_buffer.type)
+            {
+                case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED:
+                {
+                    auto* state_event = reinterpret_cast<XrEventDataSessionStateChanged*>(&event_buffer);
+                    xr_session_state = state_event->state;
+                    xr_session_state_changed = true;
+
+                    switch (xr_session_state)
+                    {
+                        case XR_SESSION_STATE_READY:
+                        {
+                            // the runtime drives this transition when the hmd becomes ready
+                            // to present frames (typically when the user puts it on).
+                            XrSessionBeginInfo begin_info = { XR_TYPE_SESSION_BEGIN_INFO };
+                            begin_info.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+                            if (xr_check(xrBeginSession(xr_session, &begin_info), "begin session"))
+                            {
+                                m_session_running = true;
+                                SP_LOG_INFO("openxr: session started (headset active)");
+                            }
+                            break;
+                        }
+                        case XR_SESSION_STATE_STOPPING:
+                        {
+                            // the runtime drives this when the headset comes off, the session stays alive and can return to READY
+                            m_session_running = false;
+                            m_session_focused = false;
+                            xrEndSession(xr_session);
+                            SP_LOG_INFO("openxr: session stopped (headset inactive)");
+                            break;
+                        }
+                        case XR_SESSION_STATE_FOCUSED:
+                        {
+                            m_session_focused = true;
+                            break;
+                        }
+                        case XR_SESSION_STATE_VISIBLE:
+                        {
+                            m_session_focused = false;
+                            break;
+                        }
+                        case XR_SESSION_STATE_EXITING:
+                        case XR_SESSION_STATE_LOSS_PENDING:
+                        {
+                            m_session_running = false;
+                            m_session_focused = false;
+                            break;
+                        }
+                        default:
+                            break;
+                    }
+                    break;
+                }
+                case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
+                {
+                    SP_LOG_WARNING("openxr: instance loss pending");
+                    m_session_running = false;
+                    break;
+                }
+                default:
+                    break;
+            }
+
+            event_buffer = { XR_TYPE_EVENT_DATA_BUFFER };
+        }
+
+        // Xr::Tick runs before Renderer::Tick, so the queue is idle and RecreateRenderTargets can wait for the gpu
+        const bool stereo_active_after = m_session_running && m_stereo_3d;
+        if (stereo_active_before != stereo_active_after)
+        {
+            if (stereo_active_after)
+            {
+                ApplyHmdResolution();
+            }
+            else
+            {
+                // headset off keeps stereo mode, restore monitor size but leave vr scale until ctrl+0
+                RestoreDesktopResolution(false);
+            }
+
+            Renderer::RecreateRenderTargets();
+        }
+    }
+
+    void Xr::UpdateViews()
+    {
+        if (xr_session == XR_NULL_HANDLE || xr_reference_space == XR_NULL_HANDLE)
+        {
+            return;
+        }
+
+        XrViewLocateInfo view_locate_info = { XR_TYPE_VIEW_LOCATE_INFO };
+        view_locate_info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        view_locate_info.displayTime = xr_predicted_display_time;
+        view_locate_info.space = xr_reference_space;
+
+        xr_view_state = { XR_TYPE_VIEW_STATE };
+        uint32_t view_count = 0;
+
+        XrResult result = xrLocateViews(xr_session, &view_locate_info, &xr_view_state,
+            static_cast<uint32_t>(xr_views.size()), &view_count, xr_views.data());
+
+        if (XR_FAILED(result) || view_count < eye_count)
+        {
+            return;
+        }
+
+        // check if pose is valid
+        bool pose_valid = (xr_view_state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
+                          (xr_view_state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
+
+        if (!pose_valid)
+        {
+            return;
+        }
+
+        // tracking space positions, openxr is right-handed (-z forward), engine is left-handed (+z forward)
+        const math::Vector3 eye0_pos(
+            xr_views[0].pose.position.x,
+            xr_views[0].pose.position.y,
+            -xr_views[0].pose.position.z
+        );
+        const math::Vector3 eye1_pos(
+            xr_views[1].pose.position.x,
+            xr_views[1].pose.position.y,
+            -xr_views[1].pose.position.z
+        );
+        const math::Vector3 head_tracking = (eye0_pos + eye1_pos) * 0.5f;
+
+        m_head_orientation = math::Quaternion(
+            xr_views[0].pose.orientation.x,
+            xr_views[0].pose.orientation.y,
+            -xr_views[0].pose.orientation.z,
+            -xr_views[0].pose.orientation.w
+        );
+
+        // camera entity is the eye of the 1.8m person, not the floor
+        // steamvr/psvr2 often report floor-relative y even in LOCAL, so strip absolute head
+        // translation and keep only per-eye ipd offsets around the camera eye
+        math::Vector3    camera_pos = math::Vector3::Zero;
+        math::Quaternion camera_rot = math::Quaternion::Identity;
+        float            near_z     = 0.1f;
+        float            far_z      = 10000.0f;
+        if (auto camera = World::GetCamera())
+        {
+            camera_pos = camera->GetEntity()->GetPosition();
+            camera_rot = camera->GetEntity()->GetRotation();
+            near_z     = camera->GetNearPlane();
+            far_z      = camera->GetFarPlane();
+        }
+        const math::Matrix camera_world(camera_pos, camera_rot, math::Vector3::One);
+        m_head_position = camera_pos;
+
+        // update per-eye data
+        for (uint32_t i = 0; i < eye_count; i++)
+        {
+            const XrView& view = xr_views[i];
+
+            const math::Vector3 eye_tracking(
+                view.pose.position.x,
+                view.pose.position.y,
+                -view.pose.position.z
+            );
+            // ipd only, pin height and room position to the game camera eye
+            const math::Vector3 rig_local_pos = eye_tracking - head_tracking;
+            const math::Quaternion rig_local_rot(
+                view.pose.orientation.x,
+                view.pose.orientation.y,
+                -view.pose.orientation.z,
+                -view.pose.orientation.w
+            );
+
+            // row vector parenting: eye_world = eye_local * camera_world
+            const math::Matrix eye_local(rig_local_pos, rig_local_rot, math::Vector3::One);
+            const math::Matrix eye_world = eye_local * camera_world;
+
+            m_eye_views[i].view        = eye_world.Inverted();
+            m_eye_views[i].position    = eye_world.GetTranslation();
+            m_eye_views[i].orientation = eye_world.GetRotation();
+
+            m_eye_views[i].fov_left  = view.fov.angleLeft;
+            m_eye_views[i].fov_right = view.fov.angleRight;
+            m_eye_views[i].fov_up    = view.fov.angleUp;
+            m_eye_views[i].fov_down  = view.fov.angleDown;
+
+            m_eye_views[i].projection = create_projection_matrix(
+                view.fov.angleLeft, view.fov.angleRight,
+                view.fov.angleUp, view.fov.angleDown,
+                near_z, far_z
+            );
+        }
+    }
+
+    bool Xr::BeginFrame()
+    {
+        if (!m_session_running || xr_session == XR_NULL_HANDLE)
+        {
+            return false;
+        }
+
+        // wait for frame
+        xr_frame_state = { XR_TYPE_FRAME_STATE };
+        if (!xr_check(xrWaitFrame(xr_session, nullptr, &xr_frame_state), "wait frame"))
+        {
+            return false;
+        }
+
+        // begin frame
+        if (!xr_check(xrBeginFrame(xr_session, nullptr), "begin frame"))
+        {
+            return false;
+        }
+
+        m_frame_began                         = true;
+        swapchain_image_acquired_this_frame   = false;
+        swapchain_image_released_this_frame   = false;
+        xr_predicted_display_time             = xr_frame_state.predictedDisplayTime;
+
+        // update view poses
+        UpdateViews();
+
+        // should we render this frame?
+        return xr_frame_state.shouldRender == XR_TRUE;
+    }
+
+    void Xr::EndFrame()
+    {
+        if (!m_frame_began || xr_session == XR_NULL_HANDLE)
+        {
+            return;
+        }
+
+        // prepare projection views for submission
+        array<XrCompositionLayerProjectionView, eye_count> projection_views;
+
+        for (uint32_t i = 0; i < eye_count; i++)
+        {
+            projection_views[i] = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
+            projection_views[i].subImage.swapchain         = xr_swapchain;
+            projection_views[i].subImage.imageRect.offset  = { 0, 0 };
+            projection_views[i].subImage.imageRect.extent  = { static_cast<int32_t>(swapchain_width), static_cast<int32_t>(swapchain_height) };
+            projection_views[i].subImage.imageArrayIndex   = i;
+
+            // submit the pose and fov of the eye actually rendered into array layer i, no runtime specific swap needed
+            projection_views[i].pose = xr_views[i].pose;
+            projection_views[i].fov  = xr_views[i].fov;
+        }
+
+        XrCompositionLayerProjection projection_layer = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+        projection_layer.space     = xr_reference_space;
+        projection_layer.viewCount = eye_count;
+        projection_layer.views     = projection_views.data();
+
+        const XrCompositionLayerBaseHeader* layers[] = { reinterpret_cast<XrCompositionLayerBaseHeader*>(&projection_layer) };
+
+        // the layer is skipped when the renderer produced no image, submitting it would return XR_ERROR_LAYER_INVALID
+        const bool submit_layer = xr_frame_state.shouldRender && swapchain_image_released_this_frame;
+
+        XrFrameEndInfo end_info = { XR_TYPE_FRAME_END_INFO };
+        end_info.displayTime          = xr_predicted_display_time;
+        end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        end_info.layerCount           = submit_layer ? 1 : 0;
+        end_info.layers               = submit_layer ? layers : nullptr;
+
+        xr_check(xrEndFrame(xr_session, &end_info), "end frame");
+        m_frame_began = false;
+    }
+
+    bool Xr::AcquireSwapchainImage()
+    {
+        if (xr_swapchain == XR_NULL_HANDLE)
+        {
+            return false;
+        }
+
+        XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+        if (!xr_check(xrAcquireSwapchainImage(xr_swapchain, &acquire_info, &swapchain_image_index), "acquire swapchain image"))
+        {
+            return false;
+        }
+
+        XrSwapchainImageWaitInfo wait_info = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+        wait_info.timeout = XR_INFINITE_DURATION;
+        if (!xr_check(xrWaitSwapchainImage(xr_swapchain, &wait_info), "wait swapchain image"))
+        {
+            return false;
+        }
+
+        swapchain_image_acquired_this_frame = true;
+        return true;
+    }
+
+    void Xr::ReleaseSwapchainImage()
+    {
+        if (xr_swapchain == XR_NULL_HANDLE || !swapchain_image_acquired_this_frame)
+        {
+            return;
+        }
+
+        XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+        if (xr_check(xrReleaseSwapchainImage(xr_swapchain, &release_info), "release swapchain image"))
+        {
+            // mark the frame as having produced a swapchain image so EndFrame knows it
+            // is valid to submit a projection layer referencing it.
+            swapchain_image_released_this_frame = true;
+        }
+        swapchain_image_acquired_this_frame = false;
+    }
+
+    bool Xr::IsAvailable()
+    {
+        // acquire-load pairs with the release-store in Initialize's worker thread
+        return m_initialized.load() && xr_instance != XR_NULL_HANDLE;
+    }
+
+    void* Xr::GetSwapchainImage()
+    {
+        if (swapchain_images.empty() || swapchain_image_index >= swapchain_images.size())
+        {
+            return nullptr;
+        }
+        return swapchain_images[swapchain_image_index].texture;
+    }
+
+    void* Xr::GetSwapchainImageView()
+    {
+        // d3d12 has no standalone view object, the command list builds transient rtvs on the image when blitting
+        return nullptr;
+    }
+
+    uint32_t Xr::GetSwapchainImageIndex()
+    {
+        return swapchain_image_index;
+    }
+
+    uint32_t Xr::GetSwapchainLength()
+    {
+        return swapchain_length;
+    }
+
+    bool Xr::IsMultiviewSupported()
+    {
+        // multiview is supported if we successfully created an array swapchain
+        return xr_swapchain != XR_NULL_HANDLE && swapchain_length > 0;
+    }
+}

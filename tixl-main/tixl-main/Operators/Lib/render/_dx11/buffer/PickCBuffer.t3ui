@@ -1,0 +1,38 @@
+{
+  "FormatVersion": 3,
+  "Id": "690a64f6-7475-4766-a3f6-456fc5fcea86"/*PickCBuffer*/,
+  "Description": "Picks one of the connected Constatnt buffers. \n",
+  "InputUis": [
+    {
+      "InputId": "2168fd82-df85-405e-820f-7e6447298891"/*Input*/,
+      "Position": {
+        "X": -200.0,
+        "Y": 0.0
+      }
+    },
+    {
+      "InputId": "a4305e0f-3ceb-4353-acf3-41655dcffd93"/*Index*/,
+      "Position": {
+        "X": -200.0,
+        "Y": 0.0
+      }
+    }
+  ],
+  "SymbolChildUis": [],
+  "OutputUis": [
+    {
+      "OutputId": "bc197bba-0f85-4872-b88d-753cd151a9ad"/*Count*/,
+      "Position": {
+        "X": 771.2465,
+        "Y": 946.7957
+      }
+    },
+    {
+      "OutputId": "397f3890-43ba-4c2d-8143-3424808af5e3"/*Output*/,
+      "Position": {
+        "X": 771.2465,
+        "Y": 1046.7957
+      }
+    }
+  ]
+}

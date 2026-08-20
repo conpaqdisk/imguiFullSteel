@@ -1,0 +1,556 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES ========================
+#include "pch.h"
+#include "RenderOptions.h"
+#include "core/Timer.h"
+#include "rhi/RHI_Device.h"
+#include "rendering/Renderer.h"
+#include "resource/ResourceCache.h"
+#include "world/World.h"
+#include "../imgui/ImGui_Extension.h"
+//===================================
+
+//= NAMESPACES ===============
+using namespace std;
+using namespace spartan;
+using namespace spartan::math;
+//============================
+
+namespace
+{
+    // table
+    const int column_count      = 2;
+    const ImGuiTableFlags flags = ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg;
+
+    // misc
+    vector<DisplayMode> display_modes;
+    vector<string> display_modes_string;
+    ImGuiTextFilter option_filter;
+    bool current_section_matches_filter = false;
+
+    // helper functions
+    bool option_visible(const char* label)
+    {
+        return !option_filter.IsActive() || current_section_matches_filter || option_filter.PassFilter(label);
+    }
+
+    bool option_header(const char* title, bool default_open = true)
+    {
+        current_section_matches_filter = option_filter.IsActive() && option_filter.PassFilter(title);
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGuiTreeNodeFlags header_flags = ImGuiTreeNodeFlags_SpanAllColumns;
+        if (default_open || option_filter.IsActive())
+        {
+            header_flags |= ImGuiTreeNodeFlags_DefaultOpen;
+        }
+        if (option_filter.IsActive())
+        {
+            ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+        }
+        return ImGuiSp::collapsing_header(title, header_flags);
+    }
+
+    void option_first_column()
+    {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+    }
+
+    void option_second_column()
+    {
+        ImGui::TableSetColumnIndex(1);
+    }
+
+    void option_check_box(const char* label, const char* render_option, const char* tooltip = nullptr)
+    {
+        if (!option_visible(label))
+        {
+            return;
+        }
+
+        option_first_column();
+        ImGui::TextDisabled("%s", label);
+        if (tooltip)
+        {
+            ImGuiSp::tooltip(tooltip);
+        }
+
+        option_second_column();
+        ImGui::PushID(render_option);
+        bool value = ConsoleRegistry::Get().GetAs<float>(render_option) != 0.0f;
+        // only write on user interaction, otherwise an async cvar update (eg world load) can be reverted
+        if (ImGuiSp::toggle_switch("", &value))
+        {
+            ConsoleRegistry::Get().SetValueFromString(render_option, value ? "1" : "0");
+        }
+        ImGui::PopID();
+    }
+
+    void option_check_box(const char* label, bool& value, const char* tooltip = nullptr)
+    {
+        if (!option_visible(label))
+        {
+            return;
+        }
+
+        option_first_column();
+        ImGui::TextDisabled("%s", label);
+        if (tooltip)
+        {
+            ImGuiSp::tooltip(tooltip);
+        }
+
+        option_second_column();
+        ImGui::PushID(label);
+        ImGuiSp::toggle_switch("", &value);
+        ImGui::PopID();
+    }
+
+    bool option_combo_box(const char* label, const vector<string>& options, uint32_t& selection_index, const char* tooltip = nullptr)
+    {
+        if (!option_visible(label))
+        {
+            return false;
+        }
+
+        option_first_column();
+        ImGui::TextDisabled("%s", label);
+        if (tooltip)
+        {
+            ImGuiSp::tooltip(tooltip);
+        }
+
+        option_second_column();
+        ImGui::PushID(label);
+        ImGui::PushItemWidth(-FLT_MIN);
+        bool result = ImGuiSp::combo_box("", options, &selection_index);
+        ImGui::PopItemWidth();
+        ImGui::PopID();
+        return result;
+    }
+
+    bool option_value(const char* label, const char* render_option, const char* tooltip = nullptr, float step = 0.1f, float min = 0.0f, float max = numeric_limits<float>::max(), const char* format = "%.3f")
+    {
+        if (!option_visible(label))
+        {
+            return false;
+        }
+
+        option_first_column();
+        ImGui::TextDisabled("%s", label);
+        if (tooltip)
+        {
+            ImGuiSp::tooltip(tooltip);
+        }
+
+        bool changed = false;
+        option_second_column();
+        {
+            float value = ConsoleRegistry::Get().GetAs<float>(render_option);
+
+            ImGui::PushID(render_option);
+            ImGui::PushItemWidth(-FLT_MIN);
+            changed = ImGui::InputFloat("", &value, step, 0.0f, format);
+            ImGui::PopItemWidth();
+            ImGui::PopID();
+
+            // only write on user interaction, otherwise an async cvar update (eg world load) can be reverted
+            if (changed)
+            {
+                value = clamp(value, min, max);
+                ConsoleRegistry::Get().SetValueFromString(render_option, to_string(value));
+            }
+        }
+
+        return changed;
+    }
+
+    bool option_float(const char* label, float& option, float step = 0.1f, const char* format = "%.3f")
+    {
+        if (!option_visible(label))
+        {
+            return false;
+        }
+
+        option_first_column();
+        ImGui::TextDisabled("%s", label);
+
+        option_second_column();
+        {
+            ImGui::PushID(label);
+            ImGui::PushItemWidth(-FLT_MIN);
+            const bool changed = ImGui::InputFloat("", &option, step, 0.0f, format);
+            ImGui::PopItemWidth();
+            ImGui::PopID();
+            return changed;
+        }
+    }
+
+    void option_int(const char* label, int& option, int step = 1)
+    {
+        if (!option_visible(label))
+        {
+            return;
+        }
+
+        option_first_column();
+        ImGui::TextDisabled("%s", label);
+        option_second_column();
+        ImGui::PushID(label);
+        ImGui::PushItemWidth(-FLT_MIN);
+        ImGui::InputInt("##shadow_resolution", &option, step);
+        ImGui::PopItemWidth();
+        ImGui::PopID();
+    }
+
+    uint32_t get_display_mode_index(const Vector2& resolution)
+    {
+        uint32_t index = 0;
+
+        for (uint32_t i = 0; i < static_cast<uint32_t>(display_modes.size()); i++)
+        {
+            const DisplayMode& display_mode = display_modes[i];
+
+            if (display_mode.width == resolution.x && display_mode.height == resolution.y)
+            {
+                index = i;
+                break;
+            }
+        }
+
+        return index;
+    };
+}
+
+RenderOptions::RenderOptions(Editor* editor) : Widget(editor)
+{
+    m_title         = "Renderer Options";
+    m_visible       = false;
+    m_toolbar_order = 4;
+    m_toolbar_icon  = static_cast<int>(spartan::IconType::Gear);
+    m_alpha        = 1.0f;
+    m_size_initial = Vector2(Display::GetWidth() * 0.25f, Display::GetHeight() * 0.5f);
+}
+
+void RenderOptions::OnVisible()
+{
+    // get display modes
+    {
+        display_modes.clear();
+        display_modes_string.clear();
+        for (const DisplayMode& display_mode : Display::GetDisplayModes())
+        {
+            // only include resolutions that match the monitor's current refresh rate (with tolerance for floating-point quirks like 240 vs 239.8 Hz)
+            // quirks like that can exist for NVIDIA for example, but not for AMD, so it's important to be safe like that
+            if (fabs(display_mode.hz - Display::GetRefreshRate()) < 0.1f)
+            {
+                display_modes.emplace_back(display_mode);
+                display_modes_string.emplace_back(to_string(display_mode.width) + "x" + to_string(display_mode.height));
+            }
+        }
+    }
+}
+
+void RenderOptions::OnTickVisible()
+{
+    const float dpi = Window::GetDpiScale();
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0f * dpi);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::SetNextItemShortcut(ImGuiMod_Ctrl | ImGuiKey_F, ImGuiInputFlags_Tooltip);
+    if (ImGui::InputTextWithHint("##renderer_options_search", "Filter options in the selected tab", option_filter.InputBuf, IM_ARRAYSIZE(option_filter.InputBuf), ImGuiInputTextFlags_EscapeClearsAll))
+    {
+        option_filter.Build();
+    }
+    ImGui::PopStyleVar();
+
+    ImGui::Dummy(ImVec2(0.0f, 4.0f * dpi));
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(8.0f * dpi, 6.0f * dpi));
+    if (ImGui::BeginTabBar("##renderer_options_tabs"))
+    {
+        // ------------------------------------------------------------------------
+        // RENDERING TAB
+        // ------------------------------------------------------------------------
+        if (ImGui::BeginTabItem("Rendering"))
+        {
+            if (ImGui::BeginTable("##rendering", column_count, flags))
+            {
+                ImGui::TableSetupColumn("Option", ImGuiTableColumnFlags_WidthStretch, 0.62f);
+                ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.38f);
+                ImGui::TableHeadersRow();
+
+                if (option_header("Resolution"))
+                {
+                    // render resolution
+                    Vector2 res_render = Renderer::GetResolutionRender();
+                    uint32_t res_render_index = get_display_mode_index(res_render);
+                    if (option_combo_box("Render resolution", display_modes_string, res_render_index))
+                    {
+                        Renderer::SetResolutionRender(display_modes[res_render_index].width, display_modes[res_render_index].height);
+                    }
+
+                    // output resolution
+                    Vector2 res_output = Renderer::GetResolutionOutput();
+                    uint32_t res_output_index = get_display_mode_index(res_output);
+                    if (option_combo_box("Output resolution", display_modes_string, res_output_index))
+                    {
+                        Renderer::SetResolutionOutput(display_modes[res_output_index].width, display_modes[res_output_index].height);
+                    }
+
+                    option_check_box("Variable rate shading", "r.variable_rate_shading", "Improves performance by varying shading detail per pixel");
+                    option_check_box("Dynamic resolution", "r.dynamic_resolution", "Scales render resolution automatically based on GPU load");
+
+                    ImGui::BeginDisabled(cvar_dynamic_resolution.GetValueAs<bool>());
+                    option_value("Resolution scale", "r.resolution_scale", "Adjusts the percentage of the render resolution", 0.01f);
+                    ImGui::EndDisabled();
+                }
+
+                if (option_header("Anti-Aliasing & Upscaling"))
+                {
+                    vector<string> upsamplers =
+                    {
+                        "Off",    // AA_Off_Upscale_Linear
+                        "FXAA",   // AA_Fxaa_Upscale_Linear
+                        "TAAU",   // AA_Taau_Upscale_Taau
+                        "XeSS 3"  // AA_Xess_Upscale_Xess
+                    };
+                    if (RHI_Device::IsSupportedDlss())
+                    {
+                        upsamplers.emplace_back("DLSS 4"); // AA_Dlss_Upscale_Dlss
+                    }
+
+                    uint32_t mode = cvar_antialiasing_upsampling.GetValueAs<uint32_t>();
+                    if (option_combo_box("Upsampling method", upsamplers, mode))
+                    {
+                        ConsoleRegistry::Get().SetValueFromString("r.antialiasing_upsampling", to_string(static_cast<float>(mode)));
+                    }
+
+                    option_value("Sharpness (CAS)", "r.sharpness", "AMD FidelityFX Contrast Adaptive Sharpening", 0.1f, 0.0f, 1.0f);
+                }
+
+                if (option_header("Ray-traced Effects"))
+                {
+                    ImGui::BeginDisabled(!RHI_Device::IsSupportedRayTracing());
+                    option_check_box("Reflections", "r.ray_traced_reflections");
+                    option_check_box("Shadows",     "r.ray_traced_shadows");
+                    option_check_box("ReSTIR Path Tracing (WIP)", "r.restir_pt");
+                    ImGui::BeginDisabled(!cvar_restir_pt.GetValueAs<bool>());
+                    option_value("ReSTIR resolution scale",   "r.restir_pt_scale",                "Fraction of render resolution used for path tracing (0.1-1.0)", 0.05f, 0.1f, 1.0f, "%.2f");
+                    ImGui::EndDisabled();
+                    ImGui::EndDisabled();
+                }
+
+                if (option_header("Screen-space Effects"))
+                {
+                    option_check_box("Ambient Occlusion (SSAO)", "r.ssao");
+                }
+
+                ImGui::EndTable();
+            }
+            ImGui::EndTabItem();
+        }
+
+        // ------------------------------------------------------------------------
+        // OUTPUT TAB
+        // ------------------------------------------------------------------------
+        if (ImGui::BeginTabItem("Output"))
+        {
+            if (ImGui::BeginTable("##output", column_count, flags))
+            {
+                ImGui::TableSetupColumn("Option", ImGuiTableColumnFlags_WidthStretch, 0.62f);
+                ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.38f);
+                ImGui::TableHeadersRow();
+
+                if (option_header("Display"))
+                {
+                    option_check_box("HDR", "r.hdr", "Enable high dynamic range output");
+                    ImGui::BeginDisabled(cvar_hdr.GetValueAs<bool>());
+                    option_value("Gamma", "r.gamma");
+                    ImGui::EndDisabled();
+                }
+
+                if (option_header("Tone Mapping"))
+                {
+                    static vector<string> tonemapping = { "ACES", "AgX", "Reinhard", "ACES Nautilus", "Gran Turismo 7", "Off" };
+                    uint32_t index = cvar_tonemapping.GetValueAs<uint32_t>();
+                    if (option_combo_box("Algorithm", tonemapping, index))
+                    {
+                        ConsoleRegistry::Get().SetValueFromString("r.tonemapping", to_string(static_cast<float>(index)));
+                    }
+                }
+
+                ImGui::EndTable();
+            }
+            ImGui::EndTabItem();
+        }
+
+        // ------------------------------------------------------------------------
+        // CAMERA TAB
+        // ------------------------------------------------------------------------
+        if (ImGui::BeginTabItem("Camera"))
+        {
+            if (ImGui::BeginTable("##camera", column_count, flags))
+            {
+                ImGui::TableSetupColumn("Effect", ImGuiTableColumnFlags_WidthStretch, 0.62f);
+                ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.38f);
+                ImGui::TableHeadersRow();
+
+                if (option_header("Bloom"))
+                {
+                    option_value("Bloom intensity", "r.bloom", "Blend factor, set to 0 to disable", 0.01f);
+                }
+
+                if (option_header("Light Flares"))
+                {
+                    option_check_box("Light flares", "r.light_flares", "Distant light coronas");
+                    ImGui::BeginDisabled(!cvar_light_flares.GetValueAs<bool>());
+                    option_value("Flare near distance", "r.light_flares_near_distance", "Meters from camera where flares are fully gone", 1.0f, 0.0f, 500.0f);
+                    option_value("Flare fade length", "r.light_flares_fade_length", "Meters over which flares fade in as they get farther", 1.0f, 0.1f, 500.0f);
+                    option_value("Flare max distance", "r.light_flares_max_distance", "How far flare-only lights stay visible past draw distance", 10.0f, 100.0f, 10000.0f);
+                    option_value("Flare size", "r.light_flares_size_scale", "Global flare size multiplier", 0.05f, 0.01f, 5.0f);
+                    option_value("Flare intensity", "r.light_flares_intensity_scale", "Global flare brightness multiplier", 0.05f, 0.01f, 5.0f);
+                    option_value("Flare max size", "r.light_flares_max_size_px", "Maximum flare radius in pixels", 0.5f, 1.0f, 16.0f);
+                    option_check_box("Flare occlusion", "r.light_flares_occlusion", "Hide flares behind geometry");
+                    ImGui::EndDisabled();
+                }
+
+                if (option_header("Camera Effects"))
+                {
+                    option_check_box("Motion blur", "r.motion_blur", "Controlled by camera shutter speed");
+                    option_check_box("Depth of field", "r.depth_of_field", "Cinematic auto focus, strength from aperture");
+                    option_check_box("Film grain", "r.film_grain", "Simulates old film camera noise");
+                    option_check_box("Chromatic aberration", "r.chromatic_aberration", "Lens color fringing effect");
+                    option_check_box("VHS effect", "r.vhs", "Retro VHS look");
+                    option_check_box("Dithering", "r.dithering", "Reduces color banding in gradients");
+                }
+
+                ImGui::EndTable();
+            }
+            ImGui::EndTabItem();
+        }
+
+        // ------------------------------------------------------------------------
+        // WORLD TAB
+        // ------------------------------------------------------------------------
+        if (ImGui::BeginTabItem("World"))
+        {
+            if (ImGui::BeginTable("##world", column_count, flags))
+            {
+                ImGui::TableSetupColumn("Option", ImGuiTableColumnFlags_WidthStretch, 0.62f);
+                ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.38f);
+                ImGui::TableHeadersRow();
+
+                if (option_header("Atmosphere"))
+                {
+                    option_value("Fog density", "r.fog", "Controls volumetric fog strength", 0.1f);
+                }
+
+                if (option_header("Wind"))
+                {
+                    Vector3 wind = World::GetWind();
+                    float strength = wind.Length();
+                    float direction = atan2f(wind.x, wind.z) * (180.0f / 3.14159f);
+                    if (direction < 0.0f)
+                    {
+                        direction += 360.0f;
+                    }
+
+                    bool changed = false;
+                    changed |= option_float("Strength", strength, 0.1f, "%.1f");
+                    changed |= option_float("Direction", direction, 1.0f, "%.1f deg");
+
+                    if (changed)
+                    {
+                        strength = clamp(strength, 0.1f, 10.0f);
+                        direction = clamp(direction, 0.0f, 360.0f);
+                        float radians = direction * (3.14159f / 180.0f);
+                        wind.x = sinf(radians) * strength;
+                        wind.z = cosf(radians) * strength;
+                        World::SetWind(wind);
+                    }
+
+                    ImGuiSp::tooltip("Wind affects vegetation and cloth simulation");
+                }
+
+                ImGui::EndTable();
+            }
+            ImGui::EndTabItem();
+        }
+
+        // ------------------------------------------------------------------------
+        // DEBUG TAB
+        // ------------------------------------------------------------------------
+        if (ImGui::BeginTabItem("Debug"))
+        {
+            if (ImGui::BeginTable("##debug", column_count, flags))
+            {
+                ImGui::TableSetupColumn("Option", ImGuiTableColumnFlags_WidthStretch, 0.62f);
+                ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.38f);
+                ImGui::TableHeadersRow();
+
+                if (option_header("Performance"))
+                {
+                    option_check_box("VSync", "r.vsync", "Synchronize frame updates with monitor refresh");
+                    if (option_visible("FPS limit"))
+                    {
+                        option_first_column();
+                        string fps_label = "FPS limit (" + string(Timer::GetFpsLimitType() == FpsLimitType::FixedToMonitor ? "monitor" : Timer::GetFpsLimitType() == FpsLimitType::Unlocked ? "unlocked" : "fixed") + ")";
+                        ImGui::TextDisabled("%s", fps_label.c_str());
+                        option_second_column();
+                        float fps_target = Timer::GetFpsLimit();
+                        ImGui::PushItemWidth(-FLT_MIN);
+                        if (ImGui::InputFloat("##fps_limit", &fps_target, 0.0, 0.0f, "%.1f"))
+                        {
+                            Timer::SetFpsLimit(fps_target);
+                        }
+                        ImGui::PopItemWidth();
+                    }
+                    option_check_box("Show performance metrics", "r.performance_metrics");
+                }
+
+                if (option_header("Debug Visuals"))
+                {
+                    option_value("Snap translate", "r.transform_snap_translate", "world units", 0.05f, 0.001f, 100.0f, "%.3f");
+                    option_value("Snap rotate", "r.transform_snap_rotate", "degrees", 1.0f, 0.1f, 180.0f, "%.1f");
+                    option_value("Snap scale", "r.transform_snap_scale", "scale step", 0.05f, 0.001f, 10.0f, "%.3f");
+                    option_check_box("Selection outline", "r.selection_outline");
+                    option_check_box("Entity icons", "r.entity_icons");
+                    option_check_box("Grid", "r.grid");
+                    option_check_box("Picking ray", "r.picking_ray");
+                    option_check_box("Physics", "r.physics");
+                    option_check_box("Ragdoll", "r.ragdoll", "Capsule and joint overlay, works while playing");
+                    option_check_box("AABBs", "r.aabb");
+                    option_check_box("Wireframe", "r.wireframe");
+                    option_check_box("Occlusion culling", "r.hiz_occlusion", "For development purposes");
+                    option_check_box("Mesh shaders", "r.mesh_shaders", "Primary opaque path when supported, otherwise vertex-shader pull");
+                }
+
+                ImGui::EndTable();
+            }
+            ImGui::EndTabItem();
+        }
+
+        ImGui::EndTabBar();
+    }
+    ImGui::PopStyleVar();
+}

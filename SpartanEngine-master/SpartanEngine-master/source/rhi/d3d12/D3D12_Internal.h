@@ -1,0 +1,164 @@
+/*
+Copyright(c) 2016-2024 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+#pragma once
+
+#include <cstdint>
+#include <d3d12.h>
+
+namespace spartan
+{
+    enum class RHI_Queue_Type;
+}
+
+// agility sdk redist, returns 0 when the build falls back to the in-box d3d12 runtime
+namespace spartan::d3d12_agility
+{
+    uint32_t requested_sdk_version();
+}
+
+// d3d12 only capabilities, queried once during device creation
+// features with a vulkan counterpart live on RHI_Device instead, these have no vulkan analogue
+namespace spartan::d3d12_caps
+{
+    uint32_t                  GetLoadedSdkVersion();       // 0 when the in-box runtime is in use
+    bool                      IsEnhancedBarriersSupported();
+    bool                      IsGpuUploadHeapSupported();
+    bool                      IsRelaxedFormatCastingSupported();
+    D3D12_MESH_SHADER_TIER    GetMeshShaderTier();
+    D3D12_RESOURCE_BINDING_TIER GetResourceBindingTier();
+    D3D_ROOT_SIGNATURE_VERSION GetHighestRootSignatureVersion();
+    D3D_SHADER_MODEL          GetHighestShaderModel();
+}
+
+// barrier submission, translates the legacy barrier descriptions the command list builds into
+// enhanced barriers when the runtime supports them, otherwise submits them as-is
+namespace spartan::d3d12_barriers
+{
+    void Initialize();
+    bool IsEnabled();
+    void Submit(ID3D12GraphicsCommandList* cmd_list, const D3D12_RESOURCE_BARRIER* barriers, uint32_t count);
+}
+
+// shared descriptor-heap + queue access used by the various D3D12_*.cpp files
+namespace spartan::d3d12_descriptors
+{
+    // heaps
+    ID3D12DescriptorHeap* GetRtvHeap();
+    ID3D12DescriptorHeap* GetDsvHeap();
+    ID3D12DescriptorHeap* GetCbvSrvUavHeap();
+    ID3D12DescriptorHeap* GetSamplerHeap();
+    ID3D12DescriptorHeap* GetCbvSrvUavHeapCpu();
+    ID3D12DescriptorHeap* GetSamplerHeapCpu();
+
+    // descriptor sizes
+    uint32_t GetRtvDescriptorSize();
+    uint32_t GetDsvDescriptorSize();
+    uint32_t GetCbvSrvUavDescriptorSize();
+    uint32_t GetSamplerDescriptorSize();
+
+    // zone info
+    uint32_t GetBindlessTexturesBase();
+    uint32_t GetBindlessTexturesCount();
+    uint32_t GetBindlessBuffersBase();
+    uint32_t GetBindlessBuffersCount();
+    uint32_t GetSamplersCompareBase();
+    uint32_t GetSamplersCompareCount();
+    uint32_t GetSamplersBase();
+    uint32_t GetSamplersCount();
+
+    // handles
+    D3D12_CPU_DESCRIPTOR_HANDLE GetRtvHandle(uint32_t index);
+    D3D12_CPU_DESCRIPTOR_HANDLE GetDsvHandle(uint32_t index);
+    D3D12_CPU_DESCRIPTOR_HANDLE GetCbvSrvUavCpuHandle(uint32_t index);          // cpu-only staging heap
+    D3D12_CPU_DESCRIPTOR_HANDLE GetSamplerCpuHandle(uint32_t index);            // cpu-only staging heap
+    D3D12_CPU_DESCRIPTOR_HANDLE GetCbvSrvUavGpuVisibleCpuHandle(uint32_t index);// shader-visible heap (for writes)
+    D3D12_GPU_DESCRIPTOR_HANDLE GetCbvSrvUavGpuHandle(uint32_t index);
+    D3D12_CPU_DESCRIPTOR_HANDLE GetSamplerGpuVisibleCpuHandle(uint32_t index);
+    D3D12_GPU_DESCRIPTOR_HANDLE GetSamplerGpuHandle(uint32_t index);
+
+    // allocators
+    uint32_t AllocateRtv();
+    uint32_t AllocateDsv();
+    uint32_t AllocateCbvSrvUavCpu();          // monotonic, for static views (texture/buffer init)
+    uint32_t AllocateCbvSrvUavCpuTransient(); // wraps inside a dedicated transient zone, for per-frame transient views
+    uint32_t AllocateSamplerCpu();
+    void     FreeSamplerCpu(uint32_t index);
+    uint32_t SamplerHandleToIndex(SIZE_T handle_ptr);
+    uint32_t AllocateRing(uint32_t count); // index in shader-visible cbv/srv/uav heap
+
+    // queue resources
+    ID3D12CommandAllocator* GetGraphicsAllocator();
+    ID3D12Fence*            GetGraphicsFence();
+    uint64_t&               GetGraphicsFenceValue();
+    ID3D12Fence*            GetQueueFence(RHI_Queue_Type type);
+    uint64_t&               GetQueueFenceValue(RHI_Queue_Type type);
+    HANDLE                  GetFenceEvent();
+}
+
+// root parameter slots for the unified bindless root signature
+namespace spartan::d3d12_root_slot
+{
+    // buffers bound through Renderer_BindingsUav are declared as t registers in the stages that only read them, so the srv table must span the same index range as the uav table
+    constexpr uint32_t srv_space0_count   = 60; // t0..t59
+    constexpr uint32_t uav_space0_count   = 60; // u0..u59
+    constexpr uint32_t cbv_frame          = 0;  // CBV b0 space0
+    constexpr uint32_t push_constants     = 1;  // 32-bit root constants b1 space0
+    constexpr uint32_t srv_table_space0   = 2;  // t0..t56 space0
+    constexpr uint32_t uav_table_space0   = 3;  // u0..u56 space0
+    constexpr uint32_t srv_material_tex   = 4;  // t15 space1 unbounded
+    constexpr uint32_t srv_material_param = 5;  // t16 space2
+    constexpr uint32_t srv_light_param    = 6;  // t17 space3
+    constexpr uint32_t srv_aabb           = 7;  // t18 space4
+    constexpr uint32_t srv_draw_data      = 8;  // t19 space5
+    constexpr uint32_t srv_geometry       = 9;  // t20 space8 + t22 space9 + t23 space10
+    constexpr uint32_t sampler_table      = 10; // s0 space6 + s1 space7
+    constexpr uint32_t count              = 11;
+}
+
+// per-resource state tracker, used to compute the StateBefore field of d3d12 transition barriers
+// resources are seeded by their owners (texture creation, swapchain acquire) and freed on destroy
+namespace spartan::d3d12_state
+{
+    void SetState(ID3D12Resource* resource, D3D12_RESOURCE_STATES state);
+    D3D12_RESOURCE_STATES GetState(ID3D12Resource* resource);
+    // buffers and simultaneous-access textures decay to common after executecommandlists
+    void SetDecaysToCommon(ID3D12Resource* resource, bool decays);
+    bool DecaysToCommon(ID3D12Resource* resource);
+    void SetIsBuffer(ID3D12Resource* resource, bool is_buffer);
+    bool IsBuffer(ID3D12Resource* resource);
+    void SetSubresourceCount(ID3D12Resource* resource, uint32_t count);
+    uint32_t GetSubresourceCount(ID3D12Resource* resource);
+    void RemoveState(ID3D12Resource* resource);
+}
+
+// true when pipeline_cache_d3d12.bin was loaded, skip Load*Pipeline when false to avoid nameless cache spam
+namespace spartan::d3d12_pipeline_library
+{
+    bool can_load();
+}
+
+// shader bytecode lifetime, the IDxcBlob backing a compiled shader is kept alive in a registry
+// keyed by its buffer pointer so the deletion queue can release it when the shader is destroyed
+namespace spartan::d3d12_shader
+{
+    void release_bytecode_blob(void* bytecode_ptr);
+}

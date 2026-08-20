@@ -1,0 +1,14 @@
+{
+  "BaseConfig": {
+    "Url": "file://config.base.json"
+  },
+  "Namespace": "Hexa.NET.ImNodes",
+  "ApiName": "ImNodes",
+  "LibName": "cimnodes",
+  "KnownDefaultValueNames": {
+    "ImNodesMiniMapLocation_TopLeft": "ImNodesMiniMapLocation.TopLeft",
+    "ImNodesPinShape_CircleFilled": "ImNodesPinShape.CircleFilled"
+  },
+  "IgnoredParts": [ "ImNodes", "Imnodes", "imnodes" ],
+  "Usings": [ "Hexa.NET.ImGui" ]
+}

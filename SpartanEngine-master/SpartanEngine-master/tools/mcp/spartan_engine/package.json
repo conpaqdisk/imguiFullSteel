@@ -1,0 +1,20 @@
+{
+  "name": "spartan-engine-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "spartan-engine-mcp": "./server.mjs"
+  },
+  "scripts": {
+    "start": "node ./server.mjs",
+    "http": "node ./server.mjs --http --no-stdio --http-port=8765",
+    "assistant": "node ./assistant.mjs"
+  },
+  "dependencies": {
+    "@connectrpc/connect-node": "1.7.0",
+    "@cursor/sdk": "1.0.19",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "zod": "4.4.3"
+  }
+}

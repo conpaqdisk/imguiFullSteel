@@ -1,0 +1,153 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+#pragma once
+
+//= INCLUDES =====================
+#include "Component.h"
+#include "../../math/Quaternion.h"
+#include <vector>
+//================================
+
+namespace spartan
+{
+    class Spline;
+
+    // behavior when the follower reaches the end of the spline
+    enum class SplineFollowMode : uint8_t
+    {
+        Clamp,    // stop at the end
+        Loop,     // jump back to the start and continue
+        PingPong, // reverse direction at each end
+        Max
+    };
+
+    class SplineFollower : public Component
+    {
+    public:
+        SplineFollower(Entity* entity);
+        ~SplineFollower() = default;
+
+        // lifecycle
+        void Start() override;
+        void Stop() override;
+        void Tick() override;
+
+        // serialization
+        void Save(pugi::xml_node& node) override;
+        void Load(pugi::xml_node& node) override;
+
+        // spline entity reference
+        uint64_t GetSplineEntityId() const            { return m_spline_entity_id; }
+        void SetSplineEntityId(uint64_t id);
+        Entity* GetSplineEntity() const               { return m_spline_entity; }
+
+        // movement properties
+        float GetSpeed() const                        { return m_speed; }
+        void SetSpeed(float speed)                    { m_speed = speed; }
+        SplineFollowMode GetFollowMode() const        { return m_follow_mode; }
+        void SetFollowMode(SplineFollowMode mode)     { m_follow_mode = mode; }
+        bool GetAlignToSpline() const                 { return m_align_to_spline; }
+        void SetAlignToSpline(bool align)             { m_align_to_spline = align; }
+        bool GetFlipForward() const                   { return m_flip_forward; }
+        void SetFlipForward(bool flip)                { m_flip_forward = flip; }
+
+        // normalized position along the spline [0, 1]
+        float GetProgress() const                     { return m_progress; }
+        void SetProgress(float progress)              { m_progress = progress < 0.0f ? 0.0f : (progress > 1.0f ? 1.0f : progress); }
+
+        // wheel animation, rolls every wheel with speed and steers the front wheels into the turns
+        bool GetAnimateWheels() const                 { return m_animate_wheels; }
+        void SetAnimateWheels(bool enable)            { m_animate_wheels = enable; }
+        float GetWheelRadius() const                  { return m_wheel_radius; }
+        void SetWheelRadius(float radius)             { m_wheel_radius = radius < 0.0f ? 0.0f : radius; } // 0 auto estimates from the mesh
+        float GetMaxSteerAngle() const                { return m_max_steer_angle; }
+        void SetMaxSteerAngle(float degrees)          { m_max_steer_angle = degrees; }
+
+        // drive the follower externally, maps seconds from the start to a spline position
+        void SetTime(float seconds);
+
+    private:
+        // try to resolve the runtime entity pointer from the stored id
+        void ResolveSplineEntity();
+
+        // resolve and validate the spline, returns null if it can't be followed
+        Spline* GetValidSpline();
+
+        // apply the current progress to the entity transform
+        void ApplyProgress(Spline* spline);
+
+        // find the wheel entities under the follower and classify them front or rear
+        void ResolveWheels();
+
+        // roll every wheel with the travelled distance and steer the front wheels into the turn
+        void UpdateWheels(Spline* spline, float t);
+
+        // signed steer angle in radians derived from the upcoming spline curvature
+        float ComputeSteerAngle(Spline* spline, float t) const;
+
+        // id of the entity that has the spline component (persisted)
+        uint64_t m_spline_entity_id = 0;
+
+        // runtime pointer to the spline entity (not persisted)
+        Entity* m_spline_entity = nullptr;
+
+        // movement speed in world units per second
+        float m_speed = 5.0f;
+
+        // what happens when the follower reaches the end
+        SplineFollowMode m_follow_mode = SplineFollowMode::Loop;
+
+        // orient the entity along the spline tangent
+        bool m_align_to_spline = true;
+
+        // rotate 180 degrees for meshes whose forward axis points backwards
+        bool m_flip_forward = false;
+
+        // current normalized position along the spline [0, 1]
+        float m_progress = 0.0f;
+
+        // travel direction: +1 forward, -1 backward (used by ping-pong)
+        float m_direction = 1.0f;
+
+        // roll every wheel with speed and steer the front wheels into the turns
+        bool m_animate_wheels = true;
+
+        // wheel radius in meters, 0 auto estimates it from the wheel mesh bounds
+        float m_wheel_radius = 0.0f;
+
+        // maximum steering angle of the front wheels in degrees
+        float m_max_steer_angle = 35.0f;
+
+        // a resolved wheel and its orientation relative to the car body
+        struct WheelState
+        {
+            Entity* entity                  = nullptr;
+            math::Quaternion rest_offset    = math::Quaternion::Identity;
+            bool is_front                   = false;
+        };
+
+        // runtime wheel cache, not persisted, rebuilt on demand
+        std::vector<WheelState> m_wheels;
+        bool m_wheels_resolved     = false;
+        float m_wheel_radius_active = 0.35f;
+    };
+}

@@ -1,0 +1,128 @@
+{
+  "FormatVersion": 3,
+  "Id": "51968877-03e7-472d-9b43-95bc8aeda3bc"/*ChannelMixer*/,
+  "Description": "Adjusts the color of an incoming image.\n\nEach column defines a color channel of the output, whereas the incoming components are multiplied by a factor and summed up.\nFinally, a value is added to each component.\n\nYou can do a lot of things with this operator, like:\n- converting to grayscale\n- extracting an alpha channel to grayscale\n- inverting an image\n- swapping color channels.\n\nCheck the presets for examples.\nFor more natural color correction, try [Adjust Color].",
+  "SymbolTags": "1",
+  "InputUis": [
+    {
+      "InputId": "17d67e72-9603-4dfa-8646-e8e2e9db7fbf"/*ClampResult*/,
+      "Position": {
+        "X": 442.4342,
+        "Y": 530.55725
+      }
+    },
+    {
+      "InputId": "1a0acd15-34d1-4b8f-9739-f78ba204f315"/*Add*/,
+      "Position": {
+        "X": 442.4342,
+        "Y": 390.55728
+      },
+      "GroupTitle": "Settings"
+    },
+    {
+      "InputId": "1f380edd-ed50-49a4-976d-cce13783851d"/*MultiplyB*/,
+      "Position": {
+        "X": 442.4342,
+        "Y": 110.55728
+      }
+    },
+    {
+      "InputId": "28bb7ff9-190a-4624-9361-c4a530851bfd"/*Texture2d*/,
+      "Relevancy": "Required",
+      "Position": {
+        "X": 582.4342,
+        "Y": -204.44272
+      }
+    },
+    {
+      "InputId": "5f3e8fc7-5b51-4502-aac2-d4cc282c985a"/*MultiplyR*/,
+      "Position": {
+        "X": 442.4342,
+        "Y": -169.44272
+      },
+      "GroupTitle": "Channels"
+    },
+    {
+      "InputId": "76e01cd7-15b8-4962-a96f-592e67ae51c5"/*MultiplyG*/,
+      "Position": {
+        "X": 442.4342,
+        "Y": -29.442719
+      }
+    },
+    {
+      "InputId": "8e25ab02-ef93-441c-8a16-78555093c5a6"/*GenerateMipmaps*/,
+      "Position": {
+        "X": 582.4342,
+        "Y": 565.55725
+      },
+      "AddPadding": "True"
+    },
+    {
+      "InputId": "e68ed87b-fb06-43b2-a51f-a37a85fb6d87"/*MultiplyA*/,
+      "Position": {
+        "X": 442.4342,
+        "Y": 250.55728
+      }
+    }
+  ],
+  "SymbolChildUis": [
+    {
+      "ChildId": "0c6358fd-a9d2-4d8b-b9d6-5c435bd01708"/*Vector4Components*/,
+      "Position": {
+        "X": 582.4342,
+        "Y": 390.55728
+      }
+    },
+    {
+      "ChildId": "0d751e5a-ab98-447a-86ae-998e16b4f99c"/*Vector4Components*/,
+      "Position": {
+        "X": 582.4342,
+        "Y": 250.55728
+      }
+    },
+    {
+      "ChildId": "1e6b6da4-4c9d-4bfe-a0ea-144116dbbe20"/*Vector4Components*/,
+      "Position": {
+        "X": 582.4342,
+        "Y": 110.55728
+      }
+    },
+    {
+      "ChildId": "34d84a40-5e42-46f2-aa44-5ad18246b03b"/*BoolToFloat*/,
+      "Position": {
+        "X": 582.4342,
+        "Y": 530.55725
+      }
+    },
+    {
+      "ChildId": "80db9bd5-cec6-49af-9cba-f33ef5752a31"/*Vector4Components*/,
+      "Position": {
+        "X": 582.4342,
+        "Y": -29.442719
+      }
+    },
+    {
+      "ChildId": "99f43d85-65d0-418e-bb90-83f75b71360f"/*_ImageFxShaderSetupStatic*/,
+      "Position": {
+        "X": 722.4342,
+        "Y": -204.44272
+      }
+    },
+    {
+      "ChildId": "d417a36e-fe49-4115-8cb7-ea2de2844f10"/*Vector4Components*/,
+      "Position": {
+        "X": 582.4342,
+        "Y": -169.44272
+      }
+    }
+  ],
+  "OutputUis": [
+    {
+      "OutputId": "9cedcad7-1c8d-4aee-9168-67deae14248d"/*Output*/,
+      "Position": {
+        "X": 722.4342,
+        "Y": 600.55725
+      }
+    }
+  ]
+}

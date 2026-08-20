@@ -1,0 +1,3987 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES ===============================
+#include "pch.h"
+#include "Car.h"
+#include "CarHud.h"
+#include "CarSimulation.h"
+#include "CarEngineSoundSynthesis.h"
+#include "CarTireSquealSynthesis.h"
+#include "../input/Input.h"
+#include "../core/Window.h"
+#include "../file_system/FileSystem.h"
+#include "../rendering/Material.h"
+#include "../rendering/Renderer.h"
+#include "../resource/ResourceCache.h"
+#include "../world/World.h"
+#include "../world/Entity.h"
+#include "../world/components/AudioSource.h"
+#include "../world/components/Camera.h"
+#include "../world/components/Light.h"
+#include "../world/components/Physics.h"
+#include "../world/components/Render.h"
+#include "../world/components/CarReset.h"
+#include "../world/components/SpawnPoint.h"
+#include "../world/Prefab.h"
+#include "../io/pugixml.hpp"
+#include <mutex>
+//==========================================
+
+namespace spartan
+{
+    std::vector<Car*> Car::s_cars;
+
+    // shared entities use external linkage and resolve lazily during world load
+    Entity* default_camera = nullptr;
+
+    namespace
+    {
+        // car prefabs are created from multiple world loading threads, s_cars is shared
+        std::mutex car_list_mutex;
+        std::once_flag audio_synthesizers_once;
+        constexpr float car_spawn_margin = 1.0f;
+        // how far from the car surface the player can be and still get in
+        constexpr float car_enter_reach = 2.5f;
+
+        float get_car_lower_extent(const car::car_preset& preset)
+        {
+            const float wheel_extent = preset.suspension_height + std::max(preset.front_wheel_radius, preset.rear_wheel_radius);
+            return std::max(preset.height * 0.5f, wheel_extent);
+        }
+
+        enum class CarMaterialSlot
+        {
+            Unknown,
+            BodyPaint,
+            CarbonTrim,
+            TireRubber,
+            RimMetal,
+            HeadlightLens,
+            TaillightLens,
+            MainGlass,
+            MirrorGlass,
+            EngineMetal,
+            BrakeDisc,
+            InteriorLeather,
+            BlackTrim,
+            EmissiveRedLight,
+            EmissiveWhiteLight
+        };
+
+        std::string to_lower_copy(std::string value)
+        {
+            std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return std::tolower(c); });
+            return value;
+        }
+
+        bool contains(const std::string& value, const char* token)
+        {
+            return value.find(token) != std::string::npos;
+        }
+
+        MaterialPaintPreset parse_paint_preset(const char* value)
+        {
+            const std::string preset = to_lower_copy(value ? value : "");
+
+            if (preset == "gloss_solid" || preset == "gloss solid" || preset == "solid")
+            {
+                return MaterialPaintPreset::GlossSolid;
+            }
+
+            if (preset == "metallic")
+            {
+                return MaterialPaintPreset::Metallic;
+            }
+
+            if (preset == "satin")
+            {
+                return MaterialPaintPreset::Satin;
+            }
+
+            if (preset == "matte")
+            {
+                return MaterialPaintPreset::Matte;
+            }
+
+            if (preset == "pearl")
+            {
+                return MaterialPaintPreset::Pearl;
+            }
+
+            if (preset == "chameleon")
+            {
+                return MaterialPaintPreset::Chameleon;
+            }
+
+            return MaterialPaintPreset::Metallic;
+        }
+
+        void tag_wheel(Entity* wheel, bool is_front, bool is_left)
+        {
+            wheel->AddTag("wheel");
+            wheel->AddTag(is_front ? "wheel_front" : "wheel_rear");
+            wheel->AddTag(is_left ? "wheel_left" : "wheel_right");
+        }
+
+        // scales prop wheels without a physics component
+        void scale_wheel_to_radius(Entity* wheel_entity, float target_radius)
+        {
+            Render* render = wheel_entity->GetComponent<Render>();
+            if (!render || !std::isfinite(target_radius) || target_radius <= 0.0f)
+            {
+                return;
+            }
+
+            const math::Vector3 extents  = render->GetBoundingBoxMesh().GetExtents();
+            const float measured_radius  = std::max({ extents.x, extents.y, extents.z });
+            if (!std::isfinite(measured_radius) || measured_radius <= 1e-5f)
+            {
+                return;
+            }
+
+            wheel_entity->SetScaleLocal(math::Vector3(target_radius / measured_radius));
+        }
+
+        std::string resolve_car_file(const std::string& file)
+        {
+            const std::string relative = file.empty() ? "cars/ferrari_laferrari.car" : file;
+
+            // paths in world files are relative to the world file directory
+            const std::string& world_path = World::GetFilePath();
+            if (!world_path.empty())
+            {
+                const std::string candidate = FileSystem::GetDirectoryFromFilePath(world_path) + relative;
+                if (FileSystem::Exists(candidate))
+                {
+                    return candidate;
+                }
+            }
+
+            // fall back to the path as given, relative to the working directory
+            return relative;
+        }
+
+        std::string get_material_context(Entity* entity, Render* render)
+        {
+            std::string context;
+            for (Entity* current = entity; current != nullptr; current = current->GetParent())
+            {
+                context += " ";
+                context += to_lower_copy(current->GetObjectName());
+            }
+
+            if (render)
+            {
+                context += " ";
+                context += to_lower_copy(render->GetMaterialName());
+            }
+
+            return context;
+        }
+
+        CarMaterialSlot resolve_car_material_slot(Entity* entity, Render* render)
+        {
+            const std::string context = get_material_context(entity, render);
+
+            if (contains(context, "car_paint") || contains(context, "body"))
+            {
+                return CarMaterialSlot::BodyPaint;
+            }
+
+            if (contains(context, "carbon"))
+            {
+                return CarMaterialSlot::CarbonTrim;
+            }
+
+            if (contains(context, "object_129") || contains(context, "object_144") || contains(context, "object_159") || contains(context, "object_174"))
+            {
+                return CarMaterialSlot::BrakeDisc;
+            }
+
+            if (contains(context, "object_180") || contains(context, "object_150") || contains(context, "rim"))
+            {
+                return CarMaterialSlot::RimMetal;
+            }
+
+            if (contains(context, "tire"))
+            {
+                return CarMaterialSlot::TireRubber;
+            }
+
+            if (contains(context, "red_light") || contains(context, "tail_lights") || contains(context, "run_lights"))
+            {
+                return CarMaterialSlot::EmissiveRedLight;
+            }
+
+            if ((contains(context, "rear") || contains(context, "tail") || contains(context, "break") || contains(context, "breake")) && contains(context, "headlight"))
+            {
+                return CarMaterialSlot::EmissiveRedLight;
+            }
+
+            if (contains(context, "headlight") && !contains(context, "glass"))
+            {
+                return CarMaterialSlot::EmissiveWhiteLight;
+            }
+
+            if (contains(context, "glass") || contains(context, "glasses"))
+            {
+                if (contains(context, "break") || contains(context, "breake") || contains(context, "tail") || contains(context, "rear") || contains(context, "red"))
+                {
+                    return CarMaterialSlot::TaillightLens;
+                }
+
+                if (contains(context, "head"))
+                {
+                    return CarMaterialSlot::HeadlightLens;
+                }
+
+                return CarMaterialSlot::MainGlass;
+            }
+
+            if (contains(context, "object_58"))
+            {
+                return CarMaterialSlot::MainGlass;
+            }
+
+            if (contains(context, "object_98"))
+            {
+                return CarMaterialSlot::MirrorGlass;
+            }
+
+            if (contains(context, "object_14") || contains(context, "engine") || contains(context, "disk"))
+            {
+                return CarMaterialSlot::EngineMetal;
+            }
+
+            if (contains(context, "object_90") || contains(context, "leather") || contains(context, "interior"))
+            {
+                return CarMaterialSlot::InteriorLeather;
+            }
+
+            if (contains(context, "black") || contains(context, "under"))
+            {
+                return CarMaterialSlot::BlackTrim;
+            }
+
+            return CarMaterialSlot::Unknown;
+        }
+
+        using CarMaterialClones =
+            std::map<
+                std::pair<Material*, std::string>,
+                std::shared_ptr<Material>
+            >;
+
+        std::shared_ptr<Material> clone_car_material(
+            Entity* car_entity,
+            Render* render,
+            const char* slot_name,
+            CarMaterialClones& clones
+        )
+        {
+            Material* source = render ? render->GetMaterial() : nullptr;
+            if (!source)
+            {
+                return nullptr;
+            }
+
+            const auto key = std::make_pair(
+                source,
+                std::string(slot_name)
+            );
+            const auto existing = clones.find(key);
+            if (existing != clones.end())
+            {
+                render->SetMaterial(existing->second);
+                return existing->second;
+            }
+
+            const std::string resource_name =
+                "car_" +
+                std::to_string(car_entity->GetObjectId()) +
+                "_" +
+                std::to_string(source->GetObjectId()) +
+                "_" +
+                slot_name +
+                std::string(EXTENSION_MATERIAL);
+            std::shared_ptr<Material> material = source->Clone(resource_name);
+            material->SetPersistent(false);
+            render->SetMaterial(material);
+            clones.emplace(key, material);
+            return material;
+        }
+
+        // structure colors are reserved by nature, load only tints inside the same hue
+        const Color skeleton_color_frame       = Color(0.55f, 0.62f, 0.72f, 1.0f);
+        const Color skeleton_color_suspension  = Color(0.98f, 0.70f, 0.12f, 1.0f);
+        const Color skeleton_color_steering    = Color(0.20f, 0.95f, 0.42f, 1.0f);
+        const Color skeleton_color_drivetrain  = Color(0.10f, 0.78f, 1.00f, 1.0f);
+        const Color skeleton_color_wheel       = Color(0.78f, 0.82f, 0.88f, 1.0f);
+        const Color skeleton_color_collision   = Color(0.72f, 0.28f, 1.00f, 1.0f);
+        // telemetry overlays, never used for structure
+        const Color skeleton_color_contact     = Color(0.55f, 1.00f, 0.30f, 1.0f);
+        const Color skeleton_color_tire_force  = Color(1.00f, 0.30f, 0.68f, 1.0f);
+        const Color skeleton_color_long_force  = Color(1.00f, 0.40f, 0.15f, 1.0f);
+        const Color skeleton_color_torque      = Color(1.00f, 0.18f, 0.18f, 1.0f);
+        const Color skeleton_color_aero        = Color(0.25f, 0.90f, 0.75f, 1.0f);
+
+        auto tint_skeleton_color = [](const Color& base, float load, float lift) -> Color
+        {
+            const float t = std::clamp(load, 0.0f, 1.0f) * lift;
+            return Color(
+                std::min(base.r + t * (1.0f - base.r), 1.0f),
+                std::min(base.g + t * (1.0f - base.g), 1.0f),
+                std::min(base.b + t * (1.0f - base.b), 1.0f),
+                base.a);
+        };
+
+        math::Vector3 lerp_skeleton(const math::Vector3& a, const math::Vector3& b, float t)
+        {
+            return a + (b - a) * t;
+        }
+
+        void draw_skeleton_joint(const math::Vector3& position, const Color& color)
+        {
+            Renderer::DrawSphere(position, 0.035f, 6, color);
+        }
+
+        void draw_skeleton_cylinder(const math::Vector3& start, const math::Vector3& end, float radius, const Color& color)
+        {
+            const math::Vector3 axis = end - start;
+            const float length = axis.Length();
+            if (length <= 0.001f)
+            {
+                return;
+            }
+
+            const math::Vector3 direction = axis / length;
+            const math::Vector3 reference = fabsf(direction.y) < 0.9f ? math::Vector3::Up : math::Vector3::Right;
+            const math::Vector3 tangent = math::Vector3::Cross(direction, reference).Normalized();
+            const math::Vector3 bitangent = math::Vector3::Cross(direction, tangent).Normalized();
+            const int segments = 10;
+            math::Vector3 previous_start;
+            math::Vector3 previous_end;
+            for (int i = 0; i <= segments; i++)
+            {
+                const float angle = static_cast<float>(i) * math::pi * 2.0f / static_cast<float>(segments);
+                const math::Vector3 radial = (tangent * cosf(angle) + bitangent * sinf(angle)) * radius;
+                const math::Vector3 start_point = start + radial;
+                const math::Vector3 end_point = end + radial;
+                if (i > 0)
+                {
+                    Renderer::DrawLine(previous_start, start_point, color, color);
+                    Renderer::DrawLine(previous_end, end_point, color, color);
+                }
+                if (i % 2 == 0)
+                {
+                    Renderer::DrawLine(start_point, end_point, color, color);
+                }
+                previous_start = start_point;
+                previous_end = end_point;
+            }
+        }
+
+        void draw_skeleton_spring(const math::Vector3& start, const math::Vector3& end, const math::Vector3& reference, float radius, const Color& color)
+        {
+            const math::Vector3 axis = end - start;
+            const float length = axis.Length();
+            if (length <= 0.001f)
+            {
+                return;
+            }
+
+            const math::Vector3 direction = axis / length;
+            math::Vector3 tangent = reference - direction * math::Vector3::Dot(reference, direction);
+            if (tangent.LengthSquared() <= 0.0001f)
+            {
+                tangent = math::Vector3::Right - direction * math::Vector3::Dot(math::Vector3::Right, direction);
+            }
+            tangent.Normalize();
+            const math::Vector3 bitangent = math::Vector3::Cross(direction, tangent).Normalized();
+            const int segments = 36;
+            const float turns  = 6.0f;
+            math::Vector3 previous = start;
+
+            for (int i = 0; i <= segments; i++)
+            {
+                const float t     = static_cast<float>(i) / static_cast<float>(segments);
+                const float angle = t * turns * math::pi * 2.0f;
+                const float envelope = sinf(t * math::pi);
+                const math::Vector3 point = lerp_skeleton(start, end, t) + (tangent * cosf(angle) + bitangent * sinf(angle)) * radius * envelope;
+                if (i > 0)
+                {
+                    Renderer::DrawLine(previous, point, color, color);
+                }
+                previous = point;
+            }
+        }
+
+        void draw_skeleton_shaft(const math::Vector3& start, const math::Vector3& end, float radius, float rotation, float twist, const Color& color)
+        {
+            const math::Vector3 axis = end - start;
+            const float length = axis.Length();
+            if (length <= 0.001f)
+            {
+                return;
+            }
+
+            const math::Vector3 direction = axis / length;
+            const math::Vector3 reference = fabsf(direction.y) < 0.9f ? math::Vector3::Up : math::Vector3::Right;
+            const math::Vector3 tangent   = math::Vector3::Cross(direction, reference).Normalized();
+            const math::Vector3 bitangent = math::Vector3::Cross(direction, tangent).Normalized();
+            const int radial_segments = 12;
+            const int length_segments = 8;
+
+            for (int length_index = 0; length_index <= length_segments; length_index++)
+            {
+                const float t = static_cast<float>(length_index) / static_cast<float>(length_segments);
+                const math::Vector3 center = lerp_skeleton(start, end, t);
+                math::Vector3 previous;
+                for (int radial_index = 0; radial_index <= radial_segments; radial_index++)
+                {
+                    const float angle = rotation + twist * t + static_cast<float>(radial_index) * math::pi * 2.0f / static_cast<float>(radial_segments);
+                    const math::Vector3 point = center + (tangent * cosf(angle) + bitangent * sinf(angle)) * radius;
+                    if (radial_index > 0)
+                    {
+                        Renderer::DrawLine(previous, point, color, color);
+                    }
+                    previous = point;
+                }
+            }
+
+            for (int stripe_index = 0; stripe_index < 4; stripe_index++)
+            {
+                math::Vector3 previous;
+                for (int length_index = 0; length_index <= length_segments; length_index++)
+                {
+                    const float t = static_cast<float>(length_index) / static_cast<float>(length_segments);
+                    const float angle = rotation + twist * t + static_cast<float>(stripe_index) * math::pi * 0.5f;
+                    const math::Vector3 point = lerp_skeleton(start, end, t) + (tangent * cosf(angle) + bitangent * sinf(angle)) * radius;
+                    if (length_index > 0)
+                    {
+                        Renderer::DrawLine(previous, point, color, color);
+                    }
+                    previous = point;
+                }
+            }
+
+            draw_skeleton_joint(start, color);
+            draw_skeleton_joint(end, color);
+            Renderer::DrawLine(start - tangent * radius * 1.7f, start + tangent * radius * 1.7f, color, color);
+            Renderer::DrawLine(start - bitangent * radius * 1.7f, start + bitangent * radius * 1.7f, color, color);
+            Renderer::DrawLine(end - tangent * radius * 1.7f, end + tangent * radius * 1.7f, color, color);
+            Renderer::DrawLine(end - bitangent * radius * 1.7f, end + bitangent * radius * 1.7f, color, color);
+        }
+
+        Color get_skeleton_tire_temperature_color(float temperature, float wear, const ::car::car_preset& preset)
+        {
+            const float ambient = preset.tire_ambient_temp;
+            const float optimal = std::max(preset.tire_optimal_temp, ambient + 1.0f);
+            const float maximum = std::max(preset.tire_max_temp, optimal + 1.0f);
+            const float brightness = 1.0f - std::clamp(wear, 0.0f, 1.0f) * 0.55f;
+            if (temperature <= optimal)
+            {
+                const float t = std::clamp((temperature - ambient) / (optimal - ambient), 0.0f, 1.0f);
+                return Color((0.12f + t * 0.18f) * brightness, (0.42f + t * 0.58f) * brightness, (1.0f - t * 0.65f) * brightness, 1.0f);
+            }
+            const float t = std::clamp((temperature - optimal) / (maximum - optimal), 0.0f, 1.0f);
+            return Color((0.30f + t * 0.70f) * brightness, (1.0f - t * 0.82f) * brightness, (0.35f - t * 0.25f) * brightness, 1.0f);
+        }
+
+        void draw_skeleton_torque_arc(const math::Vector3& center, const math::Vector3& axis_input, float radius, float normalized_torque, const Color& color)
+        {
+            if (fabsf(normalized_torque) < 0.001f || axis_input.LengthSquared() < 0.0001f)
+            {
+                return;
+            }
+            const math::Vector3 axis = axis_input.Normalized();
+            const math::Vector3 reference = fabsf(axis.y) < 0.9f ? math::Vector3::Up : math::Vector3::Right;
+            const math::Vector3 tangent = math::Vector3::Cross(axis, reference).Normalized();
+            const math::Vector3 bitangent = math::Vector3::Cross(axis, tangent).Normalized();
+            const float direction = normalized_torque > 0.0f ? 1.0f : -1.0f;
+            const float span = std::clamp(fabsf(normalized_torque), 0.0f, 1.0f) * math::pi * 1.5f;
+            const int segments = 14;
+            math::Vector3 previous = center + tangent * radius;
+            for (int segment = 1; segment <= segments; segment++)
+            {
+                const float angle = direction * span * static_cast<float>(segment) / static_cast<float>(segments);
+                const math::Vector3 point = center + (tangent * cosf(angle) + bitangent * sinf(angle)) * radius;
+                Renderer::DrawLine(previous, point, color, color);
+                previous = point;
+            }
+            const float end_angle = direction * span;
+            const math::Vector3 radial = tangent * cosf(end_angle) + bitangent * sinf(end_angle);
+            const math::Vector3 direction_at_end = (-tangent * sinf(end_angle) + bitangent * cosf(end_angle)) * direction;
+            Renderer::DrawLine(previous, previous - direction_at_end * radius * 0.28f + radial * radius * 0.16f, color, color);
+            Renderer::DrawLine(previous, previous - direction_at_end * radius * 0.28f - radial * radius * 0.16f, color, color);
+        }
+
+        // draws one collision shape exactly as physx holds it, every simulated body goes through
+        // here so the skeleton can never drift from the geometry the solver is actually using
+        template<typename Transform>
+        void draw_skeleton_shape(
+            const physx::PxTransform& shape_pose,
+            const physx::PxGeometry& shape_geometry,
+            const Color& color,
+            Transform&& to_render
+        )
+        {
+            auto line = [&](const physx::PxVec3& a, const physx::PxVec3& b)
+            {
+                Renderer::DrawLine(to_render(a), to_render(b), color, color);
+            };
+
+            auto ring = [&](
+                const physx::PxVec3& center,
+                const physx::PxVec3& axis_a,
+                const physx::PxVec3& axis_b,
+                float radius
+            )
+            {
+                const int segments = 16;
+                physx::PxVec3 previous = center + axis_a * radius;
+                for (int segment = 1; segment <= segments; segment++)
+                {
+                    const float angle = static_cast<float>(segment) / static_cast<float>(segments) * math::pi * 2.0f;
+                    const physx::PxVec3 point = center + (axis_a * cosf(angle) + axis_b * sinf(angle)) * radius;
+                    line(previous, point);
+                    previous = point;
+                }
+            };
+
+            // half of a ring, bulging towards axis_b, which is how a capsule end cap is shaped
+            auto arc = [&](
+                const physx::PxVec3& center,
+                const physx::PxVec3& axis_a,
+                const physx::PxVec3& axis_b,
+                float radius
+            )
+            {
+                const int segments = 8;
+                physx::PxVec3 previous = center + axis_a * radius;
+                for (int segment = 1; segment <= segments; segment++)
+                {
+                    const float angle = static_cast<float>(segment) / static_cast<float>(segments) * math::pi;
+                    const physx::PxVec3 point = center + (axis_a * cosf(angle) + axis_b * sinf(angle)) * radius;
+                    line(previous, point);
+                    previous = point;
+                }
+            };
+
+            const physx::PxVec3 local_x = shape_pose.q.rotate(physx::PxVec3(1.0f, 0.0f, 0.0f));
+            const physx::PxVec3 local_y = shape_pose.q.rotate(physx::PxVec3(0.0f, 1.0f, 0.0f));
+            const physx::PxVec3 local_z = shape_pose.q.rotate(physx::PxVec3(0.0f, 0.0f, 1.0f));
+
+            switch (shape_geometry.getType())
+            {
+                case physx::PxGeometryType::eCONVEXMESH:
+                {
+                    const physx::PxConvexMeshGeometry& geometry = static_cast<const physx::PxConvexMeshGeometry&>(shape_geometry);
+                    if (!geometry.convexMesh)
+                    {
+                        break;
+                    }
+                    const physx::PxVec3* vertices = geometry.convexMesh->getVertices();
+                    const physx::PxU8* indices = geometry.convexMesh->getIndexBuffer();
+                    for (physx::PxU32 polygon_index = 0; polygon_index < geometry.convexMesh->getNbPolygons(); polygon_index++)
+                    {
+                        physx::PxHullPolygon polygon;
+                        if (!geometry.convexMesh->getPolygonData(polygon_index, polygon))
+                        {
+                            continue;
+                        }
+                        for (physx::PxU32 edge_index = 0; edge_index < polygon.mNbVerts; edge_index++)
+                        {
+                            const physx::PxU8 index_a = indices[polygon.mIndexBase + edge_index];
+                            const physx::PxU8 index_b = indices[polygon.mIndexBase + (edge_index + 1) % polygon.mNbVerts];
+                            line(
+                                shape_pose.transform(geometry.scale.transform(vertices[index_a])),
+                                shape_pose.transform(geometry.scale.transform(vertices[index_b]))
+                            );
+                        }
+                    }
+                    break;
+                }
+                case physx::PxGeometryType::eBOX:
+                {
+                    const physx::PxBoxGeometry& geometry = static_cast<const physx::PxBoxGeometry&>(shape_geometry);
+                    const physx::PxVec3 h = geometry.halfExtents;
+                    const physx::PxVec3 vertices[8] = { {-h.x, -h.y, -h.z}, {h.x, -h.y, -h.z}, {h.x, h.y, -h.z}, {-h.x, h.y, -h.z}, {-h.x, -h.y, h.z}, {h.x, -h.y, h.z}, {h.x, h.y, h.z}, {-h.x, h.y, h.z} };
+                    const int edges[12][2] = { {0, 1}, {1, 2}, {2, 3}, {3, 0}, {4, 5}, {5, 6}, {6, 7}, {7, 4}, {0, 4}, {1, 5}, {2, 6}, {3, 7} };
+                    for (const auto& edge : edges)
+                    {
+                        line(shape_pose.transform(vertices[edge[0]]), shape_pose.transform(vertices[edge[1]]));
+                    }
+                    break;
+                }
+                case physx::PxGeometryType::eCAPSULE:
+                {
+                    // a physx capsule runs along its local x, the caps sit at plus and minus the half height
+                    const physx::PxCapsuleGeometry& geometry = static_cast<const physx::PxCapsuleGeometry&>(shape_geometry);
+                    const physx::PxVec3 cap_a = shape_pose.p - local_x * geometry.halfHeight;
+                    const physx::PxVec3 cap_b = shape_pose.p + local_x * geometry.halfHeight;
+                    ring(cap_a, local_y, local_z, geometry.radius);
+                    ring(cap_b, local_y, local_z, geometry.radius);
+                    line(cap_a + local_y * geometry.radius, cap_b + local_y * geometry.radius);
+                    line(cap_a - local_y * geometry.radius, cap_b - local_y * geometry.radius);
+                    line(cap_a + local_z * geometry.radius, cap_b + local_z * geometry.radius);
+                    line(cap_a - local_z * geometry.radius, cap_b - local_z * geometry.radius);
+                    arc(cap_a, local_y, -local_x, geometry.radius);
+                    arc(cap_a, local_z, -local_x, geometry.radius);
+                    arc(cap_b, local_y, local_x, geometry.radius);
+                    arc(cap_b, local_z, local_x, geometry.radius);
+                    break;
+                }
+                case physx::PxGeometryType::eSPHERE:
+                {
+                    const physx::PxSphereGeometry& geometry = static_cast<const physx::PxSphereGeometry&>(shape_geometry);
+                    ring(shape_pose.p, local_x, local_y, geometry.radius);
+                    ring(shape_pose.p, local_y, local_z, geometry.radius);
+                    ring(shape_pose.p, local_z, local_x, geometry.radius);
+                    break;
+                }
+                default:
+                {
+                    break;
+                }
+            }
+        }
+
+        // a rubber bush is not a ball joint, so it gets a barrel across the load path and a colour that
+        // tracks how much of its travel it is using. the deflection is under a millimetre either way
+        void draw_skeleton_bushing(physx::PxJoint* joint, const math::Vector3& pivot, const math::Vector3& outboard, float max_deflection)
+        {
+            float load = 0.0f;
+            if (physx::PxD6Joint* bush = joint ? joint->is<physx::PxD6Joint>() : nullptr)
+            {
+                const physx::PxVec3 offset = bush->getRelativeTransform().p;
+                if (std::isfinite(offset.x) && std::isfinite(offset.y) && std::isfinite(offset.z))
+                {
+                    load = std::clamp(offset.magnitude() / std::max(max_deflection, 0.0001f), 0.0f, 1.0f);
+                }
+            }
+
+            const Color bush_color = tint_skeleton_color(skeleton_color_suspension, load, 0.40f);
+            math::Vector3 along = outboard - pivot;
+            if (along.LengthSquared() < 0.000001f)
+            {
+                draw_skeleton_joint(pivot, bush_color);
+                return;
+            }
+            along.Normalize();
+            draw_skeleton_cylinder(pivot - along * 0.022f, pivot + along * 0.022f, 0.030f + load * 0.008f, bush_color);
+            Renderer::DrawSphere(pivot, 0.014f, 5, bush_color);
+        }
+
+        template<typename Transform>
+        void draw_skeleton_actor_shapes(physx::PxRigidActor* actor, const Color& color, Transform&& to_render)
+        {
+            if (!actor)
+            {
+                return;
+            }
+
+            const physx::PxU32 shape_count = actor->getNbShapes();
+            if (shape_count == 0)
+            {
+                return;
+            }
+
+            std::vector<physx::PxShape*> shapes(shape_count);
+            actor->getShapes(shapes.data(), shape_count);
+            for (physx::PxShape* shape : shapes)
+            {
+                draw_skeleton_shape(
+                    actor->getGlobalPose() * shape->getLocalPose(),
+                    shape->getGeometry(),
+                    color,
+                    to_render
+                );
+            }
+        }
+
+        // capsule endpoints in world space, used so shaft stripes follow the real actor not a guess
+        bool get_capsule_endpoints(physx::PxRigidActor* actor, physx::PxVec3& start, physx::PxVec3& end, float& radius)
+        {
+            if (!actor || actor->getNbShapes() == 0)
+            {
+                return false;
+            }
+            physx::PxShape* shape = nullptr;
+            actor->getShapes(&shape, 1);
+            if (!shape || shape->getGeometry().getType() != physx::PxGeometryType::eCAPSULE)
+            {
+                return false;
+            }
+            const physx::PxCapsuleGeometry& geometry =
+                static_cast<const physx::PxCapsuleGeometry&>(shape->getGeometry());
+            const physx::PxTransform pose = actor->getGlobalPose() * shape->getLocalPose();
+            const physx::PxVec3 axis = pose.q.rotate(physx::PxVec3(1.0f, 0.0f, 0.0f));
+            start = pose.p - axis * geometry.halfHeight;
+            end = pose.p + axis * geometry.halfHeight;
+            radius = geometry.radius;
+            return true;
+        }
+
+        float get_actor_spin(physx::PxRigidDynamic* actor, const physx::PxVec3& axis_hint)
+        {
+            if (!actor)
+            {
+                return 0.0f;
+            }
+            physx::PxVec3 axis = axis_hint;
+            if (axis.normalize() < 1e-4f)
+            {
+                axis = actor->getGlobalPose().q.rotate(physx::PxVec3(1.0f, 0.0f, 0.0f));
+            }
+            // angle from the actor orientation projected onto the spin axis, good enough for stripes
+            const physx::PxQuat q = actor->getGlobalPose().q;
+            return 2.0f * atanf(q.x / std::max(q.w, 1e-6f));
+        }
+    }
+
+    Car* Car::Create(const Config& config)
+    {
+        // the .car file is the single source of truth for the car
+        const ::car::car_definition* definition = ::car::load_car_file(config.car_file);
+        if (!definition)
+        {
+            SP_LOG_ERROR("failed to load car file: %s", config.car_file.c_str());
+            return nullptr;
+        }
+
+        // register sibling car files so the hud preset selector can switch between them
+        ::car::load_car_directory(FileSystem::GetDirectoryFromFilePath(config.car_file));
+
+        Car* car = new Car();
+        car->m_definition     = definition;
+        car->m_show_telemetry = config.show_telemetry;
+        car->m_is_drivable    = config.drivable;
+        car->m_paint_preset   = config.paint_preset;
+        car->m_paint_color    = config.paint_color;
+        car->m_customize_materials = config.customize_materials;
+
+        if (config.drivable)
+        {
+            // create vehicle entity with physics
+            car->m_vehicle_entity = World::CreateEntity();
+            car->m_vehicle_entity->SetObjectName("vehicle");
+            car->m_vehicle_entity->SetPosition(config.position);
+            car->m_vehicle_entity->AddTag("car");
+
+            Physics* physics = car->m_vehicle_entity->AddComponent<Physics>();
+            physics->SetStatic(false);
+            physics->SetMass(definition->performance.mass > 0.0f ? definition->performance.mass : 1500.0f);
+            physics->SetVehiclePreset(definition->performance);
+            physics->SetVehicleSimMode(config.vehicle_sim_mode);
+            physics->SetBodyType(BodyType::Vehicle);
+            physics->SetCar(car);  // car ticks automatically through entity system
+
+            // create car body (without its baked in wheels)
+            std::vector<Entity*> excluded_wheel_entities;
+            car->m_body_entity = car->CreateBody(&excluded_wheel_entities);
+            if (car->m_body_entity)
+            {
+                car->m_body_entity->SetParent(car->m_vehicle_entity);
+                if (definition->body_model.empty())
+                {
+                    car->m_body_entity->SetPositionLocal(math::Vector3::Zero);
+                    car->m_body_entity->SetRotationLocal(math::Quaternion::Identity);
+                }
+                else
+                {
+                    car->m_body_entity->SetPositionLocal(math::Vector3(0.0f, physics->GetVehicleSimulation()->get_chassis_visual_offset_y(), 0.07f));
+                    car->m_body_entity->SetRotationLocal(math::Quaternion::FromAxisAngle(math::Vector3::Right, math::pi * 0.5f));
+                    car->m_body_entity->SetScaleLocal(1.1f);
+                }
+
+                physics->SetChassisEntity(car->m_body_entity, excluded_wheel_entities);
+            }
+
+            car->CreateAudioSources(car->m_vehicle_entity);
+            car->CreateWheels(car->m_vehicle_entity, physics, excluded_wheel_entities);
+
+            // skid marks are defined in the world as a prefab override on the vehicle, not added here
+
+            // camera follow enters the car when play mode starts
+            car->m_camera_follows = config.camera_follows;
+
+        }
+        else
+        {
+            // display cars keep the same visual hierarchy without vehicle physics
+            car->m_vehicle_entity = World::CreateEntity();
+            car->m_vehicle_entity->SetObjectName("vehicle");
+            car->m_vehicle_entity->SetPosition(config.position);
+            car->m_vehicle_entity->AddTag("car");
+
+            std::vector<Entity*> baked_wheel_entities;
+            car->m_body_entity = car->CreateBody(&baked_wheel_entities);
+            if (car->m_body_entity)
+            {
+                car->m_body_entity->SetParent(car->m_vehicle_entity);
+                car->m_body_entity->SetPositionLocal(math::Vector3::Zero);
+            }
+
+            // spawn real wheel entities where the baked in tires were
+            car->CreatePropWheels(car->m_vehicle_entity, baked_wheel_entities);
+
+            if (config.static_physics && car->m_body_entity)
+            {
+                std::vector<Entity*> car_parts;
+                car->m_body_entity->GetDescendants(&car_parts);
+                for (Entity* car_part : car_parts)
+                {
+                    if (car_part->GetComponent<Render>())
+                    {
+                        Physics* physics_body = car_part->AddComponent<Physics>();
+                        physics_body->SetKinematic(true);
+                        physics_body->SetBodyType(BodyType::Mesh);
+                    }
+                }
+            }
+
+            car->CreateAudioSources(car->m_vehicle_entity);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(car_list_mutex);
+            s_cars.push_back(car);
+        }
+        return car;
+    }
+
+    void Car::RegisterPrefabs()
+    {
+        Prefab::Register("car", Car::CreatePrefab);
+    }
+
+    Entity* Car::CreatePrefab(pugi::xml_node& node, Entity* parent)
+    {
+        Config config;
+        config.position       = parent ? parent->GetPosition() : math::Vector3::Zero;
+        config.car_file       = resolve_car_file(node.attribute("file").as_string(""));
+        config.drivable       = node.attribute("drivable").as_bool(false);
+        config.static_physics = node.attribute("static_physics").as_bool(false);
+        config.show_telemetry = node.attribute("telemetry").as_bool(false);
+        config.camera_follows = node.attribute("camera_follows").as_bool(false);
+        config.customize_materials = node.attribute("customize_materials").as_bool(true);
+        config.paint_preset   = parse_paint_preset(node.attribute("paint_preset").as_string("metallic"));
+        config.paint_color.r  = node.attribute("paint_color_r").as_float(config.paint_color.r);
+        config.paint_color.g  = node.attribute("paint_color_g").as_float(config.paint_color.g);
+        config.paint_color.b  = node.attribute("paint_color_b").as_float(config.paint_color.b);
+        config.paint_color.a  = node.attribute("paint_color_a").as_float(config.paint_color.a);
+
+        Car* car = Create(config);
+        if (car && parent)
+        {
+            Entity* root = car->GetRootEntity();
+            if (root)
+            {
+                root->SetParent(parent);
+                root->SetPositionLocal(math::Vector3::Zero);
+            }
+        }
+        return car ? car->GetRootEntity() : nullptr;
+    }
+
+    void Car::ShutdownAll()
+    {
+        std::lock_guard<std::mutex> lock(car_list_mutex);
+        for (Car* car : s_cars)
+        {
+            if (car->m_vehicle_entity)
+            {
+                if (Physics* physics = car->m_vehicle_entity->GetComponent<Physics>())
+                {
+                    physics->SetCar(nullptr);
+                }
+            }
+            car->m_vehicle_entity = nullptr;
+            car->m_body_entity    = nullptr;
+            car->m_window_entity  = nullptr;
+            delete car;
+        }
+        s_cars.clear();
+
+        default_camera = nullptr;
+
+        // stop any vibration
+        Input::GamepadVibrate(0.0f, 0.0f);
+    }
+
+    std::vector<Car*> Car::GetAll()
+    {
+        std::lock_guard<std::mutex> lock(car_list_mutex);
+        return s_cars;
+    }
+
+    void Car::SetVehicleSimMode(VehicleSimMode mode)
+    {
+        if (!m_vehicle_entity)
+        {
+            return;
+        }
+        if (Physics* physics = m_vehicle_entity->GetComponent<Physics>())
+        {
+            physics->SetVehicleSimMode(mode);
+        }
+    }
+
+    VehicleSimMode Car::GetVehicleSimMode() const
+    {
+        if (!m_vehicle_entity)
+        {
+            return VehicleSimMode::Full;
+        }
+        if (Physics* physics = m_vehicle_entity->GetComponent<Physics>())
+        {
+            return physics->GetVehicleSimMode();
+        }
+        return VehicleSimMode::Full;
+    }
+
+    static void mark_entity_tree_transient(Entity* entity)
+    {
+        if (!entity)
+        {
+            return;
+        }
+
+        entity->SetTransient(true);
+        std::vector<Entity*> descendants;
+        entity->GetDescendants(&descendants);
+        for (Entity* descendant : descendants)
+        {
+            if (descendant)
+            {
+                descendant->SetTransient(true);
+            }
+        }
+    }
+
+    void Car::ClearBodyRenderStates(bool restore)
+    {
+        if (restore)
+        {
+            for (const BodyRenderState& state : m_body_render_states)
+            {
+                if (Entity* entity = World::GetEntityById(state.entity_id))
+                {
+                    entity->SetActive(state.active);
+                }
+            }
+        }
+
+        m_body_render_states.clear();
+    }
+
+    void Car::ApplySkeletonBodyVisibility()
+    {
+        ClearBodyRenderStates(true);
+
+        // skeleton mode always hides the painted 3d mesh, collision hull is a separate debug toggle
+        if (
+            m_visualization_preset != CarVisualizationPreset::Skeleton ||
+            !m_vehicle_entity
+        )
+        {
+            return;
+        }
+
+        // deactivate roots, GetActive walks parents so every painted mesh under them is skipped
+        auto hide_entity = [this](Entity* entity)
+        {
+            if (!entity)
+            {
+                return;
+            }
+
+            const uint64_t id = entity->GetObjectId();
+            for (const BodyRenderState& state : m_body_render_states)
+            {
+                if (state.entity_id == id)
+                {
+                    entity->SetActive(false);
+                    return;
+                }
+            }
+
+            m_body_render_states.push_back({ id, entity->IsActive() });
+            entity->SetActive(false);
+        };
+
+        hide_entity(m_body_entity);
+
+        if (Physics* physics = m_vehicle_entity->GetComponent<Physics>())
+        {
+            for (int i = 0; i < 4; i++)
+            {
+                hide_entity(
+                    physics->GetWheelEntity(static_cast<WheelIndex>(i))
+                );
+            }
+        }
+
+        // any other render meshes attached to the vehicle root
+        std::vector<Entity*> descendants;
+        m_vehicle_entity->GetDescendants(&descendants);
+        for (Entity* entity : descendants)
+        {
+            if (
+                entity &&
+                entity->IsActive() &&
+                entity->GetComponent<Render>()
+            )
+            {
+                hide_entity(entity);
+            }
+        }
+    }
+
+    void Car::SetVisualizationPreset(CarVisualizationPreset preset)
+    {
+        m_visualization_preset = preset;
+        ApplySkeletonBodyVisibility();
+    }
+
+    void Car::PrepareForPlayStop()
+    {
+        if (m_visualization_preset == CarVisualizationPreset::Skeleton)
+        {
+            SetVisualizationPreset(CarVisualizationPreset::Full);
+        }
+        else
+        {
+            ClearBodyRenderStates(false);
+        }
+
+        m_was_playing = false;
+    }
+
+    void Car::SetSkeletonShowCollision(bool show)
+    {
+        m_skeleton_show_collision = show;
+    }
+
+    void Car::LoadDefinition(const car::car_definition* definition)
+    {
+        if (!definition || definition == m_definition || !m_vehicle_entity)
+        {
+            return;
+        }
+
+        Physics* physics = m_vehicle_entity->GetComponent<Physics>();
+        if (!physics)
+        {
+            return;
+        }
+
+        const CarVisualizationPreset visualization_preset = m_visualization_preset;
+        if (visualization_preset == CarVisualizationPreset::Skeleton)
+        {
+            SetVisualizationPreset(CarVisualizationPreset::Full);
+        }
+
+        // drop cached body pointers before destroying the mesh, restore would uaf
+        ClearBodyRenderStates(false);
+
+        const math::Vector3 current_position = m_vehicle_entity->GetPosition();
+        const math::Quaternion current_rotation = m_vehicle_entity->GetRotation();
+        float ground_height = current_position.y - get_car_lower_extent(m_definition->performance);
+        bool has_ground_contact = false;
+        for (int i = 0; i < ::car::wheel_count; i++)
+        {
+            const math::Vector3 contact_point = physics->GetWheelContactPoint(static_cast<WheelIndex>(i));
+            if (physics->IsWheelGrounded(static_cast<WheelIndex>(i)) && std::isfinite(contact_point.y))
+            {
+                ground_height = has_ground_contact ? std::max(ground_height, contact_point.y) : contact_point.y;
+                has_ground_contact = true;
+            }
+        }
+        const float target_height = ground_height + get_car_lower_extent(definition->performance) + car_spawn_margin;
+        const math::Vector3 target_position(current_position.x, std::max(current_position.y, target_height), current_position.z);
+        const math::Quaternion target_rotation = math::Quaternion::FromEulerAngles(0.0f, current_rotation.Yaw(), 0.0f);
+        physics->SetBodyTransform(target_position, target_rotation, false);
+
+        if (m_body_entity)
+        {
+            m_body_entity->SetActive(false);
+            World::RemoveEntity(m_body_entity);
+        }
+
+        m_body_entity   = nullptr;
+        m_window_entity = nullptr;
+        m_definition    = definition;
+        physics->SetVehiclePreset(definition->performance);
+
+        std::vector<Entity*> excluded_wheel_entities;
+        m_body_entity = CreateBody(&excluded_wheel_entities);
+        if (m_body_entity)
+        {
+            m_body_entity->SetParent(m_vehicle_entity);
+            // play stop strips non transient play spawned entities, keep the body with the car
+            mark_entity_tree_transient(m_body_entity);
+            if (definition->body_model.empty())
+            {
+                m_body_entity->SetPositionLocal(math::Vector3::Zero);
+                m_body_entity->SetRotationLocal(math::Quaternion::Identity);
+            }
+            else
+            {
+                m_body_entity->SetPositionLocal(math::Vector3(0.0f, physics->GetVehicleSimulation()->get_chassis_visual_offset_y(), 0.07f));
+                m_body_entity->SetRotationLocal(math::Quaternion::FromAxisAngle(math::Vector3::Right, math::pi * 0.5f));
+                m_body_entity->SetScaleLocal(1.1f);
+            }
+            physics->SetChassisEntity(m_body_entity, excluded_wheel_entities);
+        }
+
+        for (int i = 0; i < 4; i++)
+        {
+            const WheelIndex wheel_index = static_cast<WheelIndex>(i);
+            if (Entity* wheel_entity = physics->GetWheelEntity(wheel_index))
+            {
+                const bool is_front = i == 0 || i == 1;
+                const float radius = is_front ? definition->performance.front_wheel_radius : definition->performance.rear_wheel_radius;
+                const float width  = is_front ? definition->performance.front_wheel_width : definition->performance.rear_wheel_width;
+                physics->ScaleWheelEntityToDimensions(wheel_entity, radius, width);
+            }
+        }
+
+        if (visualization_preset == CarVisualizationPreset::Skeleton)
+        {
+            SetVisualizationPreset(CarVisualizationPreset::Skeleton);
+        }
+    }
+
+    void Car::TickVisualization()
+    {
+        if (
+            m_visualization_preset != CarVisualizationPreset::Skeleton ||
+            !m_vehicle_entity
+        )
+        {
+            return;
+        }
+
+        // keep the painted mesh off every frame, something else can re-enable it after preset change
+        if (m_body_render_states.empty())
+        {
+            ApplySkeletonBodyVisibility();
+        }
+        else
+        {
+            bool has_dead = false;
+            for (const BodyRenderState& state : m_body_render_states)
+            {
+                Entity* entity = World::GetEntityById(state.entity_id);
+                if (!entity)
+                {
+                    has_dead = true;
+                    continue;
+                }
+
+                if (entity->IsActive())
+                {
+                    entity->SetActive(false);
+                }
+            }
+
+            // play stop can delete play spawned body meshes while the car object survives
+            if (has_dead)
+            {
+                ClearBodyRenderStates(false);
+                ApplySkeletonBodyVisibility();
+            }
+        }
+
+        Physics* physics = m_vehicle_entity->GetComponent<Physics>();
+        if (!physics)
+        {
+            return;
+        }
+
+        ::car::Simulation* simulation = physics->GetVehicleSimulation();
+        if (!simulation)
+        {
+            return;
+        }
+        physx::PxRigidDynamic* body = simulation->get_body();
+        if (!body)
+        {
+            return;
+        }
+
+        Entity* wheel_entities[4] =
+        {
+            physics->GetWheelEntity(WheelIndex::FrontLeft),
+            physics->GetWheelEntity(WheelIndex::FrontRight),
+            physics->GetWheelEntity(WheelIndex::RearLeft),
+            physics->GetWheelEntity(WheelIndex::RearRight)
+        };
+
+        for (Entity* wheel_entity : wheel_entities)
+        {
+            if (!wheel_entity)
+            {
+                return;
+            }
+        }
+
+        auto from_px = [](const physx::PxVec3& value) { return math::Vector3(value.x, value.y, value.z); };
+        auto to_render = [&](const physx::PxVec3& value) { return physics->TransformVehiclePointToRender(from_px(value)); };
+        if (m_skeleton_show_collision)
+        {
+            draw_skeleton_actor_shapes(body, skeleton_color_collision, to_render);
+        }
+
+        // cheap mode only draws chassis hull plus four wheels
+        if (physics->GetVehicleSimMode() == VehicleSimMode::Cheap)
+        {
+            const ::car::config& config = simulation->get_config();
+            for (int i = 0; i < 4; i++)
+            {
+                const float wheel_radius = config.wheel_radius_for(i);
+                const float wheel_half_width = config.wheel_width_for(i) * 0.5f;
+                const math::Vector3 wheel_center = wheel_entities[i]->GetPosition();
+                const math::Quaternion wheel_rotation = wheel_entities[i]->GetRotation();
+                const math::Vector3 wheel_axis = wheel_rotation * math::Vector3::Right;
+                const math::Vector3 wheel_radial_y = wheel_rotation * math::Vector3::Up;
+                const math::Vector3 wheel_radial_z = wheel_rotation * math::Vector3::Forward;
+                const math::Vector3 wheel_left = wheel_center - wheel_axis * wheel_half_width;
+                const math::Vector3 wheel_right = wheel_center + wheel_axis * wheel_half_width;
+                const int wheel_segments = 20;
+                math::Vector3 previous_left;
+                math::Vector3 previous_right;
+                for (int segment = 0; segment <= wheel_segments; segment++)
+                {
+                    const float angle =
+                        static_cast<float>(segment) /
+                        static_cast<float>(wheel_segments) *
+                        math::pi * 2.0f;
+                    const math::Vector3 radial =
+                        (wheel_radial_y * cosf(angle) + wheel_radial_z * sinf(angle)) *
+                        wheel_radius;
+                    const math::Vector3 left = wheel_left + radial;
+                    const math::Vector3 right = wheel_right + radial;
+                    if (segment > 0)
+                    {
+                        Renderer::DrawLine(previous_left, left, skeleton_color_wheel, skeleton_color_wheel);
+                        Renderer::DrawLine(previous_right, right, skeleton_color_wheel, skeleton_color_wheel);
+                        Renderer::DrawLine(left, right, skeleton_color_wheel, skeleton_color_wheel);
+                    }
+                    previous_left = left;
+                    previous_right = right;
+                }
+            }
+            return;
+        }
+
+        const ::car::config& config = simulation->get_config();
+        const ::car::car_preset& preset = simulation->get_spec();
+        const ::car::multibody_state& multibody = simulation->get_multibody_state();
+        if (!simulation->has_multibody())
+        {
+            return;
+        }
+
+        const math::Vector3 vehicle_position = m_vehicle_entity->GetPosition();
+        const math::Quaternion vehicle_rotation = m_vehicle_entity->GetRotation();
+        auto to_world = [&](const math::Vector3& local) { return vehicle_position + vehicle_rotation * local; };
+
+        math::Vector3 wheel_local[4];
+        math::Vector3 wheel_world[4];
+        math::Vector3 shock_top_world[4];
+        math::Vector3 shock_bottom_world[4];
+        for (int i = 0; i < 4; i++)
+        {
+            const ::car::suspension_corner& corner = multibody.corners[i];
+            const ::car::wheel& wheel = simulation->get_wheel_state(i);
+            if (!corner.upright || !corner.wheel_body)
+            {
+                return;
+            }
+
+            const physx::PxTransform wheel_pose = corner.wheel_body->getGlobalPose();
+            wheel_world[i] = to_render(wheel_pose.p);
+            wheel_local[i] = vehicle_rotation.Conjugate() * (wheel_world[i] - vehicle_position);
+            const float wheel_radius = config.wheel_radius_for(i);
+            const float wheel_half_width = config.wheel_width_for(i) * 0.5f;
+            const physx::PxQuat query_rotation = corner.upright->getGlobalPose().q;
+            const physx::PxVec3 wheel_axis = query_rotation.rotate(physx::PxVec3(1.0f, 0.0f, 0.0f));
+            const physx::PxVec3 wheel_radial_y = query_rotation.rotate(physx::PxVec3(0.0f, 1.0f, 0.0f));
+            const physx::PxVec3 wheel_radial_z = query_rotation.rotate(physx::PxVec3(0.0f, 0.0f, 1.0f));
+            const physx::PxVec3 wheel_left = wheel_pose.p - wheel_axis * wheel_half_width;
+            const physx::PxVec3 wheel_right = wheel_pose.p + wheel_axis * wheel_half_width;
+            const int wheel_segments = 20;
+            physx::PxVec3 previous_left;
+            physx::PxVec3 previous_right;
+            physx::PxVec3 previous_effective;
+            physx::PxVec3 previous_temperature[3];
+            const float inside_direction = i == 0 || i == 2 ? 1.0f : -1.0f;
+            const float zone_offset[3] = { inside_direction * wheel_half_width * 0.66f, 0.0f, -inside_direction * wheel_half_width * 0.66f };
+            const Color zone_color[3] = { get_skeleton_tire_temperature_color(wheel.thermal.surface[0], wheel.wear, preset), get_skeleton_tire_temperature_color(wheel.thermal.surface[1], wheel.wear, preset), get_skeleton_tire_temperature_color(wheel.thermal.surface[2], wheel.wear, preset) };
+            for (int segment = 0; segment <= wheel_segments; segment++)
+            {
+                const float angle = static_cast<float>(segment) / static_cast<float>(wheel_segments) * math::pi * 2.0f;
+                const physx::PxVec3 radial = (wheel_radial_y * cosf(angle) + wheel_radial_z * sinf(angle)) * wheel_radius;
+                const physx::PxVec3 effective_point = wheel_pose.p + (wheel_radial_y * cosf(angle) + wheel_radial_z * sinf(angle)) * wheel.effective_radius;
+                const physx::PxVec3 left = wheel_left + radial;
+                const physx::PxVec3 right = wheel_right + radial;
+                const physx::PxVec3 temperature_point[3] = { wheel_pose.p + wheel_axis * zone_offset[0] + radial, wheel_pose.p + wheel_axis * zone_offset[1] + radial, wheel_pose.p + wheel_axis * zone_offset[2] + radial };
+                if (segment > 0)
+                {
+                    Renderer::DrawLine(to_render(previous_left), to_render(left), skeleton_color_wheel, skeleton_color_wheel);
+                    Renderer::DrawLine(to_render(previous_right), to_render(right), skeleton_color_wheel, skeleton_color_wheel);
+                    Renderer::DrawLine(to_render(previous_effective), to_render(effective_point), skeleton_color_contact, skeleton_color_contact);
+                    for (int zone = 0; zone < 3; zone++)
+                    {
+                        Renderer::DrawLine(to_render(previous_temperature[zone]), to_render(temperature_point[zone]), zone_color[zone], zone_color[zone]);
+                    }
+                }
+                if (segment % 4 == 0)
+                {
+                    Renderer::DrawLine(to_render(left), to_render(right), skeleton_color_wheel, skeleton_color_wheel);
+                }
+                previous_left = left;
+                previous_right = right;
+                previous_effective = effective_point;
+                for (int zone = 0; zone < 3; zone++)
+                {
+                    previous_temperature[zone] = temperature_point[zone];
+                }
+            }
+
+            draw_skeleton_cylinder(to_render(wheel_left), to_render(wheel_right), 0.045f, skeleton_color_wheel);
+            const float brake_radius = wheel_radius * 0.62f;
+            const float brake_temperature_range = std::max(preset.brake_fade_temp - preset.brake_ambient_temp, 1.0f);
+            const float brake_heat = std::clamp((wheel.brake_temp - preset.brake_ambient_temp) / brake_temperature_range, 0.0f, 1.0f);
+            const float abs_flash = simulation->is_abs_active(i) ? 0.35f : 0.0f;
+            const Color brake_color = Color(1.0f, std::min(0.16f + brake_heat * 0.62f + abs_flash, 1.0f), 0.10f + abs_flash, 1.0f);
+            physx::PxVec3 previous_brake;
+            for (int segment = 0; segment <= 16; segment++)
+            {
+                const float angle = static_cast<float>(segment) / 16.0f * math::pi * 2.0f;
+                const physx::PxVec3 brake_point = wheel_pose.p + (wheel_radial_y * cosf(angle) + wheel_radial_z * sinf(angle)) * brake_radius;
+                if (segment > 0)
+                {
+                    Renderer::DrawLine(to_render(previous_brake), to_render(brake_point), brake_color, brake_color);
+                }
+                previous_brake = brake_point;
+            }
+            const physx::PxVec3 spin_marker = wheel_pose.q.rotate(physx::PxVec3(0.0f, wheel_radius * 0.9f, 0.0f));
+            Renderer::DrawLine(wheel_world[i], to_render(wheel_pose.p + spin_marker), skeleton_color_wheel, skeleton_color_wheel);
+            const math::Vector3 wheel_axis_render = (to_render(wheel_pose.p + wheel_axis) - wheel_world[i]).Normalized();
+            const float wheel_torque_reference = std::max(preset.handbrake_torque + preset.brake_force * wheel_radius, 1.0f);
+            draw_skeleton_torque_arc(wheel_world[i], wheel_axis_render, wheel_radius * 0.72f, wheel.net_torque / wheel_torque_reference, skeleton_color_torque);
+            Renderer::DrawSphere(wheel_world[i], 0.052f, 7, get_skeleton_tire_temperature_color(wheel.thermal.core, wheel.wear, preset));
+            const bool is_front_wheel = i < 2;
+            const float axle_brake_share = is_front_wheel ? preset.brake_bias_front : 1.0f - preset.brake_bias_front;
+            const float wheel_radius_for_brake = config.wheel_radius_for(i);
+            float applied_brake_torque = fabsf(wheel.brake_torque);
+            if (!is_front_wheel)
+            {
+                applied_brake_torque += preset.handbrake_torque * simulation->get_handbrake();
+            }
+            const float brake_reference = std::max(preset.brake_force * wheel_radius_for_brake * axle_brake_share * 0.5f + (!is_front_wheel ? preset.handbrake_torque : 0.0f), 1.0f);
+            const float brake_actuation = std::clamp(applied_brake_torque / brake_reference, 0.0f, 1.0f);
+            const float caliper_size = 0.050f + brake_actuation * 0.016f;
+            Renderer::DrawSphere(to_render(wheel_pose.p + wheel_radial_y * brake_radius * 0.72f + wheel_radial_z * brake_radius * 0.45f), caliper_size, 6, brake_color);
+
+            // the upright box is sized from the ball joint spread, drawing a fixed length rod here
+            // hid every geometry change the preset made to it
+            const physx::PxTransform upright_pose = corner.upright->getGlobalPose();
+            draw_skeleton_actor_shapes(corner.upright, skeleton_color_suspension, to_render);
+            draw_skeleton_joint(to_render(upright_pose.transform(corner.upright_shock_anchor)), skeleton_color_suspension);
+
+            // the wheel carries a sphere for its rotational inertia, it is not the tyre outline and
+            // seeing the two apart is the only way to tell the collision proxy from the visual radius
+            draw_skeleton_actor_shapes(corner.wheel_body, skeleton_color_wheel, to_render);
+
+            physx::PxRigidDynamic* drawn_members[::car::max_suspension_members] = {};
+            int drawn_member_count = 0;
+            for (int member_index = 0; member_index < corner.member_count; member_index++)
+            {
+                const ::car::suspension_member& member = corner.members[member_index];
+                if (!member.actor)
+                {
+                    continue;
+                }
+                const physx::PxTransform member_pose = member.actor->getGlobalPose();
+                const math::Vector3 start = to_render(member_pose.transform(member.local_start));
+                const math::Vector3 end = to_render(member_pose.transform(member.local_end));
+                const bool tie_rod = is_front_wheel && multibody.rack && member_index == corner.member_count - 1;
+                const Color& member_color = tie_rod ? skeleton_color_steering : skeleton_color_suspension;
+
+                // a wishbone registers its single arm under two members, one per inner pivot, so
+                // the shape has to be drawn once while both pivots still get their own marker
+                bool already_drawn = false;
+                for (int drawn = 0; drawn < drawn_member_count; drawn++)
+                {
+                    if (drawn_members[drawn] == member.actor)
+                    {
+                        already_drawn = true;
+                        break;
+                    }
+                }
+
+                if (!already_drawn)
+                {
+                    drawn_members[drawn_member_count++] = member.actor;
+                    // a wishbone is a box and a link is a capsule, both were drawn as one thin rod
+                    draw_skeleton_actor_shapes(member.actor, member_color, to_render);
+                }
+
+                // outboard is always a bearing, inboard is a rubber bush unless the preset disabled it
+                if (member.pivot_is_bushing && member.pivot_joint)
+                {
+                    draw_skeleton_bushing(member.pivot_joint, start, end, preset.bushing_max_deflection);
+                }
+                else
+                {
+                    draw_skeleton_joint(start, tie_rod ? skeleton_color_steering : skeleton_color_suspension);
+                }
+                draw_skeleton_joint(end, tie_rod ? skeleton_color_steering : skeleton_color_suspension);
+            }
+
+            const math::Vector3 shock_top = to_render(body->getGlobalPose().transform(corner.chassis_shock_anchor));
+            const math::Vector3 shock_bottom = to_render(upright_pose.transform(corner.upright_shock_anchor));
+            shock_top_world[i] = shock_top;
+            shock_bottom_world[i] = shock_bottom;
+            const math::Vector3 shock_mid = lerp_skeleton(shock_top, shock_bottom, 0.48f);
+            const float suspension_force = simulation->get_wheel_suspension_force(i);
+            const float spring_load = std::clamp(fabsf(suspension_force) / std::max(preset.max_susp_force, 1.0f), 0.0f, 1.0f);
+            const float damper_velocity = fabsf(wheel.compression_velocity) * config.suspension_travel;
+            const float damper_load = std::clamp(damper_velocity / std::max(preset.max_damper_velocity, 0.1f), 0.0f, 1.0f);
+            const Color spring_color = tint_skeleton_color(skeleton_color_suspension, spring_load, 0.45f);
+            const Color damper_color = tint_skeleton_color(skeleton_color_suspension, damper_load, 0.25f);
+            const ::car::coilover& coilover_unit = corner.coilover_unit;
+            if (coilover_unit.tube && coilover_unit.rod)
+            {
+                draw_skeleton_actor_shapes(coilover_unit.tube, damper_color, to_render);
+                draw_skeleton_actor_shapes(coilover_unit.rod, skeleton_color_suspension, to_render);
+                draw_skeleton_spring(shock_top, shock_bottom, vehicle_rotation * math::Vector3::Forward, 0.055f, spring_color);
+                draw_skeleton_joint(shock_top, skeleton_color_suspension);
+                draw_skeleton_joint(shock_bottom, skeleton_color_suspension);
+            }
+            else
+            {
+                draw_skeleton_cylinder(shock_top, shock_mid, 0.030f, damper_color);
+                Renderer::DrawLine(shock_mid, shock_bottom, skeleton_color_suspension, skeleton_color_suspension);
+                draw_skeleton_spring(shock_top, shock_bottom, vehicle_rotation * math::Vector3::Forward, 0.055f, spring_color);
+                draw_skeleton_joint(shock_top, skeleton_color_suspension);
+                draw_skeleton_joint(shock_bottom, skeleton_color_suspension);
+            }
+            const math::Vector3 shock_axis = (shock_top - shock_bottom).Normalized();
+            const math::Vector3 spring_force_vector = shock_axis * (suspension_force * 0.00001f);
+            Renderer::DrawLine(shock_top, shock_top + spring_force_vector, spring_color, spring_color);
+            Renderer::DrawLine(shock_bottom, shock_bottom - spring_force_vector, spring_color, spring_color);
+            // the shock carries three separate stages and only the first was ever drawn, so a car sitting
+            // on its packers looked identical to one riding on its springs
+            const float current_compression = corner.shock_rest_length - corner.shock_length;
+            if (current_compression > config.suspension_travel * preset.bump_stop_threshold)
+            {
+                Renderer::DrawSphere(shock_bottom, 0.065f, 8, skeleton_color_torque);
+            }
+            if (current_compression > config.suspension_travel * preset.packer_threshold)
+            {
+                Renderer::DrawSphere(shock_bottom, 0.088f, 9, skeleton_color_long_force);
+            }
+
+            // the distance joint is a hard backstop on droop and bump that no spring force reveals
+            if (corner.travel_joint)
+            {
+                const float travel_length = corner.travel_joint->getDistance();
+                const float minimum = corner.travel_joint->getMinDistance();
+                const float maximum = corner.travel_joint->getMaxDistance();
+                const float band = std::max((maximum - minimum) * 0.06f, 0.002f);
+                const bool at_droop = travel_length > maximum - band;
+                const bool at_bump  = travel_length < minimum + band;
+                const Color travel_color = at_droop || at_bump ? skeleton_color_torque : skeleton_color_suspension;
+                // the two ends of the allowed band, drawn along the shock so the remaining travel is visible
+                const math::Vector3 droop_mark = shock_top + shock_axis * -maximum;
+                const math::Vector3 bump_mark  = shock_top + shock_axis * -minimum;
+                Renderer::DrawLine(droop_mark, bump_mark, travel_color, travel_color);
+                Renderer::DrawSphere(droop_mark, at_droop ? 0.034f : 0.018f, 5, travel_color);
+                Renderer::DrawSphere(bump_mark, at_bump ? 0.034f : 0.018f, 5, travel_color);
+            }
+
+            // the steering lock, a twist limit on the upright about the chassis vertical. running out of
+            // angle produced no visual at all before, the wheel simply stopped turning
+            if (corner.steering_stop && corner.steering_limit > 0.0f)
+            {
+                const float twist = corner.steering_stop->getTwistAngle();
+                const float lock = std::clamp(fabsf(twist) / corner.steering_limit, 0.0f, 1.0f);
+                const Color lock_color = lock > 0.98f ? skeleton_color_torque : skeleton_color_steering;
+                const math::Vector3 steering_axis = vehicle_rotation * math::Vector3::Up;
+                draw_skeleton_torque_arc(wheel_world[i], steering_axis, wheel_radius * 0.86f, twist / corner.steering_limit, lock_color);
+                if (lock > 0.98f)
+                {
+                    Renderer::DrawSphere(wheel_world[i], wheel_radius * 0.30f, 8, lock_color);
+                }
+            }
+            physx::PxVec3 sweep_origin;
+            physx::PxVec3 sweep_endpoint;
+            bool sweep_hit = false;
+            simulation->get_debug_sweep(i, sweep_origin, sweep_endpoint, sweep_hit);
+            const Color& sweep_color = sweep_hit ? skeleton_color_contact : skeleton_color_collision;
+            Renderer::DrawLine(to_render(sweep_origin), to_render(sweep_endpoint), sweep_color, sweep_color);
+            Renderer::DrawSphere(to_render(sweep_endpoint), 0.025f, 6, sweep_color);
+
+            // the tread rows the contact model actually loaded, the stalk length is that row's share of
+            // the load so an uneven patch from camber or a kerb edge is visible rather than inferred
+            const int contact_rows = simulation->get_debug_contact_rows(i);
+            for (int row = 0; row < contact_rows; row++)
+            {
+                physx::PxVec3 row_point;
+                physx::PxVec3 row_normal;
+                float row_load = 0.0f;
+                simulation->get_debug_contact_row(i, row, row_point, row_normal, row_load);
+                const math::Vector3 row_base = to_render(row_point);
+                const math::Vector3 row_tip  = to_render(row_point + row_normal * (row_load * 0.00006f));
+                Renderer::DrawLine(row_base, row_tip, skeleton_color_contact, skeleton_color_contact);
+                Renderer::DrawSphere(row_base, 0.012f, 5, skeleton_color_contact);
+            }
+            if (wheel.grounded)
+            {
+                physx::PxVec3 wheel_forward = wheel_axis.cross(wheel.contact_normal);
+                if (wheel_forward.normalize() < 0.0001f)
+                {
+                    wheel_forward = upright_pose.q.rotate(physx::PxVec3(0.0f, 0.0f, 1.0f));
+                }
+                const physx::PxVec3 wheel_lateral = wheel.contact_normal.cross(wheel_forward).getNormalized();
+                const physx::PxVec3 normal_endpoint = wheel.contact_point + wheel.contact_normal * (wheel.tire_load * 0.00002f);
+                const physx::PxVec3 longitudinal_endpoint = wheel.contact_point + wheel_forward * wheel.longitudinal_force * 0.00002f;
+                const physx::PxVec3 lateral_endpoint = wheel.contact_point + wheel_lateral * wheel.lateral_force * 0.00002f;
+                const float rolling_resistance_force = preset.rolling_resistance * wheel.tire_load;
+                const float rolling_direction = -std::clamp(corner.wheel_body->getLinearVelocity().dot(wheel_forward) / 0.5f, -1.0f, 1.0f);
+                const physx::PxVec3 rolling_endpoint = wheel.contact_point + wheel_forward * rolling_direction * rolling_resistance_force * 0.00004f;
+                const math::Vector3 contact = to_render(wheel.contact_point);
+                Color contact_color = skeleton_color_contact;
+                if (wheel.contact_surface == ::car::surface_gravel)
+                {
+                    contact_color = Color(0.76f, 0.56f, 0.28f, 1.0f);
+                }
+                else if (wheel.contact_surface == ::car::surface_grass)
+                {
+                    contact_color = Color(0.18f, 0.72f, 0.18f, 1.0f);
+                }
+                else if (wheel.contact_surface == ::car::surface_ice)
+                {
+                    contact_color = Color(0.65f, 0.90f, 1.00f, 1.0f);
+                }
+                else if (wheel.contact_surface == ::car::surface_wet_asphalt)
+                {
+                    contact_color = Color(0.25f, 0.48f, 1.00f, 1.0f);
+                }
+                if (wheel.contact_actor && wheel.contact_actor->is<physx::PxRigidDynamic>())
+                {
+                    contact_color = Color(1.00f, 0.90f, 0.20f, 1.0f);
+                }
+                Renderer::DrawSphere(contact, 0.045f, 8, contact_color);
+                Renderer::DrawLine(contact, to_render(normal_endpoint), skeleton_color_contact, skeleton_color_contact);
+                Renderer::DrawLine(contact, to_render(longitudinal_endpoint), skeleton_color_long_force, skeleton_color_long_force);
+                Renderer::DrawLine(contact, to_render(lateral_endpoint), skeleton_color_tire_force, skeleton_color_tire_force);
+                Renderer::DrawLine(contact, to_render(rolling_endpoint), skeleton_color_aero, skeleton_color_aero);
+                // the trail comes from the simulation, recomputing it here drew the curve fit result
+                // even when the brush model was the one steering the car
+                const float trail = simulation->get_wheel_pneumatic_trail(i);
+                const float aligning_torque = simulation->get_wheel_self_aligning_torque(i);
+                const math::Vector3 contact_normal_render = (to_render(wheel.contact_point + wheel.contact_normal) - contact).Normalized();
+                draw_skeleton_torque_arc(wheel_world[i], contact_normal_render, wheel_radius * 0.48f, aligning_torque / 500.0f, skeleton_color_steering);
+
+                // the patch the brush model derived from carcass deflection, and the point inside it where
+                // the lateral force actually acts. both are outputs of the tire model that nothing showed
+                const float patch_half = wheel.contact_patch_length * 0.5f;
+                if (patch_half > 0.0f)
+                {
+                    Renderer::DrawLine(to_render(wheel.contact_point - wheel_forward * patch_half), to_render(wheel.contact_point + wheel_forward * patch_half), skeleton_color_contact, skeleton_color_contact);
+                }
+                Renderer::DrawSphere(to_render(wheel.contact_point - wheel_forward * trail), 0.018f, 5, skeleton_color_steering);
+            }
+        }
+
+        const float front_z = (wheel_local[0].z + wheel_local[1].z) * 0.5f;
+        const float rear_z  = (wheel_local[2].z + wheel_local[3].z) * 0.5f;
+        const float frame_y = 0.04f;
+        const float front_frame_half_width = config.track_front * 0.30f;
+        const float rear_frame_half_width = config.track_rear * 0.30f;
+        const math::Vector3 frame_front_left = to_world(math::Vector3(-front_frame_half_width, frame_y, front_z));
+        const math::Vector3 frame_front_right = to_world(math::Vector3(front_frame_half_width, frame_y, front_z));
+        const math::Vector3 frame_rear_left = to_world(math::Vector3(-rear_frame_half_width, frame_y, rear_z));
+        const math::Vector3 frame_rear_right = to_world(math::Vector3(rear_frame_half_width, frame_y, rear_z));
+        const math::Vector3 frame_center_left = lerp_skeleton(frame_front_left, frame_rear_left, 0.5f);
+        const math::Vector3 frame_center_right = lerp_skeleton(frame_front_right, frame_rear_right, 0.5f);
+        draw_skeleton_cylinder(frame_front_left, frame_rear_left, 0.025f, skeleton_color_frame);
+        draw_skeleton_cylinder(frame_front_right, frame_rear_right, 0.025f, skeleton_color_frame);
+        draw_skeleton_cylinder(frame_front_left, frame_front_right, 0.025f, skeleton_color_frame);
+        draw_skeleton_cylinder(frame_center_left, frame_center_right, 0.025f, skeleton_color_frame);
+        draw_skeleton_cylinder(frame_rear_left, frame_rear_right, 0.025f, skeleton_color_frame);
+        Renderer::DrawLine(frame_front_left, frame_rear_right, skeleton_color_frame, skeleton_color_frame);
+        Renderer::DrawLine(frame_front_right, frame_rear_left, skeleton_color_frame, skeleton_color_frame);
+        draw_skeleton_cylinder(frame_front_left, shock_top_world[0], 0.018f, skeleton_color_frame);
+        draw_skeleton_cylinder(frame_front_right, shock_top_world[1], 0.018f, skeleton_color_frame);
+        draw_skeleton_cylinder(frame_rear_left, shock_top_world[2], 0.018f, skeleton_color_frame);
+        draw_skeleton_cylinder(frame_rear_right, shock_top_world[3], 0.018f, skeleton_color_frame);
+
+        auto draw_physical_anti_roll = [&](const ::car::anti_roll_bar& arb, int left, int right, float stiffness)
+        {
+            if (!arb.left_half || !arb.right_half)
+            {
+                // no physx bar, fall back to the old travel-difference sketch
+                if (stiffness <= 0.0f)
+                {
+                    return;
+                }
+                const ::car::suspension_corner& left_corner = multibody.corners[left];
+                const ::car::suspension_corner& right_corner = multibody.corners[right];
+                const float compression_difference =
+                    (left_corner.shock_rest_length - left_corner.shock_length)
+                    - (right_corner.shock_rest_length - right_corner.shock_length);
+                const float anti_roll_load = std::clamp(
+                    fabsf(compression_difference * stiffness) / std::max(preset.max_susp_force, 1.0f),
+                    0.0f,
+                    1.0f);
+                const Color loaded = tint_skeleton_color(skeleton_color_suspension, anti_roll_load, 0.40f);
+                const math::Vector3 left_arm_end = lerp_skeleton(shock_top_world[left], shock_bottom_world[left], 0.24f);
+                const math::Vector3 right_arm_end = lerp_skeleton(shock_top_world[right], shock_bottom_world[right], 0.24f);
+                const float anti_roll_twist =
+                    compression_difference / std::max(config.suspension_travel, 0.01f) * math::pi;
+                draw_skeleton_shaft(shock_top_world[left], shock_top_world[right], 0.020f, 0.0f, anti_roll_twist, loaded);
+                draw_skeleton_cylinder(shock_top_world[left], left_arm_end, 0.014f, loaded);
+                draw_skeleton_cylinder(shock_top_world[right], right_arm_end, 0.014f, loaded);
+                return;
+            }
+
+            const ::car::suspension_corner& left_corner = multibody.corners[left];
+            const ::car::suspension_corner& right_corner = multibody.corners[right];
+            const float compression_difference =
+                (left_corner.shock_rest_length - left_corner.shock_length)
+                - (right_corner.shock_rest_length - right_corner.shock_length);
+            float twist = 0.0f;
+            if (arb.torsion_joint)
+            {
+                const physx::PxQuat relative = arb.torsion_joint->getRelativeTransform().q;
+                twist = 2.0f * atanf(relative.x / std::max(relative.w, 1e-6f));
+                if (!std::isfinite(twist))
+                {
+                    twist = 0.0f;
+                }
+            }
+            else
+            {
+                twist = compression_difference / std::max(arb.arm_length, 0.05f);
+            }
+            const float anti_roll_load = std::clamp(
+                fabsf(compression_difference * stiffness) / std::max(preset.max_susp_force, 1.0f),
+                0.0f,
+                1.0f);
+            const Color loaded = tint_skeleton_color(skeleton_color_suspension, anti_roll_load, 0.40f);
+
+            physx::PxVec3 left_start, left_end, right_start, right_end;
+            float left_radius = 0.016f;
+            float right_radius = 0.016f;
+            const bool left_caps = get_capsule_endpoints(arb.left_half, left_start, left_end, left_radius);
+            const bool right_caps = get_capsule_endpoints(arb.right_half, right_start, right_end, right_radius);
+            draw_skeleton_actor_shapes(arb.left_half, loaded, to_render);
+            draw_skeleton_actor_shapes(arb.right_half, loaded, to_render);
+
+            if (left_caps && right_caps)
+            {
+                // inboard is the end with smaller chassis local |x|
+                const physx::PxTransform pose = body->getGlobalPose();
+                auto local_abs_x = [&](const physx::PxVec3& world) -> float
+                {
+                    return fabsf(pose.transformInv(world).x);
+                };
+                const physx::PxVec3 left_inboard =
+                    local_abs_x(left_start) < local_abs_x(left_end) ? left_start : left_end;
+                const physx::PxVec3 left_outboard = left_inboard == left_start ? left_end : left_start;
+                const physx::PxVec3 right_inboard =
+                    local_abs_x(right_start) < local_abs_x(right_end) ? right_start : right_end;
+                const physx::PxVec3 right_outboard = right_inboard == right_start ? right_end : right_start;
+                draw_skeleton_shaft(
+                    to_render(left_inboard),
+                    to_render(right_inboard),
+                    std::max(left_radius, right_radius) * 0.85f,
+                    0.0f,
+                    twist,
+                    loaded);
+                draw_skeleton_joint(to_render(left_inboard), skeleton_color_suspension);
+                draw_skeleton_joint(to_render(right_inboard), skeleton_color_suspension);
+                draw_skeleton_joint(to_render(left_outboard), loaded);
+                draw_skeleton_joint(to_render(right_outboard), loaded);
+            }
+
+            auto draw_drop = [&](physx::PxRigidDynamic* drop, int corner_index)
+            {
+                if (!drop)
+                {
+                    return;
+                }
+                draw_skeleton_actor_shapes(drop, loaded, to_render);
+                physx::PxVec3 drop_start, drop_end;
+                float drop_radius = 0.014f;
+                if (get_capsule_endpoints(drop, drop_start, drop_end, drop_radius))
+                {
+                    draw_skeleton_joint(to_render(drop_start), loaded);
+                    draw_skeleton_joint(to_render(drop_end), loaded);
+                    // load stalk along the link, same units as the old force sketch
+                    const math::Vector3 a = to_render(drop_start);
+                    const math::Vector3 b = to_render(drop_end);
+                    math::Vector3 along = b - a;
+                    if (along.LengthSquared() > 1e-6f)
+                    {
+                        along.Normalize();
+                        const float force_scale = anti_roll_load * 0.12f;
+                        Renderer::DrawLine(a, a - along * force_scale, loaded, loaded);
+                        Renderer::DrawLine(b, b + along * force_scale, loaded, loaded);
+                    }
+                }
+                else
+                {
+                    draw_skeleton_joint(to_render(drop->getGlobalPose().p), loaded);
+                    draw_skeleton_joint(shock_bottom_world[corner_index], loaded);
+                }
+            };
+            draw_drop(arb.left_drop, left);
+            draw_drop(arb.right_drop, right);
+        };
+        draw_physical_anti_roll(multibody.front_arb, 0, 1, preset.front_arb_stiffness);
+        draw_physical_anti_roll(multibody.rear_arb, 2, 3, preset.rear_arb_stiffness);
+
+        const physx::PxTransform body_pose = body->getGlobalPose();
+        const math::Vector3 center_of_mass = to_render(body_pose.transform(body->getCMassLocalPose().p));
+        Renderer::DrawSphere(center_of_mass, 0.075f, 10, skeleton_color_frame);
+
+        // principal inertia axes at the com, length scales with sqrt(i) so yaw vs roll is readable
+        {
+            const physx::PxVec3 inertia = body->getMassSpaceInertiaTensor();
+            const float i_scale = 0.012f / std::max(sqrtf(std::max(std::max(inertia.x, inertia.y), inertia.z)), 1.0f);
+            const physx::PxTransform com_pose = body_pose * body->getCMassLocalPose();
+            auto draw_inertia_axis = [&](const physx::PxVec3& local_axis, float inertia_value, const Color& color)
+            {
+                const float half_length = sqrtf(std::max(inertia_value, 1.0f)) * i_scale * 40.0f;
+                const physx::PxVec3 world_axis = com_pose.q.rotate(local_axis) * half_length;
+                Renderer::DrawLine(
+                    to_render(com_pose.p - world_axis),
+                    to_render(com_pose.p + world_axis),
+                    color,
+                    color);
+            };
+            draw_inertia_axis(physx::PxVec3(1.0f, 0.0f, 0.0f), inertia.x, Color(1.0f, 0.35f, 0.35f, 1.0f));
+            draw_inertia_axis(physx::PxVec3(0.0f, 1.0f, 0.0f), inertia.y, Color(0.35f, 1.0f, 0.45f, 1.0f));
+            draw_inertia_axis(physx::PxVec3(0.0f, 0.0f, 1.0f), inertia.z, Color(0.35f, 0.65f, 1.0f, 1.0f));
+        }
+        const ::car::aero_debug_data& aero_debug = simulation->get_aero_debug();
+        if (aero_debug.valid)
+        {
+            auto draw_aero_force = [&](const physx::PxVec3& position, const physx::PxVec3& force)
+            {
+                const math::Vector3 start = to_render(position);
+                Renderer::DrawLine(start, to_render(position + force * 0.00002f), skeleton_color_aero, skeleton_color_aero);
+            };
+            draw_aero_force(aero_debug.position, aero_debug.drag_force);
+            draw_aero_force(aero_debug.front_aero_pos, aero_debug.front_downforce);
+            draw_aero_force(aero_debug.rear_aero_pos, aero_debug.rear_downforce);
+            draw_aero_force(aero_debug.side_aero_pos, aero_debug.side_force);
+        }
+
+        if (multibody.rack)
+        {
+            // the tie rod ends ride on the bar itself, so the marker span has to come from the
+            // shape rather than from a track fraction recomputed here
+            const physx::PxTransform rack_pose = multibody.rack->getGlobalPose();
+            draw_skeleton_actor_shapes(multibody.rack, skeleton_color_steering, to_render);
+
+            physx::PxShape* rack_shape = nullptr;
+            if (multibody.rack->getNbShapes() > 0)
+            {
+                multibody.rack->getShapes(&rack_shape, 1);
+            }
+
+            if (rack_shape && rack_shape->getGeometry().getType() == physx::PxGeometryType::eBOX)
+            {
+                const float half_width =
+                    static_cast<const physx::PxBoxGeometry&>(rack_shape->getGeometry()).halfExtents.x;
+                draw_skeleton_joint(to_render(rack_pose.transform(physx::PxVec3(-half_width, 0.0f, 0.0f))), skeleton_color_steering);
+                draw_skeleton_joint(to_render(rack_pose.transform(physx::PxVec3(half_width, 0.0f, 0.0f))), skeleton_color_steering);
+            }
+        }
+
+        const int drivetrain_type = preset.drivetrain_type;
+        const bool drives_front = drivetrain_type == 1 || drivetrain_type == 2;
+        const bool drives_rear  = drivetrain_type == 0 || drivetrain_type == 2;
+        const float axle_y = (wheel_local[0].y + wheel_local[2].y) * 0.5f;
+        float gearbox_z = preset.center_of_mass_z;
+        if (drives_front && !drives_rear)
+        {
+            gearbox_z = front_z;
+        }
+        else if (drives_rear && !drives_front)
+        {
+            gearbox_z = rear_z;
+        }
+        {
+            const float driven_axle_z = drives_rear ? rear_z : front_z;
+            if (fabsf(gearbox_z - driven_axle_z) < 0.08f)
+            {
+                const float toward_center = (driven_axle_z >= 0.0f) ? -1.0f : 1.0f;
+                gearbox_z = driven_axle_z + toward_center * 0.10f;
+            }
+        }
+        const math::Vector3 gearbox = to_world(math::Vector3(0.0f, axle_y, gearbox_z));
+        const float driveshaft_torque = simulation->get_driveshaft_torque();
+        const float torque_load = std::clamp(fabsf(driveshaft_torque) / 6000.0f, 0.0f, 1.0f);
+        const Color loaded_drivetrain_color = tint_skeleton_color(skeleton_color_drivetrain, torque_load, 0.45f);
+        const float motor_load = preset.electric_enabled ? std::clamp(fabsf(simulation->get_motor_torque()) / std::max(preset.electric_motor_torque, 1.0f), 0.0f, 1.0f) : 0.0f;
+        Color power_unit_color = tint_skeleton_color(skeleton_color_drivetrain, motor_load, 0.35f);
+        if (simulation->get_rev_limiter_active())
+        {
+            power_unit_color = skeleton_color_torque;
+        }
+        else if (simulation->is_tc_active())
+        {
+            power_unit_color = skeleton_color_long_force;
+        }
+        else if (simulation->get_is_shifting())
+        {
+            power_unit_color = tint_skeleton_color(skeleton_color_drivetrain, 1.0f, 0.55f);
+        }
+
+        const math::Vector3 flywheel_axis = vehicle_rotation * math::Vector3::Right * 0.10f;
+        draw_skeleton_shaft(gearbox - flywheel_axis, gearbox + flywheel_axis, 0.075f + simulation->get_clutch() * 0.015f, simulation->get_engine_rotation(), 0.0f, power_unit_color);
+        Renderer::DrawSphere(gearbox, 0.10f, 8, power_unit_color);
+
+        const ::car::driveline_assembly& driveline = multibody.driveline;
+        auto is_driveline_actor = [&](physx::PxRigidDynamic* actor) -> bool
+        {
+            if (!actor)
+            {
+                return false;
+            }
+            if (actor == driveline.gearbox_output || actor == driveline.axle_input)
+            {
+                return true;
+            }
+            for (int i = 0; i < driveline.propshaft_count; i++)
+            {
+                if (actor == driveline.propshaft[i])
+                {
+                    return true;
+                }
+            }
+            for (int i = 0; i < driveline.differential_count; i++)
+            {
+                if (actor == driveline.differential[i])
+                {
+                    return true;
+                }
+            }
+            for (int i = 0; i < 4; i++)
+            {
+                if (actor == driveline.halfshaft[i])
+                {
+                    return true;
+                }
+            }
+            return false;
+        };
+        auto is_arb_actor = [&](physx::PxRigidDynamic* actor) -> bool
+        {
+            auto match = [&](const ::car::anti_roll_bar& arb)
+            {
+                return actor == arb.left_half || actor == arb.right_half || actor == arb.left_drop || actor == arb.right_drop;
+            };
+            return match(multibody.front_arb) || match(multibody.rear_arb);
+        };
+
+        const float driveshaft_twist = simulation->get_driveshaft_twist();
+        auto wheel_drivetrain_color = [&](int wheel_index)
+        {
+            const float wheel_torque_load = std::clamp(
+                fabsf(simulation->get_wheel_state(wheel_index).drive_torque) / 6000.0f,
+                0.0f,
+                1.0f);
+            return tint_skeleton_color(skeleton_color_drivetrain, wheel_torque_load, 0.45f);
+        };
+        auto draw_spinning_capsule = [&](
+            physx::PxRigidDynamic* actor,
+            float rotation,
+            float twist,
+            float radius_scale,
+            const Color& color
+        )
+        {
+            if (!actor)
+            {
+                return;
+            }
+            physx::PxVec3 start, end;
+            float radius = 0.04f;
+            if (get_capsule_endpoints(actor, start, end, radius))
+            {
+                draw_skeleton_shaft(
+                    to_render(start),
+                    to_render(end),
+                    radius * radius_scale,
+                    rotation,
+                    twist,
+                    color);
+            }
+            else
+            {
+                draw_skeleton_actor_shapes(actor, color, to_render);
+            }
+        };
+
+        if (driveline.initialized)
+        {
+            if (driveline.gearbox_output)
+            {
+                draw_skeleton_actor_shapes(driveline.gearbox_output, power_unit_color, to_render);
+                const physx::PxVec3 flange_axis =
+                    driveline.gearbox_output->getGlobalPose().q.rotate(physx::PxVec3(1.0f, 0.0f, 0.0f));
+                const math::Vector3 flange_center = to_render(driveline.gearbox_output->getGlobalPose().p);
+                const math::Vector3 flange_axis_render =
+                    (to_render(driveline.gearbox_output->getGlobalPose().p + flange_axis) - flange_center).Normalized();
+                draw_skeleton_torque_arc(
+                    flange_center,
+                    flange_axis_render,
+                    0.11f,
+                    driveshaft_torque / 6000.0f,
+                    loaded_drivetrain_color);
+                Renderer::DrawSphere(flange_center, 0.055f, 7, power_unit_color);
+            }
+            if (driveline.axle_input)
+            {
+                draw_skeleton_actor_shapes(driveline.axle_input, loaded_drivetrain_color, to_render);
+                Renderer::DrawSphere(
+                    to_render(driveline.axle_input->getGlobalPose().p),
+                    0.045f,
+                    7,
+                    loaded_drivetrain_color);
+            }
+
+            for (int i = 0; i < driveline.propshaft_count; i++)
+            {
+                physx::PxRigidDynamic* prop = driveline.propshaft[i];
+                if (!prop)
+                {
+                    continue;
+                }
+                float pinion_rotation = 0.0f;
+                if (driveline.differential[i])
+                {
+                    const float axle_local_z =
+                        body_pose.transformInv(driveline.differential[i]->getGlobalPose().p).z;
+                    const bool front_axle = axle_local_z > 0.0f;
+                    pinion_rotation = front_axle
+                        ? (simulation->get_wheel_rotation(0) + simulation->get_wheel_rotation(1)) * 0.5f * preset.final_drive
+                        : (simulation->get_wheel_rotation(2) + simulation->get_wheel_rotation(3)) * 0.5f * preset.final_drive;
+                }
+                const float prop_radius_scale = drivetrain_type == 2 ? 1.15f : 1.45f;
+                draw_spinning_capsule(prop, pinion_rotation, driveshaft_twist, prop_radius_scale, loaded_drivetrain_color);
+            }
+
+            for (int i = 0; i < driveline.differential_count; i++)
+            {
+                physx::PxRigidDynamic* differential = driveline.differential[i];
+                if (!differential)
+                {
+                    continue;
+                }
+                draw_skeleton_actor_shapes(differential, skeleton_color_drivetrain, to_render);
+                Renderer::DrawSphere(
+                    to_render(differential->getGlobalPose().p),
+                    0.09f,
+                    8,
+                    skeleton_color_drivetrain);
+            }
+
+            for (int wheel_index = 0; wheel_index < 4; wheel_index++)
+            {
+                physx::PxRigidDynamic* shaft = driveline.halfshaft[wheel_index];
+                if (!shaft)
+                {
+                    continue;
+                }
+                const Color shaft_color = wheel_drivetrain_color(wheel_index);
+                const float wheel_twist = simulation->get_wheel_state(wheel_index).drive_torque * 0.00005f;
+                draw_spinning_capsule(
+                    shaft,
+                    simulation->get_wheel_rotation(wheel_index),
+                    wheel_twist,
+                    1.2f,
+                    shaft_color);
+
+                physx::PxVec3 shaft_start, shaft_end;
+                float shaft_radius = 0.04f;
+                if (get_capsule_endpoints(shaft, shaft_start, shaft_end, shaft_radius))
+                {
+                    Renderer::DrawSphere(to_render(shaft_start), 0.028f, 6, skeleton_color_drivetrain);
+                    Renderer::DrawSphere(to_render(shaft_end), 0.028f, 6, skeleton_color_drivetrain);
+                }
+            }
+
+            if (driveline.gearbox_output && driveline.axle_input)
+            {
+                draw_skeleton_shaft(
+                    to_render(driveline.gearbox_output->getGlobalPose().p),
+                    to_render(driveline.axle_input->getGlobalPose().p),
+                    0.018f + torque_load * 0.012f,
+                    get_actor_spin(driveline.gearbox_output, physx::PxVec3(0.0f)),
+                    driveshaft_twist,
+                    loaded_drivetrain_color);
+            }
+        }
+        else
+        {
+            const math::Vector3 front_diff = to_world(math::Vector3(0.0f, axle_y, front_z));
+            const math::Vector3 rear_diff  = to_world(math::Vector3(0.0f, axle_y, rear_z));
+            const float front_pinion_rotation =
+                (simulation->get_wheel_rotation(0) + simulation->get_wheel_rotation(1)) * 0.5f * preset.final_drive;
+            const float rear_pinion_rotation =
+                (simulation->get_wheel_rotation(2) + simulation->get_wheel_rotation(3)) * 0.5f * preset.final_drive;
+            if (drives_front)
+            {
+                Renderer::DrawSphere(front_diff, 0.11f, 8, skeleton_color_drivetrain);
+                draw_skeleton_shaft(
+                    front_diff,
+                    wheel_world[0],
+                    0.04f,
+                    simulation->get_wheel_rotation(0),
+                    simulation->get_wheel_state(0).drive_torque * 0.00005f,
+                    wheel_drivetrain_color(0));
+                draw_skeleton_shaft(
+                    front_diff,
+                    wheel_world[1],
+                    0.04f,
+                    simulation->get_wheel_rotation(1),
+                    simulation->get_wheel_state(1).drive_torque * 0.00005f,
+                    wheel_drivetrain_color(1));
+                const float front_shaft_radius =
+                    drivetrain_type == 2 ? 0.035f + preset.torque_split_front * 0.04f : 0.055f;
+                draw_skeleton_shaft(
+                    gearbox,
+                    front_diff,
+                    front_shaft_radius,
+                    front_pinion_rotation,
+                    driveshaft_twist,
+                    loaded_drivetrain_color);
+            }
+            if (drives_rear)
+            {
+                Renderer::DrawSphere(rear_diff, 0.11f, 8, skeleton_color_drivetrain);
+                draw_skeleton_shaft(
+                    rear_diff,
+                    wheel_world[2],
+                    0.04f,
+                    simulation->get_wheel_rotation(2),
+                    simulation->get_wheel_state(2).drive_torque * 0.00005f,
+                    wheel_drivetrain_color(2));
+                draw_skeleton_shaft(
+                    rear_diff,
+                    wheel_world[3],
+                    0.04f,
+                    simulation->get_wheel_rotation(3),
+                    simulation->get_wheel_state(3).drive_torque * 0.00005f,
+                    wheel_drivetrain_color(3));
+                const float rear_shaft_radius =
+                    drivetrain_type == 2 ? 0.035f + (1.0f - preset.torque_split_front) * 0.04f : 0.055f;
+                draw_skeleton_shaft(
+                    gearbox,
+                    rear_diff,
+                    rear_shaft_radius,
+                    rear_pinion_rotation,
+                    driveshaft_twist,
+                    loaded_drivetrain_color);
+            }
+        }
+
+        // everything above reaches bodies by name, which silently misses any actor a future mechanism
+        // adds. walking the solver's own list means an unhandled body shows up wrong rather than not at all
+        for (int actor_index = 0; actor_index < multibody.actor_count; actor_index++)
+        {
+            physx::PxRigidDynamic* actor = multibody.actors[actor_index];
+            if (!actor || actor == multibody.rack || is_driveline_actor(actor) || is_arb_actor(actor))
+            {
+                continue;
+            }
+
+            bool covered = false;
+            for (int i = 0; i < 4 && !covered; i++)
+            {
+                const ::car::suspension_corner& corner = multibody.corners[i];
+                covered = actor == corner.upright
+                    || actor == corner.wheel_body
+                    || actor == corner.coilover_unit.tube
+                    || actor == corner.coilover_unit.rod;
+                for (int member_index = 0; member_index < corner.member_count && !covered; member_index++)
+                {
+                    covered = actor == corner.members[member_index].actor;
+                }
+            }
+
+            if (!covered)
+            {
+                draw_skeleton_actor_shapes(actor, skeleton_color_collision, to_render);
+                Renderer::DrawSphere(to_render(actor->getGlobalPose().p), 0.06f, 7, skeleton_color_torque);
+            }
+        }
+    }
+
+    void Car::Destroy()
+    {
+        if (m_is_occupied)
+        {
+            Exit();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(car_list_mutex);
+            auto it = std::find(s_cars.begin(), s_cars.end(), this);
+            if (it != s_cars.end())
+            {
+                s_cars.erase(it);
+            }
+        }
+
+        if (m_vehicle_entity)
+        {
+            if (Physics* physics = m_vehicle_entity->GetComponent<Physics>())
+            {
+                physics->SetCar(nullptr);
+            }
+            World::RemoveEntity(m_vehicle_entity);
+        }
+        else if (m_body_entity)
+        {
+            World::RemoveEntity(m_body_entity);
+        }
+
+        delete this;
+    }
+
+    bool Car::IsPlayerInRange() const
+    {
+        Entity* car_reference = m_vehicle_entity ? m_vehicle_entity : m_body_entity;
+        if (!default_camera || !car_reference)
+        {
+            return false;
+        }
+
+        const math::Vector3 player_position = default_camera->GetPosition();
+        const math::BoundingBox aabb        = GetCarAABB();
+        const math::Vector3 aabb_min        = aabb.GetMin();
+        const math::Vector3 aabb_max        = aabb.GetMax();
+
+        // no renderable bounds, fall back to the car origin
+        if (aabb.IsInfinite() || aabb_min.x > aabb_max.x)
+        {
+            return (player_position - car_reference->GetPosition()).Length() <= car_enter_reach;
+        }
+
+        // distance to the closest point on the car bounds, so a long car is not harder to enter than a short one
+        const math::Vector3 closest_point = math::Vector3(
+            std::clamp(player_position.x, aabb_min.x, aabb_max.x),
+            std::clamp(player_position.y, aabb_min.y, aabb_max.y),
+            std::clamp(player_position.z, aabb_min.z, aabb_max.z)
+        );
+
+        return (player_position - closest_point).Length() <= car_enter_reach;
+    }
+
+    void Car::Enter()
+    {
+        if (m_is_occupied || !m_is_drivable || m_externally_controlled)
+        {
+            return;
+        }
+
+        for (Car* car : GetAll())
+        {
+            if (car && car != this && car->IsOccupied())
+            {
+                car->Exit();
+            }
+        }
+
+        m_is_occupied = true;
+        m_chase_camera.initialized = false;
+
+        // disable player physics controller so it doesn't interfere with driving
+        if (default_camera)
+        {
+            if (Physics* controller = default_camera->GetComponent<Physics>())
+            {
+                controller->SetEnabled(false);
+            }
+        }
+
+        ConfigureCameraForView();
+
+        // play engine start sound
+        if (Entity* sound_start = m_vehicle_entity ? m_vehicle_entity->GetChildByName("sound_start") : nullptr)
+        {
+            if (AudioSource* audio = sound_start->GetComponent<AudioSource>())
+            {
+                audio->PlayClip();
+            }
+        }
+
+        // play door sound
+        if (Entity* sound_door = m_vehicle_entity ? m_vehicle_entity->GetChildByName("sound_door") : nullptr)
+        {
+            if (AudioSource* audio = sound_door->GetComponent<AudioSource>())
+            {
+                audio->PlayClip();
+            }
+        }
+    }
+
+    void Car::Exit(bool position_player)
+    {
+        if (!m_is_occupied)
+        {
+            return;
+        }
+
+        m_is_occupied = false;
+        m_externally_controlled = false;
+        m_chase_camera.initialized = false;
+
+        // restore mouse cursor if orbit was active
+        if (m_orbit_mouse_active)
+        {
+            Input::SetMousePosition(m_orbit_mouse_last_position);
+            if (!Window::IsFullScreen())
+            {
+                Input::SetMouseCursorVisible(true);
+            }
+            m_orbit_mouse_active = false;
+        }
+
+        // stop the car: clear all inputs and apply handbrake
+        if (m_vehicle_entity)
+        {
+            if (Physics* physics = m_vehicle_entity->GetComponent<Physics>())
+            {
+                physics->SetVehicleThrottle(0.0f);
+                physics->SetVehicleBrake(0.0f);
+                physics->SetVehicleSteering(0.0f);
+                physics->SetVehicleHandbrake(1.0f);
+            }
+        }
+
+        Entity* camera = m_body_entity ? m_body_entity->GetChildByName("component_camera") : nullptr;
+        if (!camera && default_camera)
+        {
+            camera = default_camera->GetChildByName("component_camera");
+        }
+
+        if (camera && default_camera)
+        {
+            camera->SetParent(default_camera);
+            camera->SetRotationLocal(math::Quaternion::Identity);
+        }
+
+        // re-enable player physics controller
+        if (default_camera)
+        {
+            if (Physics* controller = default_camera->GetComponent<Physics>())
+            {
+                controller->SetEnabled(true);
+            }
+        }
+
+        // position player at the driver's door (left side of car) as if they were riding all along
+        if (default_camera && position_player)
+        {
+            // use vehicle entity for position, fall back to body entity
+            Entity* car_ref = m_vehicle_entity ? m_vehicle_entity : m_body_entity;
+            if (car_ref)
+            {
+                // get car's world transform for proper orientation
+                math::Vector3 car_position = car_ref->GetPosition();
+                math::Vector3 car_left     = car_ref->GetLeft();
+                math::Vector3 car_forward  = car_ref->GetForward();
+
+                // offset to driver's door: slightly left and forward (door is roughly at front half of car)
+                const float door_side_offset    = 1.8f; // distance from car center to door
+                const float door_forward_offset = 0.3f; // slightly forward toward front seat area
+                const float ground_offset       = 0.1f; // small offset above ground
+
+                math::Vector3 exit_position = car_position 
+                                            + car_left * door_side_offset 
+                                            + car_forward * door_forward_offset
+                                            + math::Vector3::Up * ground_offset;
+
+                // teleport the physics body first (this is the authoritative position)
+                Physics* controller = default_camera->GetComponent<Physics>();
+                if (controller)
+                {
+                    controller->SetBodyTransform(exit_position, math::Quaternion::Identity);
+                }
+
+                // also set entity position directly as fallback
+                default_camera->SetPosition(exit_position);
+
+                // reset camera local position to top of controller
+                if (camera && controller)
+                {
+                    camera->SetPositionLocal(controller->GetControllerTopLocal());
+                }
+            }
+        }
+
+        // stop engine sound
+        if (Entity* sound_engine = m_vehicle_entity ? m_vehicle_entity->GetChildByName("sound_engine") : nullptr)
+        {
+            if (AudioSource* audio = sound_engine->GetComponent<AudioSource>())
+            {
+                audio->StopSynthesis();
+            }
+        }
+
+        // play door sound
+        if (
+            position_player &&
+            m_vehicle_entity
+        )
+        {
+            if (
+                Entity* sound_door =
+                    m_vehicle_entity->GetChildByName(
+                        "sound_door"
+                    )
+            )
+            {
+                if (
+                    AudioSource* audio =
+                        sound_door->GetComponent<AudioSource>()
+                )
+                {
+                    audio->PlayClip();
+                }
+            }
+        }
+
+        // show window when outside, skeleton mode keeps all painted mesh hidden
+        if (
+            m_window_entity &&
+            m_visualization_preset != CarVisualizationPreset::Skeleton
+        )
+        {
+            m_window_entity->SetActive(true);
+        }
+
+        // stop vibration
+        Input::GamepadVibrate(0.0f, 0.0f);
+    }
+
+    void Car::SetThrottle(float value)
+    {
+        if (!m_vehicle_entity)
+        {
+            return;
+        }
+        if (Physics* physics = m_vehicle_entity->GetComponent<Physics>())
+        {
+            physics->SetVehicleThrottle(value);
+        }
+    }
+
+    void Car::SetBrake(float value)
+    {
+        if (!m_vehicle_entity)
+        {
+            return;
+        }
+        if (Physics* physics = m_vehicle_entity->GetComponent<Physics>())
+        {
+            physics->SetVehicleBrake(value);
+        }
+    }
+
+    void Car::SetSteering(float value)
+    {
+        if (!m_vehicle_entity)
+        {
+            return;
+        }
+        if (Physics* physics = m_vehicle_entity->GetComponent<Physics>())
+        {
+            physics->SetVehicleSteering(value);
+        }
+    }
+
+    void Car::SetHandbrake(float value)
+    {
+        if (!m_vehicle_entity)
+        {
+            return;
+        }
+        if (Physics* physics = m_vehicle_entity->GetComponent<Physics>())
+        {
+            physics->SetVehicleHandbrake(value);
+        }
+    }
+
+    void Car::ResetToSpawn()
+    {
+        if (!m_vehicle_entity)
+        {
+            return;
+        }
+
+        Entity* owner = m_vehicle_entity->GetParent();
+        CarReset* car_reset =
+            owner ? owner->GetComponent<CarReset>() : nullptr;
+        SpawnPoint* spawn_point =
+            car_reset ? car_reset->GetSpawnPoint() : nullptr;
+
+        if (!spawn_point)
+        {
+            if (!m_spawn_error_logged)
+            {
+                SP_LOG_ERROR(
+                    "car '%s' requires a valid spawn point",
+                    owner ?
+                        owner->GetObjectName().c_str() :
+                        m_vehicle_entity->GetObjectName().c_str()
+                );
+                m_spawn_error_logged = true;
+            }
+            return;
+        }
+
+        spawn_point->Place(m_vehicle_entity);
+        m_spawn_error_logged = false;
+        m_chase_camera.initialized = false;
+    }
+
+    void Car::CycleView()
+    {
+        m_current_view = static_cast<CarView>((static_cast<int>(m_current_view) + 1) % 3);
+        ConfigureCameraForView();
+    }
+
+    void Car::SetView(CarView view)
+    {
+        m_current_view = view;
+        ConfigureCameraForView();
+    }
+
+    Entity* Car::FindCameraEntity() const
+    {
+        const char* name = "component_camera";
+
+        Entity* camera = nullptr;
+        if (m_body_entity)
+        {
+            camera = m_body_entity->GetChildByName(name);
+        }
+        if (!camera && m_vehicle_entity)
+        {
+            camera = m_vehicle_entity->GetChildByName(name);
+        }
+        if (!camera && default_camera)
+        {
+            camera = default_camera->GetChildByName(name);
+        }
+
+        return camera;
+    }
+
+    void Car::ConfigureCameraForView()
+    {
+        Entity* camera = FindCameraEntity();
+        if (!camera)
+        {
+            return;
+        }
+
+        if (m_current_view == CarView::Chase)
+        {
+            if (default_camera)
+            {
+                camera->SetParent(default_camera);
+            }
+            m_chase_camera.initialized = false;
+        }
+        else if (m_current_view == CarView::Hood)
+        {
+            camera->SetParent(m_body_entity);
+            // hood position
+            math::Quaternion camera_correction = m_body_entity->GetRotationLocal().Inverse();
+            camera->SetPositionLocal(math::Vector3(0.0f, 0.8f, -1.0f));
+            camera->SetRotationLocal(camera_correction);
+        }
+        else
+        {
+            ConfigureWheelCamera(camera);
+        }
+    }
+
+    void Car::ConfigureWheelCamera(Entity* camera)
+    {
+        if (!camera || !m_vehicle_entity)
+        {
+            return;
+        }
+
+        // mount on the chassis so the wheel visibly spins, steers and travels with the suspension
+        camera->SetParent(m_vehicle_entity);
+
+        // base the mount on the front left wheel rest position in vehicle local space
+        math::Vector3 wheel_local = math::Vector3(-0.8f, -0.3f, 1.3f);
+        if (Physics* physics = m_vehicle_entity->GetComponent<Physics>())
+        {
+            if (Entity* wheel = physics->GetWheelEntity(WheelIndex::FrontLeft))
+            {
+                wheel_local = wheel->GetPositionLocal();
+            }
+        }
+
+        // mount outboard, above and slightly behind the wheel, left side is toward negative x
+        const float side_offset = 0.55f;
+        const float up_offset   = 0.20f;
+        const float back_offset = 0.80f;
+        math::Vector3 camera_local = wheel_local + math::Vector3(-side_offset, up_offset, -back_offset);
+
+        // look forward and slightly down so the wheel stays in the lower part of the frame
+        math::Vector3 look_target = wheel_local + math::Vector3(0.0f, -0.1f, 2.5f);
+        math::Vector3 look_dir    = (look_target - camera_local).Normalized();
+
+        camera->SetPositionLocal(camera_local);
+        camera->SetRotationLocal(math::Quaternion::FromLookRotation(look_dir, math::Vector3::Up));
+    }
+
+    void Car::AddCameraOrbitYaw(float delta)
+    {
+        m_chase_camera.yaw_bias += delta;
+        // wrap to keep float precision after many rotations, sin and cos give identical results
+        const float two_pi = 2.0f * math::pi;
+        if (m_chase_camera.yaw_bias >  math::pi)
+        {
+            m_chase_camera.yaw_bias -= two_pi;
+        }
+        if (m_chase_camera.yaw_bias < -math::pi)
+        {
+            m_chase_camera.yaw_bias += two_pi;
+        }
+    }
+
+    void Car::AddCameraOrbitPitch(float delta)
+    {
+        m_chase_camera.pitch_bias += delta;
+        m_chase_camera.pitch_bias = std::clamp(m_chase_camera.pitch_bias, -pitch_bias_max, pitch_bias_max);
+    }
+
+    // private helpers
+
+    math::Vector3 Car::SmoothDamp(const math::Vector3& current, const math::Vector3& target, 
+                                   math::Vector3& velocity, float smooth_time, float dt)
+    {
+        // critically damped spring, exp_factor is a rational approximation of exp(-omega * dt)
+        float omega            = 2.0f / std::max(smooth_time, 0.0001f);
+        float x                = omega * dt;
+        float exp_factor       = 1.0f / (1.0f + x + 0.48f * x * x + 0.235f * x * x * x);
+        math::Vector3 delta    = current - target;
+        math::Vector3 momentum = (velocity + omega * delta) * dt;
+
+        velocity = (velocity - omega * momentum) * exp_factor;
+
+        return target + (delta + momentum) * exp_factor;
+    }
+
+    float Car::LerpAngle(float a, float b, float t)
+    {
+        float diff = fmodf(b - a + math::pi * 3.0f, math::pi * 2.0f) - math::pi;
+        return a + diff * t;
+    }
+
+    math::BoundingBox Car::GetCarAABB() const
+    {
+        if (!m_body_entity)
+        {
+            return math::BoundingBox::Unit;
+        }
+
+        math::BoundingBox combined(math::Vector3::Infinity, math::Vector3::InfinityNeg);
+        std::vector<Entity*> descendants;
+        m_body_entity->GetDescendants(&descendants);
+        descendants.push_back(m_body_entity);
+
+        for (Entity* entity : descendants)
+        {
+            if (Render* render = entity->GetComponent<Render>())
+            {
+                combined.Merge(render->GetBoundingBox());
+            }
+        }
+
+        return combined;
+    }
+
+    Entity* Car::CreateBody(std::vector<Entity*>* out_excluded_entities)
+    {
+        if (!m_definition)
+        {
+            return nullptr;
+        }
+        if (m_definition->body_model.empty())
+        {
+            const ::car::car_preset& preset = m_definition->performance;
+            Entity* car_entity = World::CreateEntity();
+            car_entity->SetObjectName(FileSystem::GetFileNameWithoutExtensionFromFilePath(m_definition->file_path));
+            car_entity->AddTag("body");
+            auto create_part = [&](const char* name, const math::Vector3& position, const math::Vector3& scale)
+            {
+                Entity* part = World::CreateEntity();
+                part->SetObjectName(name);
+                part->SetParent(car_entity);
+                part->SetPositionLocal(position);
+                part->SetScaleLocal(scale);
+                Render* render = part->AddComponent<Render>();
+                render->SetMesh(MeshType::Cube);
+                render->SetDefaultMaterial();
+            };
+            create_part("generic_lower_body", math::Vector3(0.0f, -preset.height * 0.18f, 0.0f), math::Vector3(preset.width * 0.92f, preset.height * 0.38f, preset.length * 0.84f));
+            create_part("generic_cabin", math::Vector3(0.0f, preset.height * 0.22f, -preset.length * 0.08f), math::Vector3(preset.width * 0.68f, preset.height * 0.42f, preset.length * 0.48f));
+            create_part("generic_roof", math::Vector3(0.0f, preset.height * 0.48f, -preset.length * 0.08f), math::Vector3(preset.width * 0.72f, preset.height * 0.05f, preset.length * 0.52f));
+            return car_entity;
+        }
+
+        uint32_t mesh_flags  = Mesh::GetDefaultFlags();
+        mesh_flags          &= ~static_cast<uint32_t>(MeshFlags::PostProcessOptimize);
+        mesh_flags          &= ~static_cast<uint32_t>(MeshFlags::PostProcessGenerateLods);
+
+        std::shared_ptr<Mesh> mesh_car = ResourceCache::Load<Mesh>(m_definition->body_model, mesh_flags);
+        if (!mesh_car)
+        {
+            return nullptr;
+        }
+
+        Entity* mesh_root = mesh_car->GetRootEntity();
+        if (!mesh_root)
+        {
+            return nullptr;
+        }
+
+        // mesh root is shared via the resource cache, clone so every car instance gets its own hierarchy
+        // the root itself is transient so it never leaks into the world file on save
+        Entity* car_entity = mesh_root->Clone();
+        car_entity->SetActive(true);
+        mesh_root->SetActive(false);
+        mesh_root->SetTransient(true);
+
+        car_entity->SetObjectName(FileSystem::GetFileNameWithoutExtensionFromFilePath(m_definition->file_path));
+        car_entity->SetScale(m_definition->body_scale);
+        car_entity->AddTag("body");
+
+        // deactivate the baked in parts the definition hides, the spawned wheel entities replace them
+        {
+            std::vector<Entity*> descendants;
+            car_entity->GetDescendants(&descendants);
+
+            for (Entity* descendant : descendants)
+            {
+                std::string entity_name = to_lower_copy(descendant->GetObjectName());
+
+                bool is_excluded_part = false;
+                for (const std::string& part : m_definition->body_hide_parts)
+                {
+                    if (entity_name.find(to_lower_copy(part)) != std::string::npos)
+                    {
+                        is_excluded_part = true;
+                        break;
+                    }
+                }
+
+                if (is_excluded_part)
+                {
+                    descendant->SetActive(false);
+
+                    if (out_excluded_entities)
+                    {
+                        out_excluded_entities->push_back(descendant);
+                    }
+                }
+            }
+        }
+
+        // material presets
+        {
+            std::vector<Entity*> descendants;
+            car_entity->GetDescendants(&descendants);
+            CarMaterialClones material_clones;
+            auto clone_material =
+                [&](Render* render, const char* slot_name)
+                {
+                    return clone_car_material(
+                        car_entity,
+                        render,
+                        slot_name,
+                        material_clones
+                    );
+                };
+            for (Entity* descendant : descendants)
+            {
+                Render* render = descendant->GetComponent<Render>();
+                if (!render || !render->GetMaterial())
+                {
+                    continue;
+                }
+
+                const std::string context = get_material_context(descendant, render);
+                const CarMaterialSlot material_slot = resolve_car_material_slot(descendant, render);
+                if (material_slot == CarMaterialSlot::MainGlass && (contains(context, "object_58") || contains(context, "windshield")))
+                {
+                    m_window_entity = descendant;
+                }
+                if (!m_customize_materials)
+                {
+                    continue;
+                }
+
+                switch (material_slot)
+                {
+                    case CarMaterialSlot::BodyPaint:
+                    {
+                        if (std::shared_ptr<Material> material =
+                            clone_material(render, "body_paint"))
+                        {
+                            material->ApplyPaintPreset(m_paint_preset, m_paint_color, false);
+                        }
+                        break;
+                    }
+                    case CarMaterialSlot::CarbonTrim:
+                    {
+                        if (std::shared_ptr<Material> material =
+                            clone_material(render, "carbon_trim"))
+                        {
+                            material->ApplySurfacePreset(MaterialSurfacePreset::CarbonFiber, false);
+                        }
+                        break;
+                    }
+                    case CarMaterialSlot::TireRubber:
+                    {
+                        if (std::shared_ptr<Material> material =
+                            clone_material(render, "tire_rubber"))
+                        {
+                            material->ApplySurfacePreset(MaterialSurfacePreset::RubberTire, false);
+                        }
+                        break;
+                    }
+                    case CarMaterialSlot::RimMetal:
+                    {
+                        if (std::shared_ptr<Material> material =
+                            clone_material(render, "rim_metal"))
+                        {
+                            material->ApplySurfacePreset(MaterialSurfacePreset::Chrome, false);
+                        }
+                        break;
+                    }
+                    case CarMaterialSlot::HeadlightLens:
+                    {
+                        if (std::shared_ptr<Material> material =
+                            clone_material(render, "headlight_lens"))
+                        {
+                            material->ApplySurfacePreset(MaterialSurfacePreset::HeadlightLens, false);
+                        }
+                        break;
+                    }
+                    case CarMaterialSlot::TaillightLens:
+                    {
+                        if (std::shared_ptr<Material> material =
+                            clone_material(render, "taillight_lens"))
+                        {
+                            material->ApplySurfacePreset(MaterialSurfacePreset::TaillightLens, false);
+                        }
+                        break;
+                    }
+                    case CarMaterialSlot::MainGlass:
+                    {
+                        if (std::shared_ptr<Material> material =
+                            clone_material(render, "main_glass"))
+                        {
+                            // smoked engine covers use tinted glass, windshields and side glass stay clear
+                            const MaterialSurfacePreset glass_preset = contains(context, "engine")
+                                ? MaterialSurfacePreset::GlassTinted
+                                : MaterialSurfacePreset::GlassClear;
+                            material->ApplySurfacePreset(glass_preset, false);
+                        }
+
+                        if (contains(context, "object_58") || contains(context, "windshield"))
+                        {
+                            m_window_entity = descendant;
+                        }
+                        break;
+                    }
+                    case CarMaterialSlot::MirrorGlass:
+                    {
+                        if (std::shared_ptr<Material> material =
+                            clone_material(render, "mirror_glass"))
+                        {
+                            material->ApplySurfacePreset(MaterialSurfacePreset::Chrome, false);
+                        }
+                        break;
+                    }
+                    case CarMaterialSlot::EngineMetal:
+                    {
+                        if (std::shared_ptr<Material> material =
+                            clone_material(render, "engine_metal"))
+                        {
+                            material->ApplySurfacePreset(MaterialSurfacePreset::PolishedMetal, false);
+                        }
+                        break;
+                    }
+                    case CarMaterialSlot::BrakeDisc:
+                    {
+                        if (std::shared_ptr<Material> material =
+                            clone_material(render, "brake_disc"))
+                        {
+                            material->ApplySurfacePreset(MaterialSurfacePreset::BrakeDisc, false);
+                        }
+                        break;
+                    }
+                    case CarMaterialSlot::InteriorLeather:
+                    {
+                        if (std::shared_ptr<Material> material =
+                            clone_material(render, "interior_leather"))
+                        {
+                            material->ApplySurfacePreset(MaterialSurfacePreset::Leather, false);
+                        }
+                        break;
+                    }
+                    case CarMaterialSlot::BlackTrim:
+                    {
+                        if (std::shared_ptr<Material> material =
+                            clone_material(render, "black_trim"))
+                        {
+                            material->ApplySurfacePreset(MaterialSurfacePreset::BlackPlastic, false);
+                        }
+                        break;
+                    }
+                    case CarMaterialSlot::EmissiveRedLight:
+                    {
+                        if (std::shared_ptr<Material> material =
+                            clone_material(render, "emissive_red_light"))
+                        {
+                            material->ApplySurfacePreset(MaterialSurfacePreset::EmissiveRedLight, false);
+                        }
+                        break;
+                    }
+                    case CarMaterialSlot::EmissiveWhiteLight:
+                    {
+                        if (std::shared_ptr<Material> material =
+                            clone_material(render, "emissive_white_light"))
+                        {
+                            material->ApplySurfacePreset(MaterialSurfacePreset::EmissiveWhiteLight, false);
+                        }
+                        break;
+                    }
+                    case CarMaterialSlot::Unknown:
+                    default:
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        return car_entity;
+    }
+
+    Entity* Car::SpawnWheelBase()
+    {
+        if (!m_definition || m_definition->wheel_model.empty())
+        {
+            return nullptr;
+        }
+
+        uint32_t mesh_flags  = Mesh::GetDefaultFlags();
+        mesh_flags          &= ~static_cast<uint32_t>(MeshFlags::PostProcessOptimize);
+        mesh_flags          &= ~static_cast<uint32_t>(MeshFlags::PostProcessGenerateLods);
+
+        std::shared_ptr<Mesh> mesh = ResourceCache::Load<Mesh>(m_definition->wheel_model, mesh_flags);
+        if (!mesh)
+        {
+            return nullptr;
+        }
+
+        Entity* wheel_root = mesh->GetRootEntity();
+        if (!wheel_root)
+        {
+            return nullptr;
+        }
+
+        Entity* wheel_source = wheel_root->GetChildByIndex(0);
+        if (!wheel_source)
+        {
+            return nullptr;
+        }
+
+        // clone the cached wheel root because each car owns wheel transforms
+        Entity* wheel_base = wheel_source->Clone();
+        wheel_base->SetParent(nullptr);
+        wheel_base->SetActive(true);
+        wheel_root->SetActive(false);
+        wheel_root->SetTransient(true);
+
+        // wheel bounds must be measured at unit scale before absolute dimension scaling
+        wheel_base->SetScale(1.0f);
+
+        if (Render* render = wheel_base->GetComponent<Render>())
+        {
+            Material* material = render->GetMaterial();
+            if (!m_definition->wheel_albedo.empty())
+            {
+                material->SetTexture(MaterialTextureType::Color, m_definition->wheel_albedo);
+            }
+            if (!m_definition->wheel_metalness.empty())
+            {
+                material->SetTexture(MaterialTextureType::Metalness, m_definition->wheel_metalness);
+            }
+            if (!m_definition->wheel_normal.empty())
+            {
+                material->SetTexture(MaterialTextureType::Normal, m_definition->wheel_normal);
+            }
+            if (!m_definition->wheel_roughness.empty())
+            {
+                material->SetTexture(MaterialTextureType::Roughness, m_definition->wheel_roughness);
+            }
+            material->SetProperty(MaterialProperty::MotionBlurRadial, 1.0f);
+        }
+
+        return wheel_base;
+    }
+
+    void Car::CreateWheels(Entity* vehicle_ent, Physics* physics, const std::vector<Entity*>& baked_wheel_entities)
+    {
+        Entity* wheel_base = SpawnWheelBase();
+        if (!wheel_base)
+        {
+            return;
+        }
+
+        const ::car::car_preset& preset = m_definition->performance;
+        const float front_wheel_radius  = preset.front_wheel_radius > 0.0f ? preset.front_wheel_radius : 0.34f;
+        const float rear_wheel_radius   = preset.rear_wheel_radius  > 0.0f ? preset.rear_wheel_radius  : 0.35f;
+        const float front_wheel_width   = preset.front_wheel_width  > 0.0f ? preset.front_wheel_width  : 0.245f;
+        const float rear_wheel_width    = preset.rear_wheel_width   > 0.0f ? preset.rear_wheel_width   : 0.305f;
+        Entity* wheel_fl = wheel_base;
+        Entity* wheel_fr = wheel_base->Clone();
+        Entity* wheel_rl = wheel_base->Clone();
+        Entity* wheel_rr = wheel_base->Clone();
+
+        const float suspension_height   = physics->GetSuspensionHeight();
+        const float preset_wheelbase    = preset.wheelbase   > 0.0f ? preset.wheelbase   : 2.6f;
+        const float preset_track_front  = preset.track_front > 0.0f ? preset.track_front : 1.6f;
+        const float preset_track_rear   = preset.track_rear  > 0.0f ? preset.track_rear  : 1.6f;
+        const float front_z             = preset_wheelbase   * 0.5f;
+        const float rear_z              = -preset_wheelbase  * 0.5f;
+        const float half_track_front    = preset_track_front * 0.5f;
+        const float half_track_rear     = preset_track_rear  * 0.5f;
+        const float wheel_y             = -suspension_height;
+        struct WheelPlacement
+        {
+            math::Vector3 position;
+            float radius;
+        };
+        WheelPlacement placements[4] =
+        {
+            { math::Vector3(-half_track_front, wheel_y, front_z), front_wheel_radius },
+            { math::Vector3(half_track_front, wheel_y, front_z), front_wheel_radius },
+            { math::Vector3(-half_track_rear, wheel_y, rear_z), rear_wheel_radius },
+            { math::Vector3(half_track_rear, wheel_y, rear_z), rear_wheel_radius }
+        };
+        std::vector<WheelPlacement> measured_placements;
+        const math::Matrix vehicle_inverse = vehicle_ent->GetMatrix().Inverted();
+        for (Entity* baked : baked_wheel_entities)
+        {
+            if (to_lower_copy(baked->GetObjectName()).find("tire") == std::string::npos)
+            {
+                continue;
+            }
+            bool nested = false;
+            for (Entity* ancestor = baked->GetParent(); ancestor; ancestor = ancestor->GetParent())
+            {
+                if (to_lower_copy(ancestor->GetObjectName()).find("tire") != std::string::npos)
+                {
+                    nested = true;
+                    break;
+                }
+            }
+            if (nested)
+            {
+                continue;
+            }
+            math::BoundingBox bounds = math::BoundingBox::Zero;
+            std::vector<Entity*> parts = { baked };
+            baked->GetDescendants(&parts);
+            for (Entity* part : parts)
+            {
+                if (Render* render = part->GetComponent<Render>())
+                {
+                    const math::BoundingBox part_bounds = render->GetBoundingBoxMesh() * part->GetMatrix();
+                    if (bounds == math::BoundingBox::Zero)
+                    {
+                        bounds = part_bounds;
+                    }
+                    else
+                    {
+                        bounds.Merge(part_bounds);
+                    }
+                }
+            }
+            const math::Vector3 extents = bounds.GetExtents();
+            const float radius = std::max({ extents.x, extents.y, extents.z });
+            if (bounds != math::BoundingBox::Zero && extents.IsFinite() && std::isfinite(radius) && radius > 0.01f)
+            {
+                measured_placements.push_back({ vehicle_inverse * bounds.GetCenter(), radius });
+            }
+        }
+        if (measured_placements.size() == 4)
+        {
+            float axle_midpoint = 0.0f;
+            for (const WheelPlacement& placement : measured_placements)
+            {
+                axle_midpoint += placement.position.z;
+            }
+            axle_midpoint *= 0.25f;
+            for (const WheelPlacement& placement : measured_placements)
+            {
+                const int index = placement.position.z >= axle_midpoint ? (placement.position.x < 0.0f ? 0 : 1) : (placement.position.x < 0.0f ? 2 : 3);
+                placements[index] = placement;
+            }
+        }
+        physics->ScaleWheelEntityToDimensions(wheel_fl, placements[0].radius, front_wheel_width);
+        physics->ScaleWheelEntityToDimensions(wheel_fr, placements[1].radius, front_wheel_width);
+        physics->ScaleWheelEntityToDimensions(wheel_rl, placements[2].radius, rear_wheel_width);
+        physics->ScaleWheelEntityToDimensions(wheel_rr, placements[3].radius, rear_wheel_width);
+
+        // front left
+        wheel_fl->SetObjectName("wheel_front_left");
+        wheel_fl->SetParent(vehicle_ent);
+        wheel_fl->SetPositionLocal(placements[0].position);
+        tag_wheel(wheel_fl, true, true);
+
+        // front right
+        wheel_fr->SetObjectName("wheel_front_right");
+        wheel_fr->SetParent(vehicle_ent);
+        wheel_fr->SetPositionLocal(placements[1].position);
+        wheel_fr->SetRotationLocal(math::Quaternion::FromAxisAngle(math::Vector3::Up, math::pi));
+        tag_wheel(wheel_fr, true, false);
+
+        // rear left
+        wheel_rl->SetObjectName("wheel_rear_left");
+        wheel_rl->SetParent(vehicle_ent);
+        wheel_rl->SetPositionLocal(placements[2].position);
+        tag_wheel(wheel_rl, false, true);
+
+        // rear right
+        wheel_rr->SetObjectName("wheel_rear_right");
+        wheel_rr->SetParent(vehicle_ent);
+        wheel_rr->SetPositionLocal(placements[3].position);
+        wheel_rr->SetRotationLocal(math::Quaternion::FromAxisAngle(math::Vector3::Up, math::pi));
+        tag_wheel(wheel_rr, false, false);
+
+        physics->SetWheelEntity(WheelIndex::FrontLeft,  wheel_fl);
+        physics->SetWheelEntity(WheelIndex::FrontRight, wheel_fr);
+        physics->SetWheelEntity(WheelIndex::RearLeft,   wheel_rl);
+        physics->SetWheelEntity(WheelIndex::RearRight,  wheel_rr);
+    }
+
+    void Car::CreatePropWheels(Entity* root, const std::vector<Entity*>& baked_wheel_entities)
+    {
+        if (!m_definition)
+        {
+            return;
+        }
+
+        // where the nose of the body model points along its local z axis
+        const float forward_z = m_definition->body_forward_z < 0.0f ? -1.0f : 1.0f;
+
+        // measure the baked in tires so the spawned wheels land exactly in the wheel arches
+        struct WheelSpot
+        {
+            math::Vector3 position_local;
+            float radius   = 0.0f;
+            bool  is_front = false;
+        };
+        std::vector<WheelSpot> spots;
+
+        const math::Matrix root_inverse = root->GetMatrix().Inverted();
+        for (Entity* baked : baked_wheel_entities)
+        {
+            if (to_lower_copy(baked->GetObjectName()).find("tire") == std::string::npos)
+            {
+                continue;
+            }
+
+            // the hide filter also catches the children of a tire group (tread, rim, disc),
+            // measure only the top level group so each wheel yields exactly one spot
+            bool is_nested_tire_part = false;
+            for (Entity* ancestor = baked->GetParent(); ancestor; ancestor = ancestor->GetParent())
+            {
+                if (to_lower_copy(ancestor->GetObjectName()).find("tire") != std::string::npos)
+                {
+                    is_nested_tire_part = true;
+                    break;
+                }
+            }
+            if (is_nested_tire_part)
+            {
+                continue;
+            }
+
+            // bounds come from the mesh bbox and entity matrix directly, Render::UpdateAabb falls back to identity on inactive entities
+            math::BoundingBox aabb = math::BoundingBox::Zero;
+            std::vector<Entity*> parts;
+            parts.push_back(baked);
+            baked->GetDescendants(&parts);
+            for (Entity* part : parts)
+            {
+                if (Render* render = part->GetComponent<Render>())
+                {
+                    const math::BoundingBox part_aabb = render->GetBoundingBoxMesh() * part->GetMatrix();
+                    if (aabb == math::BoundingBox::Zero)
+                    {
+                        aabb = part_aabb;
+                    }
+                    else
+                    {
+                        aabb.Merge(part_aabb);
+                    }
+                }
+            }
+
+            const math::Vector3 extents = aabb.GetExtents();
+            if (aabb == math::BoundingBox::Zero || !extents.IsFinite() || extents.y <= 0.01f)
+            {
+                continue;
+            }
+
+            WheelSpot spot;
+            spot.position_local = root_inverse * aabb.GetCenter();
+            spot.radius         = extents.y; // half the tire height is its radius
+            spots.push_back(spot);
+        }
+
+        // wheels only car or unexpected model, fall back to the performance geometry
+        if (spots.size() != 4)
+        {
+            if (!spots.empty())
+            {
+                SP_LOG_WARNING("expected 4 tire groups but measured %zu, using preset geometry for the wheels", spots.size());
+            }
+            spots.clear();
+            const ::car::car_preset& performance = m_definition->performance;
+            const float wheelbase   = performance.wheelbase   > 0.0f ? performance.wheelbase   : 2.6f;
+            const float track_front = performance.track_front > 0.0f ? performance.track_front : 1.6f;
+            const float track_rear  = performance.track_rear  > 0.0f ? performance.track_rear  : 1.6f;
+            const float front_z     = wheelbase * 0.5f * forward_z;
+            const float rear_z      = -front_z;
+            spots.push_back({ math::Vector3(-track_front * 0.5f, 0.0f, front_z), 0.34f });
+            spots.push_back({ math::Vector3( track_front * 0.5f, 0.0f, front_z), 0.34f });
+            spots.push_back({ math::Vector3(-track_rear  * 0.5f, 0.0f, rear_z),  0.34f });
+            spots.push_back({ math::Vector3( track_rear  * 0.5f, 0.0f, rear_z),  0.34f });
+        }
+
+        // the pair on the nose side of the axle midpoint is the front axle
+        float mid_z = 0.0f;
+        for (const WheelSpot& spot : spots)
+        {
+            mid_z += spot.position_local.z;
+        }
+        mid_z /= static_cast<float>(spots.size());
+        for (WheelSpot& spot : spots)
+        {
+            spot.is_front = (spot.position_local.z - mid_z) * forward_z > 0.0f;
+        }
+
+        Entity* wheel_base = SpawnWheelBase();
+        if (!wheel_base)
+        {
+            return;
+        }
+
+        for (size_t i = 0; i < spots.size(); i++)
+        {
+            const WheelSpot& spot = spots[i];
+            Entity* wheel         = (i == spots.size() - 1) ? wheel_base : wheel_base->Clone();
+
+            scale_wheel_to_radius(wheel, spot.radius);
+            wheel->SetParent(root);
+            wheel->SetPositionLocal(spot.position_local);
+
+            // rims face outward, the outboard side follows the x sign
+            const bool is_left = (spot.position_local.x * forward_z) < 0.0f;
+            if (spot.position_local.x > 0.0f)
+            {
+                wheel->SetRotationLocal(math::Quaternion::FromAxisAngle(math::Vector3::Up, math::pi));
+            }
+
+            std::string name = "wheel_";
+            name += spot.is_front ? "front_" : "rear_";
+            name += is_left ? "left" : "right";
+            wheel->SetObjectName(name);
+            tag_wheel(wheel, spot.is_front, is_left);
+        }
+    }
+
+    void Car::CreateAudioSources(Entity* parent_entity)
+    {
+        std::call_once(audio_synthesizers_once, []()
+        {
+            engine_sound::initialize(48000);
+            tire_squeal_sound::initialize(48000);
+        });
+
+        // engine start (still uses a sample for the starter motor sound)
+        {
+            Entity* sound = World::CreateEntity();
+            sound->SetObjectName("sound_start");
+            sound->SetParent(parent_entity);
+
+            AudioSource* audio_source = sound->AddComponent<AudioSource>();
+            audio_source->SetAudioClip("project\\music\\car_start.wav");
+            audio_source->SetLoop(false);
+            audio_source->SetPlayOnStart(false);
+        }
+
+        // engine sound (synthesized)
+        {
+            Entity* sound = World::CreateEntity();
+            sound->SetObjectName("sound_engine");
+            sound->SetParent(parent_entity);
+
+            AudioSource* audio_source = sound->AddComponent<AudioSource>();
+            audio_source->SetLoop(true);
+            audio_source->SetPlayOnStart(false);
+            audio_source->SetVolume(0.8f);
+        }
+
+        // door open/close
+        {
+            Entity* sound = World::CreateEntity();
+            sound->SetObjectName("sound_door");
+            sound->SetParent(parent_entity);
+
+            AudioSource* audio_source = sound->AddComponent<AudioSource>();
+            audio_source->SetAudioClip("project\\music\\car_door.wav");
+            audio_source->SetLoop(false);
+            audio_source->SetPlayOnStart(false);
+        }
+
+        // tire squeal (synthesized)
+        {
+            Entity* sound = World::CreateEntity();
+            sound->SetObjectName("sound_tire_squeal");
+            sound->SetParent(parent_entity);
+
+            AudioSource* audio_source = sound->AddComponent<AudioSource>();
+            audio_source->SetLoop(true);
+            audio_source->SetPlayOnStart(false);
+            audio_source->SetVolume(0.0f);
+        }
+    }
+
+    void Car::Tick()
+    {
+        if (!m_body_entity)
+        {
+            return;
+        }
+
+        // lazy camera finding - needed because parallel entity loading means camera might not exist during prefab creation
+        // prefer the player flycam (camera under a controller body) over cinematic sequence cameras
+        if (m_camera_follows && !default_camera)
+        {
+            std::vector<Entity*> root_entities;
+            World::GetRootEntities(root_entities);
+
+            Entity* fallback = nullptr;
+            for (Entity* root_entity : root_entities)
+            {
+                std::vector<Entity*> descendants;
+                root_entity->GetDescendants(&descendants);
+                descendants.push_back(root_entity);
+
+                for (Entity* entity : descendants)
+                {
+                    if (!entity->GetComponent<Camera>())
+                    {
+                        continue;
+                    }
+
+                    Entity* parent = entity->GetParent() ? entity->GetParent() : entity;
+                    if (Physics* physics = parent->GetComponent<Physics>())
+                    {
+                        if (physics->GetBodyType() == BodyType::Controller)
+                        {
+                            default_camera = parent;
+                            break;
+                        }
+                    }
+
+                    if (!fallback)
+                    {
+                        fallback = parent;
+                    }
+                }
+
+                if (default_camera)
+                {
+                    break;
+                }
+            }
+
+            if (!default_camera)
+            {
+                default_camera = fallback;
+            }
+        }
+
+        // auto-enter car when play mode starts if camera_follows is enabled
+        {
+            bool is_playing = Engine::IsFlagSet(EngineMode::Playing);
+            if (!is_playing && m_is_occupied)
+            {
+                Exit(false);
+            }
+
+            const bool play_started = is_playing && !m_was_playing;
+            Entity* owner =
+                m_vehicle_entity ? m_vehicle_entity->GetParent() : nullptr;
+            if (
+                play_started &&
+                owner &&
+                owner->GetComponent<CarReset>()
+            )
+            {
+                ResetToSpawn();
+            }
+
+            // only take the wheel if the player is standing next to the car, otherwise they stay on foot
+            if (
+                m_camera_follows &&
+                !m_is_occupied &&
+                play_started &&
+                IsPlayerInRange()
+            )
+            {
+                Enter();
+            }
+            m_was_playing = is_playing;
+        }
+
+        TickInput();
+        TickSounds();
+        TickChaseCamera();
+        TickEnterExit();
+        TickViewSwitch();
+        TickVisualization();
+
+        if (m_is_occupied)
+        {
+            Physics* hud_physics = m_vehicle_entity ? m_vehicle_entity->GetComponent<Physics>() : nullptr;
+            car_hud::draw_driver_hud(hud_physics);
+            if (m_show_telemetry)
+            {
+                car_hud::draw_telemetry_window(this, hud_physics, &m_show_telemetry);
+            }
+            car_hud::draw_car_bench_window(this, hud_physics);
+        }
+
+        // osd controls cheat sheet, top left as tidy rows, each row reads action then keyboard or mouse then gamepad
+        if (m_is_occupied)
+        {
+            Renderer::DrawString(
+                "CONTROLS   key / mouse  >  gamepad\n"
+                "Gas\tUp\tR2\n"
+                "Brake\tDown\tL2\n"
+                "Steer\tL/R\tLStick\n"
+                "Hbrk\tSpace\tCircle\n"
+                "Shift\tPgUp/Dn\tL1/R1\n"
+                "Light\tL\tDpadUp\n"
+                "View\tV\tTri\n"
+                "ReCam\tC\tR3\n"
+                "Look\tRClk\tRStick\n"
+                "Reset\tR\tCross\n"
+                "Exit\tE\tSquare",
+                math::Vector2(0.006f, 0.03f));
+        }
+    }
+
+    void Car::TickInput()
+    {
+        if (!m_vehicle_entity || !m_is_occupied)
+        {
+            return;
+        }
+
+        Physics* physics = m_vehicle_entity->GetComponent<Physics>();
+        if (!physics || !Engine::IsFlagSet(EngineMode::Playing))
+        {
+            return;
+        }
+
+        bool is_gamepad_connected = Input::IsGamepadConnected();
+        float dt = static_cast<float>(Timer::GetDeltaTimeSec());
+
+        // an external controller owns the pedals when flagged, so keyboard zeros do not overwrite it
+        float throttle  = physics->GetVehicleThrottle();
+        float brake     = physics->GetVehicleBrake();
+        float steering  = physics->GetVehicleSteering();
+        float handbrake = physics->GetVehicleHandbrake();
+        if (!m_externally_controlled)
+        {
+            throttle = 0.0f;
+            if (is_gamepad_connected)
+            {
+                throttle = Input::GetGamepadTriggerRight();
+            }
+            if (Input::GetKey(KeyCode::Arrow_Up))
+            {
+                throttle = 1.0f;
+            }
+
+            brake = 0.0f;
+            if (is_gamepad_connected)
+            {
+                brake = Input::GetGamepadTriggerLeft();
+            }
+            if (Input::GetKey(KeyCode::Arrow_Down))
+            {
+                brake = 1.0f;
+            }
+
+            steering = 0.0f;
+            if (is_gamepad_connected)
+            {
+                steering = Input::GetGamepadThumbStickLeft().x;
+            }
+            if (Input::GetKey(KeyCode::Arrow_Left))
+            {
+                steering = -1.0f;
+            }
+            if (Input::GetKey(KeyCode::Arrow_Right))
+            {
+                steering = 1.0f;
+            }
+
+            handbrake = (Input::GetKey(KeyCode::Space) || Input::GetKey(KeyCode::Button_East)) ? 1.0f : 0.0f;
+
+            physics->SetVehicleThrottle(throttle);
+            physics->SetVehicleBrake(brake);
+            physics->SetVehicleSteering(steering);
+            physics->SetVehicleHandbrake(handbrake);
+        }
+
+        // camera orbit (mouse right_click drag and or gamepad right thumb stick)
+        if (m_current_view == CarView::Chase)
+        {
+            // mouse right_click drag
+            {
+                bool rmb_down      = Input::GetKeyDown(KeyCode::Click_Right);
+                bool rmb_held      = Input::GetKey(KeyCode::Click_Right);
+                bool mouse_in_view = Input::GetMouseIsInViewport();
+
+                if (rmb_down && mouse_in_view && !m_orbit_mouse_active)
+                {
+                    m_orbit_mouse_active        = true;
+                    m_orbit_mouse_last_position = Input::GetMousePosition();
+                    if (!Window::IsFullScreen())
+                    {
+                        Input::SetMouseCursorVisible(false);
+                    }
+                }
+                else if (m_orbit_mouse_active && !rmb_held)
+                {
+                    Input::SetMousePosition(m_orbit_mouse_last_position);
+                    if (!Window::IsFullScreen())
+                    {
+                        Input::SetMouseCursorVisible(true);
+                    }
+                    m_orbit_mouse_active = false;
+                }
+
+                if (m_orbit_mouse_active)
+                {
+                    math::Vector2 mouse_delta = Input::GetMouseDelta();
+                    AddCameraOrbitYaw(mouse_delta.x * mouse_orbit_sensitivity_yaw);
+                    AddCameraOrbitPitch(mouse_delta.y * mouse_orbit_sensitivity_pitch);
+                }
+            }
+
+            // gamepad right thumb stick
+            if (is_gamepad_connected)
+            {
+                math::Vector2 right_stick = Input::GetGamepadThumbStickRight();
+
+                if (fabsf(right_stick.x) > 0.3f)
+                {
+                    AddCameraOrbitYaw(right_stick.x * orbit_bias_speed * dt);
+                }
+
+                if (fabsf(right_stick.y) > 0.3f)
+                {
+                    AddCameraOrbitPitch(right_stick.y * orbit_bias_speed * dt);
+                }
+            }
+
+            // manual recenter, keyboard c or right stick click
+            if (Input::GetKeyDown(KeyCode::C) || Input::GetKeyDown(KeyCode::Right_Stick))
+            {
+                m_chase_camera.yaw_bias   = 0.0f;
+                m_chase_camera.pitch_bias = 0.0f;
+            }
+        }
+
+        // reset to spawn
+        if (!m_externally_controlled && (Input::GetKeyDown(KeyCode::R) || Input::GetKeyDown(KeyCode::Button_South)))
+        {
+            ResetToSpawn();
+        }
+
+        // toggle telemetry window
+        if (Input::GetKeyDown(KeyCode::F3))
+        {
+            m_show_telemetry = !m_show_telemetry;
+        }
+
+        // manual gear shifting (gran turismo style: L1/pgdn down, R1/pgup up)
+        if (!m_externally_controlled && (Input::GetKeyDown(KeyCode::Left_Shoulder) || Input::GetKeyDown(KeyCode::Page_Down)))
+        {
+            physics->ShiftDown();
+        }
+        if (!m_externally_controlled && (Input::GetKeyDown(KeyCode::Right_Shoulder) || Input::GetKeyDown(KeyCode::Page_Up)))
+        {
+            physics->ShiftUp();
+        }
+
+        // haptic feedback
+        if (is_gamepad_connected)
+        {
+            float left_motor  = 0.0f;
+            float right_motor = 0.0f;
+
+            float max_slip_ratio = 0.0f;
+            float max_slip_angle = 0.0f;
+            for (int i = 0; i < 4; i++)
+            {
+                WheelIndex wheel = static_cast<WheelIndex>(i);
+                max_slip_ratio = std::max(max_slip_ratio, fabsf(physics->GetWheelSlipRatio(wheel)));
+                max_slip_angle = std::max(max_slip_angle, fabsf(physics->GetWheelSlipAngle(wheel)));
+            }
+
+            if (max_slip_ratio > 0.15f)
+            {
+                float slip_intensity = std::clamp((max_slip_ratio - 0.15f) * 1.5f, 0.0f, 1.0f);
+                left_motor += slip_intensity * 0.5f;
+            }
+
+            if (max_slip_angle > 0.15f)
+            {
+                float drift_intensity = std::clamp((max_slip_angle - 0.15f) * 2.0f, 0.0f, 1.0f);
+                left_motor  += drift_intensity * 0.3f;
+                right_motor += drift_intensity * 0.2f;
+            }
+
+            if (physics->IsAbsActiveAny())
+            {
+                static float abs_pulse = 0.0f;
+                abs_pulse += dt * 25.0f;
+                float pulse_value = (sinf(abs_pulse * math::pi * 2.0f) + 1.0f) * 0.5f;
+                right_motor += pulse_value * 0.6f;
+                left_motor  += pulse_value * 0.3f;
+            }
+
+            if (brake > 0.8f && !physics->IsAbsActiveAny())
+            {
+                right_motor += (brake - 0.8f) * 0.4f;
+            }
+
+            left_motor  = std::clamp(left_motor, 0.0f, 1.0f);
+            right_motor = std::clamp(right_motor, 0.0f, 1.0f);
+            Input::GamepadVibrate(left_motor, right_motor);
+        }
+    }
+
+    void Car::TickSounds()
+    {
+        if (!m_vehicle_entity)
+        {
+            return;
+        }
+
+        Entity* sound_engine_entity = m_vehicle_entity->GetChildByName("sound_engine");
+        Entity* sound_tire_entity   = m_vehicle_entity->GetChildByName("sound_tire_squeal");
+        AudioSource* audio_engine   = sound_engine_entity ? sound_engine_entity->GetComponent<AudioSource>() : nullptr;
+        AudioSource* audio_tire     = sound_tire_entity ? sound_tire_entity->GetComponent<AudioSource>() : nullptr;
+        Physics* physics            = m_vehicle_entity->GetComponent<Physics>();
+
+        // engine sound
+        if (m_is_occupied && physics && audio_engine)
+        {
+            float engine_rpm  = physics->GetEngineRPM();
+            float throttle    = physics->GetVehicleThrottle();
+            float boost       = physics->GetBoostPressure();
+            float idle_rpm    = physics->GetIdleRPM();
+            float redline_rpm = physics->GetRedlineRPM();
+            float rpm_normalized = std::clamp((engine_rpm - idle_rpm) / (redline_rpm - idle_rpm), 0.0f, 1.0f);
+            car::Simulation* simulation = physics->GetVehicleSimulation();
+
+            if (
+                !audio_engine->IsSynthesisMode() ||
+                !audio_engine->IsPlaying()
+            )
+            {
+                const car::car_preset& preset = simulation->get_spec();
+                engine_sound::engine_config config;
+                config.cylinder_count = preset.engine_sound_cylinders;
+                config.bank_count = preset.engine_sound_banks;
+                config.idle_rpm = preset.engine_idle_rpm;
+                config.redline_rpm = preset.engine_redline_rpm;
+                config.max_rpm = preset.engine_max_rpm;
+                config.displacement_l = preset.engine_displacement_l;
+                config.bore_mm = preset.engine_bore_mm;
+                config.stroke_mm = preset.engine_stroke_mm;
+                config.compression_ratio = preset.engine_compression_ratio;
+                config.primary_length_m = preset.exhaust_primary_length_m;
+                config.collector_length_m = preset.exhaust_collector_length_m;
+                for (int i = 0; i < car::max_engine_cylinders; i++)
+                {
+                    config.firing_order[i] = static_cast<int>(
+                        preset.engine_firing_order[i]
+                    );
+                    config.cylinder_bank[i] = static_cast<int>(
+                        preset.engine_cylinder_bank[i]
+                    );
+                }
+                engine_sound::configure(config);
+
+                if (!audio_engine->IsSynthesisMode())
+                {
+                    audio_engine->SetSynthesisMode(
+                        true,
+                        [](
+                            float* buffer,
+                            int num_samples
+                        )
+                        {
+                            engine_sound::generate(
+                                buffer,
+                                num_samples,
+                                true
+                            );
+                        }
+                    );
+                }
+            }
+
+            if (!audio_engine->IsPlaying())
+            {
+                audio_engine->StartSynthesis();
+            }
+
+            const car::car_preset& preset = simulation->get_spec();
+            float torque_normalized = std::clamp(
+                simulation->get_engine_output_torque() /
+                std::max(preset.engine_peak_torque, 1.0f),
+                0.0f,
+                1.5f
+            );
+            float load = std::clamp(
+                std::max(throttle * 0.15f, torque_normalized),
+                0.0f,
+                1.0f
+            );
+            engine_sound::set_parameters(
+                engine_rpm,
+                throttle,
+                load,
+                boost,
+                simulation->get_engine_rotation(),
+                torque_normalized,
+                simulation->get_rev_limiter_active()
+            );
+
+            // the synth no longer reaches the rail on every firing pulse, so the level it delivers is
+            // lower by about the distortion that used to be filling the gap
+            const float engine_volume_scale = 0.45f;
+            float volume = (0.6f + rpm_normalized * 0.3f + throttle * 0.1f) * engine_volume_scale;
+            audio_engine->SetVolume(volume);
+        }
+        else if (!m_is_occupied && audio_engine && audio_engine->IsPlaying())
+        {
+            audio_engine->StopSynthesis();
+        }
+
+        // tire squeal
+        if (audio_tire && physics)
+        {
+            float speed_kmh = physics->GetLinearVelocity().Length() * 3.6f;
+
+            float max_slip_angle = 0.0f;
+            float max_slip_ratio = 0.0f;
+            int grounded_count   = 0;
+
+            for (int i = 0; i < 4; i++)
+            {
+                WheelIndex wheel = static_cast<WheelIndex>(i);
+                if (physics->IsWheelGrounded(wheel))
+                {
+                    grounded_count++;
+                    max_slip_angle = std::max(max_slip_angle, fabsf(physics->GetWheelSlipAngle(wheel)));
+                    max_slip_ratio = std::max(max_slip_ratio, fabsf(physics->GetWheelSlipRatio(wheel)));
+                }
+            }
+
+            const float slip_angle_threshold = 0.35f;
+            const float slip_ratio_threshold = 0.28f;
+            const float min_speed_for_squeal = 20.0f;
+
+            float target_intensity = 0.0f;
+            if (speed_kmh > min_speed_for_squeal && grounded_count > 0)
+            {
+                float slip_angle_excess = max_slip_angle - slip_angle_threshold;
+                float slip_ratio_excess = max_slip_ratio - slip_ratio_threshold;
+
+                if (slip_angle_excess > 0.0f || slip_ratio_excess > 0.0f)
+                {
+                    float slip_angle_intensity = std::clamp(slip_angle_excess * 1.5f, 0.0f, 1.0f);
+                    float slip_ratio_intensity = std::clamp(slip_ratio_excess * 1.8f, 0.0f, 1.0f);
+                    target_intensity = std::max(slip_angle_intensity, slip_ratio_intensity);
+                }
+            }
+
+            // smooth the intensity to avoid abrupt changes
+            float fade_rate = (target_intensity > m_tire_squeal_volume) ? 0.04f : 0.025f;
+            m_tire_squeal_volume += (target_intensity - m_tire_squeal_volume) * fade_rate;
+
+            // feed parameters into the synthesizer
+            float speed_normalized = std::clamp(speed_kmh / 200.0f, 0.0f, 1.0f);
+            tire_squeal_sound::set_parameters(m_tire_squeal_volume, speed_normalized);
+
+            if (m_tire_squeal_volume > 0.02f)
+            {
+                if (!audio_tire->IsSynthesisMode())
+                {
+                    audio_tire->SetSynthesisMode(true, [](float* buffer, int num_samples)
+                    {
+                        tire_squeal_sound::generate(buffer, num_samples, true);
+                    });
+                }
+
+                if (!audio_tire->IsPlaying())
+                {
+                    audio_tire->StartSynthesis();
+                }
+
+                const float max_volume = 0.25f;
+                audio_tire->SetVolume(m_tire_squeal_volume * max_volume);
+            }
+            else
+            {
+                m_tire_squeal_volume = 0.0f;
+                if (audio_tire->IsPlaying())
+                {
+                    audio_tire->StopSynthesis();
+                }
+            }
+        }
+    }
+
+    void Car::TickChaseCamera()
+    {
+        if (!m_is_occupied || m_current_view != CarView::Chase || !m_vehicle_entity || !default_camera)
+        {
+            return;
+        }
+
+        Entity* camera = default_camera->GetChildByName("component_camera");
+        if (!camera)
+        {
+            camera = m_vehicle_entity->GetChildByName("component_camera");
+            if (!camera)
+            {
+                camera = m_body_entity->GetChildByName("component_camera");
+            }
+            if (camera)
+            {
+                camera->SetParent(default_camera);
+                m_chase_camera.initialized = false;
+            }
+        }
+
+        if (!camera)
+        {
+            return;
+        }
+
+        Physics* car_physics = m_vehicle_entity->GetComponent<Physics>();
+        float dt = static_cast<float>(Timer::GetDeltaTimeSec());
+
+        math::Vector3 car_position = m_vehicle_entity->GetPosition();
+        math::Vector3 car_forward  = m_vehicle_entity->GetForward();
+        math::Vector3 car_right    = m_vehicle_entity->GetRight();
+        math::Vector3 car_velocity = car_physics ? car_physics->GetLinearVelocity() : math::Vector3::Zero;
+        float car_speed = car_velocity.Length();
+
+        float target_yaw = atan2f(car_forward.x, car_forward.z);
+
+        float target_speed_factor = std::clamp(car_speed / chase_speed_reference, 0.0f, 1.0f);
+        m_chase_camera.speed_factor += (target_speed_factor - m_chase_camera.speed_factor) * 
+            std::min(1.0f, chase_speed_smoothing * dt);
+
+        float dynamic_distance = chase_distance_base - 
+            (chase_distance_base - chase_distance_min) * m_chase_camera.speed_factor;
+        float dynamic_height = chase_height_base - 
+            (chase_height_base - chase_height_min) * m_chase_camera.speed_factor;
+
+        if (!m_chase_camera.initialized)
+        {
+            m_chase_camera.yaw          = target_yaw;
+            m_chase_camera.yaw_bias     = 0.0f;
+            m_chase_camera.pitch_bias   = 0.0f;
+            m_chase_camera.speed_factor = target_speed_factor;
+            m_chase_camera.position     = car_position - math::Vector3(sinf(target_yaw), 0.0f, cosf(target_yaw)) * dynamic_distance
+                                        + math::Vector3::Up * dynamic_height;
+            m_chase_camera.velocity     = math::Vector3::Zero;
+            m_chase_camera.initialized  = true;
+        }
+
+        float rotation_speed = chase_rotation_smoothing * (1.0f + m_chase_camera.speed_factor * 0.5f);
+        m_chase_camera.yaw = LerpAngle(m_chase_camera.yaw, target_yaw, 1.0f - expf(-rotation_speed * dt));
+
+        float effective_yaw   = m_chase_camera.yaw + m_chase_camera.yaw_bias;
+        float effective_pitch = m_chase_camera.pitch_bias;
+
+        float horizontal_scale = cosf(effective_pitch);
+        float vertical_offset  = sinf(effective_pitch) * dynamic_distance;
+
+        math::Vector3 offset_direction = math::Vector3(sinf(effective_yaw), 0.0f, cosf(effective_yaw));
+        math::Vector3 target_position  = car_position 
+                                       - offset_direction * dynamic_distance * horizontal_scale
+                                       + math::Vector3::Up * (dynamic_height + vertical_offset);
+
+        float slip_intensity = 0.0f;
+        if (car_physics)
+        {
+            for (uint32_t i = 0; i < 4; i++)
+            {
+                WheelIndex wheel = static_cast<WheelIndex>(i);
+                float slip_angle = fabsf(car_physics->GetWheelSlipAngle(wheel));
+                float slip_ratio = fabsf(car_physics->GetWheelSlipRatio(wheel));
+                slip_intensity = std::max(slip_intensity, std::max(slip_angle * 0.9f, slip_ratio * 0.7f));
+            }
+            slip_intensity = std::clamp(slip_intensity, 0.0f, 1.0f);
+        }
+
+        float shake_phase = static_cast<float>(Timer::GetTimeSec()) * (16.0f + m_chase_camera.speed_factor * 16.0f);
+        float shake_strength = slip_intensity * 0.055f + m_chase_camera.speed_factor * 0.01f;
+        target_position += car_right * sinf(shake_phase) * shake_strength;
+        target_position += math::Vector3::Up * cosf(shake_phase * 1.37f) * shake_strength * 0.55f;
+
+        float position_smooth = chase_position_smoothing * (1.0f - m_chase_camera.speed_factor * 0.3f);
+        m_chase_camera.position = SmoothDamp(m_chase_camera.position, target_position, 
+                                             m_chase_camera.velocity, position_smooth, dt);
+
+        math::Vector3 velocity_xz = math::Vector3(car_velocity.x, 0.0f, car_velocity.z);
+        float velocity_xz_len = velocity_xz.Length();
+        math::Vector3 look_ahead = math::Vector3::Zero;
+        if (velocity_xz_len > 2.0f)
+        {
+            look_ahead = (velocity_xz / velocity_xz_len) * chase_look_ahead_amount * m_chase_camera.speed_factor;
+        }
+        math::Vector3 look_at = car_position + math::Vector3::Up * chase_look_offset_up + look_ahead;
+
+        camera->SetPosition(m_chase_camera.position);
+        if (Camera* camera_component = camera->GetComponent<Camera>())
+        {
+            float fov = 90.0f + m_chase_camera.speed_factor * 5.0f + slip_intensity * 1.5f;
+            camera_component->SetFovHorizontalDeg(fov);
+        }
+
+        math::Vector3 look_direction = (look_at - m_chase_camera.position).Normalized();
+        camera->SetRotation(math::Quaternion::FromLookRotation(look_direction, math::Vector3::Up));
+    }
+
+    void Car::TickEnterExit()
+    {
+        if (
+            !Engine::IsFlagSet(EngineMode::Playing) ||
+            !m_is_drivable ||
+            m_externally_controlled
+        )
+        {
+            return;
+        }
+
+        // keyboard: E, gamepad: west button (X on xbox, square on playstation)
+        if (Input::GetKeyDown(KeyCode::E) || Input::GetKeyDown(KeyCode::Button_West))
+        {
+            if (m_is_occupied)
+            {
+                // don't allow exit if car is moving too fast
+                const float max_exit_speed_kmh = 5.0f;
+                if (m_vehicle_entity)
+                {
+                    if (Physics* physics = m_vehicle_entity->GetComponent<Physics>())
+                    {
+                        float speed_kmh = physics->GetLinearVelocity().Length() * 3.6f;
+                        if (speed_kmh > max_exit_speed_kmh)
+                        {
+                            return;
+                        }
+                    }
+                }
+
+                Exit();
+            }
+            else if (IsPlayerInRange())
+            {
+                Enter();
+            }
+        }
+    }
+
+    void Car::TickViewSwitch()
+    {
+        if (!m_is_occupied)
+        {
+            return;
+        }
+
+        // triangle for view change (gran turismo style)
+        if (Input::GetKeyDown(KeyCode::V) || Input::GetKeyDown(KeyCode::Button_North))
+        {
+            CycleView();
+        }
+    }
+
+}

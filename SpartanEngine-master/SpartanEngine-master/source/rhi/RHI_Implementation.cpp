@@ -1,0 +1,55 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES ==================
+#include "pch.h"
+#include "RHI_Implementation.h"
+SP_WARNINGS_OFF
+#include <SDL3/SDL_video.h>
+SP_WARNINGS_ON
+//=============================
+
+//= NAMESPACES =====
+using namespace std;
+//==================
+
+namespace spartan
+{
+    // api specific, RHI_Implementation.cpp is the single api selection point that fans out the active rhi at compile time
+#if defined(API_GRAPHICS_D3D12)
+    RHI_Api_Type  RHI_Context::api_type                    = RHI_Api_Type::D3d12;
+    const char*   RHI_Context::api_type_str                = "D3D12";
+    ID3D12Device* RHI_Context::device                      = nullptr;
+    uint32_t      RHI_Context::sdl_window_flags            = 0;
+    bool          RHI_Context::supports_imgui_multi_viewport = false;
+#elif defined(API_GRAPHICS_VULKAN)
+    RHI_Api_Type     RHI_Context::api_type                    = RHI_Api_Type::Vulkan;
+    const char*      RHI_Context::api_type_str                = "Vulkan";
+    VkInstance       RHI_Context::instance                    = nullptr;
+    VkPhysicalDevice RHI_Context::device_physical             = nullptr;
+    VkDevice         RHI_Context::device                      = nullptr;
+    uint32_t         RHI_Context::sdl_window_flags            = SDL_WINDOW_VULKAN;
+    bool             RHI_Context::supports_imgui_multi_viewport = true;
+#endif
+
+    // api agnostic
+    const char* RHI_Context::api_version_cstr;
+}

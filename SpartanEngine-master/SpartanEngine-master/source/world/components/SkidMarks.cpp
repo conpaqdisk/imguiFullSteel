@@ -1,0 +1,395 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES ==============================
+#include "pch.h"
+#include "SkidMarks.h"
+#include "Physics.h"
+#include "Render.h"
+#include "../Entity.h"
+#include "../World.h"
+#include "../../core/Engine.h"
+#include "../../geometry/Mesh.h"
+#include "../../math/Vector2.h"
+#include "../../rendering/Material.h"
+#include "../../rendering/Color.h"
+#include "../../rendering/GeometryBuffer.h"
+#include "../../resource/ResourceCache.h"
+#include "../../rhi/RHI_Texture.h"
+#include "../../file_system/FileSystem.h"
+SP_WARNINGS_OFF
+#include "../../io/pugixml.hpp"
+SP_WARNINGS_ON
+//=========================================
+
+//= NAMESPACES ===============
+using namespace std;
+using namespace spartan::math;
+//============================
+
+namespace spartan
+{
+    // half-size of the bounding box anchor, keeps the ribbons from ever being frustum culled
+    static const float aabb_extent = 5000.0f;
+
+    // eased 0..1 ramp, removes the visible line where a linear gradient would start
+    static float smooth_fade(float t)
+    {
+        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        return t * t * (3.0f - 2.0f * t);
+    }
+
+    SkidMarks::SkidMarks(Entity* entity) : Component(entity)
+    {
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_slip_threshold, float);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_min_segment_distance, float);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_max_segments, uint32_t);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_opacity, float);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_z_offset, float);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_uv_tiling, float);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_fade_distance, float);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_center_smoothing, float);
+    }
+
+    SkidMarks::~SkidMarks()
+    {
+
+    }
+
+    void SkidMarks::Tick()
+    {
+        // editor idle must not spawn trail entities from settle slip
+        if (!Engine::IsFlagSet(EngineMode::Playing) || Engine::IsFlagSet(EngineMode::Paused))
+        {
+            return;
+        }
+
+        if (!m_physics)
+        {
+            m_physics = GetEntity()->GetComponent<Physics>();
+        }
+
+        if (!m_physics || m_physics->GetBodyType() != BodyType::Vehicle)
+        {
+            return;
+        }
+
+        // the car lateral axis gives a stable strip width direction, free of per-segment contact jitter
+        Vector3 car_right = GetEntity()->GetRight();
+
+        // once a strip is going, keep it alive down to a lower threshold so it does not fragment into
+        // many short strips that each pop in and out, which is what kills the fade
+        float end_threshold = m_slip_threshold * 0.6f;
+
+        for (int i = 0; i < 4; i++)
+        {
+            WheelTrail& trail   = m_trails[i];
+            WheelIndex wheel    = static_cast<WheelIndex>(i);
+            bool grounded       = m_physics->IsWheelGrounded(wheel);
+            float slip          = m_physics->GetWheelSlipMagnitude(wheel);
+            bool skidding       = trail.active ? (slip >= end_threshold) : (slip >= m_slip_threshold);
+
+            // not skidding, fade out the tail and stop the strip so the next one starts fresh
+            if (!grounded || !skidding)
+            {
+                if (trail.active)
+                {
+                    FadeStripEnd(trail);
+                }
+                trail.active     = false;
+                trail.has_smooth = false;
+                continue;
+            }
+
+            // create trail meshes only when a tire actually starts skidding
+            if (!m_initialized)
+            {
+                EnsureInitialized();
+            }
+
+            Vector3 normal  = m_physics->GetWheelContactNormal(wheel);
+            Vector3 contact = m_physics->GetWheelContactPoint(wheel);
+
+            // placed under the hub projected onto the contact plane, the sweep contact jitters laterally and zigzags the mark
+            Vector3 ground_point = contact;
+            if (Entity* wheel_entity = m_physics->GetWheelEntity(wheel))
+            {
+                Vector3 hub  = wheel_entity->GetPosition();
+                ground_point = hub - normal * Vector3::Dot(hub - contact, normal);
+            }
+
+            if (!trail.has_smooth)
+            {
+                trail.smooth_center = ground_point;
+                trail.has_smooth    = true;
+            }
+            else
+            {
+                trail.smooth_center = Vector3::Lerp(trail.smooth_center, ground_point, m_center_smoothing);
+            }
+
+            // strip width comes straight from the physical tire width defined on the car, never hardcoded here
+            float half_width = m_physics->GetWheelWidth(wheel) * 0.5f;
+            if (half_width <= 0.0f)
+            {
+                continue;
+            }
+
+            // width runs along the tire axle, projected onto the ground plane
+            Vector3 right = car_right - normal * Vector3::Dot(car_right, normal);
+            if (right.Length() < 0.0001f)
+            {
+                continue;
+            }
+            right.Normalize();
+
+            // start (or restart) a strip, no quad is laid until the wheel has moved
+            if (!trail.active)
+            {
+                trail.active        = true;
+                trail.has_edge      = false;
+                trail.strip_index++;
+                // each wheel and each successive pass sits at a slightly different height so stacked marks do not z-fight
+                trail.height_offset = m_z_offset + i * 0.0012f + (trail.strip_index % 6) * 0.0025f;
+                trail.anchor_center = trail.smooth_center + normal * trail.height_offset;
+                trail.recent.clear();
+                continue;
+            }
+
+            Vector3 center = trail.smooth_center + normal * trail.height_offset;
+
+            float d = Vector3::Distance(center, trail.anchor_center);
+            if (d < m_min_segment_distance)
+            {
+                continue;
+            }
+
+            Vector3 travel = (center - trail.anchor_center) / d;
+
+            // a fresh strip starts as a single point, the first cross section has zero width
+            if (!trail.has_edge)
+            {
+                trail.u_accum    = 0.0f;
+                trail.edge_left  = trail.anchor_center;
+                trail.edge_right = trail.anchor_center;
+                trail.has_edge   = true;
+            }
+
+            // taper the width up from the start point over the fade distance, a geometric fade in that does
+            // not rely on the texture alpha so it can never invert, the strip eases out of a point to full width
+            float w_b       = half_width * smooth_fade((trail.u_accum + d) / m_fade_distance);
+            Vector3 b_left  = center - right * w_b;
+            Vector3 b_right = center + right * w_b;
+            float u_a       = trail.u_accum * m_uv_tiling;
+            float u_b       = (trail.u_accum + d) * m_uv_tiling;
+
+            DepositQuad(trail, b_left, b_right, u_a, u_b, normal, travel);
+
+            // advance, the new edge becomes the start of the next quad for seamless continuity
+            trail.edge_left     = b_left;
+            trail.edge_right    = b_right;
+            trail.u_accum      += d;
+            trail.anchor_center = center;
+        }
+    }
+
+    void SkidMarks::EnsureInitialized()
+    {
+        m_initialized = true;
+        m_physics     = GetEntity()->GetComponent<Physics>();
+
+        CreateMaterial();
+
+        const char* names[4] = { "skidmarks_fl", "skidmarks_fr", "skidmarks_rl", "skidmarks_rr" };
+        for (int i = 0; i < 4; i++)
+        {
+            BuildTrailMesh(m_trails[i], names[i]);
+        }
+    }
+
+    void SkidMarks::BuildTrailMesh(WheelTrail& trail, const string& name)
+    {
+        trail.capacity_quads = m_max_segments;
+        trail.head_quad      = 0;
+
+        uint32_t quad_count   = trail.capacity_quads;
+        uint32_t vertex_count = quad_count * 4 + 2; // +2 anchors for a large, never-culled bounding box
+        uint32_t index_count  = quad_count * 6;
+
+        vector<RHI_Vertex_PosTexNorTan> vertices(vertex_count);
+        vector<uint32_t> indices(index_count);
+
+        // all quads start collapsed at the origin so nothing is visible until deposited
+        for (uint32_t q = 0; q < quad_count; q++)
+        {
+            uint32_t base = q * 4;
+            indices[q * 6 + 0] = base + 0;
+            indices[q * 6 + 1] = base + 2;
+            indices[q * 6 + 2] = base + 1;
+            indices[q * 6 + 3] = base + 1;
+            indices[q * 6 + 4] = base + 2;
+            indices[q * 6 + 5] = base + 3;
+        }
+
+        // anchors are never referenced by an index, they only stretch the bounding box
+        vertices[vertex_count - 2].set_position(Vector3( aabb_extent,  aabb_extent,  aabb_extent));
+        vertices[vertex_count - 1].set_position(Vector3(-aabb_extent, -aabb_extent, -aabb_extent));
+
+        trail.mesh = make_shared<Mesh>();
+        trail.mesh->SetObjectName(name);
+        trail.mesh->SetFlag(static_cast<uint32_t>(MeshFlags::PostProcessOptimize), false);
+        trail.mesh->SetFlag(static_cast<uint32_t>(MeshFlags::PostProcessNormalizeScale), false);
+        trail.mesh->AddGeometry(vertices, indices, false);
+        trail.mesh->CreateGpuBuffers();
+
+        // a standalone, identity-transform entity so world-space vertices are not transformed twice
+        trail.entity = World::CreateEntity();
+        trail.entity->SetObjectName(name);
+        trail.entity->SetTransient(true);
+
+        Render* render = trail.entity->AddComponent<Render>();
+        render->SetMesh(trail.mesh.get(), 0);
+        render->SetMaterial(m_material);
+        render->SetFlag(RenderFlags::CastsShadows, false);
+        render->SetFlag(RenderFlags::ExcludeFromRayTracing, true);
+
+        trail.global_vertex_offset = render->GetVertexOffset();
+    }
+
+    void SkidMarks::DepositQuad(WheelTrail& trail, const Vector3& bl, const Vector3& br, float u_a, float u_b, const Vector3& normal, const Vector3& tangent)
+    {
+        uint32_t slot   = trail.head_quad % trail.capacity_quads;
+        uint32_t offset = trail.global_vertex_offset + slot * 4;
+
+        // u tiles along travel, v spans the tire so the project texture reads as a tread
+        RecentQuad rq;
+        rq.slot     = slot;
+        rq.verts[0] = RHI_Vertex_PosTexNorTan(trail.edge_left,  Vector2(u_a, 0.0f), normal, tangent);
+        rq.verts[1] = RHI_Vertex_PosTexNorTan(trail.edge_right, Vector2(u_a, 1.0f), normal, tangent);
+        rq.verts[2] = RHI_Vertex_PosTexNorTan(bl,               Vector2(u_b, 0.0f), normal, tangent);
+        rq.verts[3] = RHI_Vertex_PosTexNorTan(br,               Vector2(u_b, 1.0f), normal, tangent);
+
+        GeometryBuffer::UpdateVertices(rq.verts, offset, 4);
+        trail.head_quad = (trail.head_quad + 1) % trail.capacity_quads;
+
+        // keep enough trailing quads to cover the fade distance, plus margin for larger segments
+        uint32_t tail_quads = static_cast<uint32_t>(m_fade_distance / m_min_segment_distance) + 3;
+        trail.recent.push_back(rq);
+        if (trail.recent.size() > tail_quads)
+        {
+            trail.recent.erase(trail.recent.begin());
+        }
+    }
+
+    void SkidMarks::FadeStripEnd(WheelTrail& trail)
+    {
+        if (trail.recent.empty())
+        {
+            return;
+        }
+
+        // the tail narrows to zero width so the strip eases away instead of ending on a full width cross section
+        float u_end = trail.u_accum;
+        const int pairs[2][2] = { { 0, 1 }, { 2, 3 } };
+        for (RecentQuad& rq : trail.recent)
+        {
+            for (int p = 0; p < 2; p++)
+            {
+                RHI_Vertex_PosTexNorTan& a = rq.verts[pairs[p][0]];
+                RHI_Vertex_PosTexNorTan& b = rq.verts[pairs[p][1]];
+
+                Vector2 uv_a = a.get_uv();
+                float u_dist = (m_uv_tiling > 0.0f) ? (uv_a.x / m_uv_tiling) : u_end;
+                float factor = smooth_fade((u_end - u_dist) / m_fade_distance);
+
+                Vector3 pa = a.get_position();
+                Vector3 pb = b.get_position();
+                Vector3 c  = (pa + pb) * 0.5f;
+                a.set_position(c + (pa - c) * factor);
+                b.set_position(c + (pb - c) * factor);
+            }
+            uint32_t offset = trail.global_vertex_offset + rq.slot * 4;
+            GeometryBuffer::UpdateVertices(rq.verts, offset, 4);
+        }
+        trail.recent.clear();
+    }
+
+    void SkidMarks::CreateMaterial()
+    {
+        const string texture_path = "project/materials/skid_marks/albedo.png";
+        if (FileSystem::Exists(texture_path))
+        {
+            m_texture = ResourceCache::Load<RHI_Texture>(texture_path);
+        }
+
+        m_material = make_shared<Material>();
+        m_material->SetResourceName("skidmarks" + string(EXTENSION_MATERIAL));
+        if (m_texture)
+        {
+            m_material->SetColor(Color(1.0f, 1.0f, 1.0f, m_opacity));
+        }
+        else
+        {
+            m_material->SetColor(Color(0.05f, 0.05f, 0.05f, m_opacity));
+        }
+        m_material->SetProperty(MaterialProperty::Roughness, 0.95f);
+        m_material->SetProperty(MaterialProperty::Metalness, 0.0f);
+        m_material->SetProperty(MaterialProperty::CullMode, static_cast<float>(RHI_CullMode::None));
+        if (m_texture)
+        {
+            m_material->SetTexture(MaterialTextureType::Color, m_texture);
+        }
+    }
+
+    void SkidMarks::Remove()
+    {
+        for (int i = 0; i < 4; i++)
+        {
+            if (m_trails[i].entity)
+            {
+                World::RemoveEntity(m_trails[i].entity);
+                m_trails[i].entity = nullptr;
+            }
+        }
+    }
+
+    void SkidMarks::Save(pugi::xml_node& node)
+    {
+        node.append_attribute("slip_threshold")       = m_slip_threshold;
+        node.append_attribute("min_segment_distance") = m_min_segment_distance;
+        node.append_attribute("max_segments")         = m_max_segments;
+        node.append_attribute("opacity")              = m_opacity;
+        node.append_attribute("z_offset")             = m_z_offset;
+        node.append_attribute("uv_tiling")            = m_uv_tiling;
+        node.append_attribute("fade_distance")        = m_fade_distance;
+    }
+
+    void SkidMarks::Load(pugi::xml_node& node)
+    {
+        m_slip_threshold       = node.attribute("slip_threshold").as_float(0.35f);
+        m_min_segment_distance = node.attribute("min_segment_distance").as_float(0.05f);
+        m_max_segments         = node.attribute("max_segments").as_uint(512);
+        m_opacity              = node.attribute("opacity").as_float(0.75f);
+        m_z_offset             = node.attribute("z_offset").as_float(0.02f);
+        m_uv_tiling            = node.attribute("uv_tiling").as_float(2.0f);
+        m_fade_distance        = node.attribute("fade_distance").as_float(0.5f);
+    }
+}

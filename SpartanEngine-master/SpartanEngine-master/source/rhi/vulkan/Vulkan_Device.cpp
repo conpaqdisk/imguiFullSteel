@@ -1,0 +1,2984 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES ==========================
+#include "pch.h"
+#include <fstream>
+#include "../../profiling/Profiler.h"
+#include "../core/Debugging.h"
+#include "../rendering/Renderer.h"
+#include "../RHI_Texture.h"
+#include "../RHI_Device.h"
+#include "../RHI_Implementation.h"
+#include "../RHI_Queue.h"
+#include "../RHI_DescriptorSet.h"
+#include "../RHI_Sampler.h"
+#include "../RHI_Shader.h"
+#include "../RHI_DescriptorSetLayout.h"
+#include "../RHI_Pipeline.h"
+#include "../RHI_Buffer.h"
+#include "../RHI_CommandList.h"
+#include "../RHI_VendorTechnology.h"
+SP_WARNINGS_OFF
+#define VMA_IMPLEMENTATION
+#include "vk_mem_alloc.h"
+#ifdef _WIN32
+#include "nvsdk_ngx_vk.h"
+#endif
+SP_WARNINGS_ON
+#include <filesystem>
+//=====================================
+
+//= NAMESPACES ===============
+using namespace std;
+using namespace spartan::math;
+//============================
+
+namespace spartan
+{
+    namespace vulkan_version
+    {
+        uint32_t used      = 0;
+        string version_str = "N/A";
+
+        const char* to_c_str(uint32_t version)
+        {
+            version_str = to_string(VK_VERSION_MAJOR(version)) + "." +
+                          to_string(VK_VERSION_MINOR(version)) + "." +
+                          to_string(VK_VERSION_PATCH(version));
+
+            return version_str.c_str();
+        }
+    }
+
+    namespace
+    {
+        mutex mutex_allocation;
+        mutex mutex_deletion_queue;
+        struct DeletionEntry
+        {
+            RHI_Resource_Type type;
+            void*             resource;
+            uint64_t          frame;
+        };
+        vector<DeletionEntry> deletion_queue;
+        uint64_t              deletion_queue_frame = 0;
+
+        VkImageUsageFlags get_image_usage_flags(const RHI_Texture* texture)
+        {
+            VkImageUsageFlags flags = 0;
+
+            flags |= texture->IsSrv() ? VK_IMAGE_USAGE_SAMPLED_BIT                  : 0;
+            flags |= texture->IsUav() ? VK_IMAGE_USAGE_STORAGE_BIT                  : 0;
+            flags |= texture->IsVrs() ? VK_IMAGE_USAGE_SHADING_RATE_IMAGE_BIT_NV    : 0;
+            flags |= texture->IsDsv() ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0;
+            flags |= texture->IsRtv() ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT         : 0;
+
+            // If the texture has data, it will be staged, so it needs transfer bits
+            // If the texture participates in clear or blit operations, it needs transfer bits
+            if (texture->HasData() || (texture->GetFlags() & RHI_Texture_ClearBlit) != 0)
+            {
+                flags |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT; // source of a transfer command
+                flags |= VK_IMAGE_USAGE_TRANSFER_DST_BIT; // destination of a transfer command
+            }
+
+            return flags;
+        }
+
+        VkImageTiling get_format_tiling(const RHI_Texture* texture)
+        {
+            VkFormatProperties2 format_properties2 = {};
+            format_properties2.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
+
+            VkFormatProperties3 format_properties3 = {};
+            format_properties3.sType               = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3;
+            format_properties2.pNext               = &format_properties3;
+
+            VkFormatFeatureFlagBits2 format_flags  = 0;
+            format_flags                          |= texture->IsSrv() ? VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT : 0;
+            format_flags                          |= texture->IsUav() ? VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT : 0;
+            format_flags                          |= texture->IsRtv() ? VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT : 0;
+            format_flags                          |= texture->IsDsv() ? VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT : 0;
+            format_flags                          |= texture->IsVrs() ? VK_FORMAT_FEATURE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR : 0;
+
+            vkGetPhysicalDeviceFormatProperties2(RHI_Context::device_physical, vulkan_format[rhi_format_to_index(texture->GetFormat())], &format_properties2);
+
+            // check for optimal support
+            VkImageTiling tiling = VK_IMAGE_TILING_MAX_ENUM;
+            if (format_properties3.optimalTilingFeatures & format_flags)
+            {
+                tiling = VK_IMAGE_TILING_OPTIMAL;
+            }
+            // check for linear support
+            else if (format_properties3.linearTilingFeatures & format_flags)
+            {
+                tiling = VK_IMAGE_TILING_LINEAR;
+            }
+
+            SP_ASSERT_MSG(tiling != VK_IMAGE_TILING_MAX_ENUM, "The GPU doesn't support this format");
+            SP_ASSERT_MSG(tiling == VK_IMAGE_TILING_OPTIMAL,  "This format doesn't support optimal tiling, switch to a more efficient format");
+
+            return tiling;
+        }
+
+        VkApplicationInfo create_application_info()
+        {
+            VkApplicationInfo app_info  = {};
+            app_info.sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+            app_info.pApplicationName   = spartan::version::name;             // for gpu vendors to do game specific driver optimizations
+            app_info.pEngineName        = app_info.pApplicationName; // for gpu vendors to do engine specific driver optimizations
+            app_info.engineVersion      = VK_MAKE_VERSION(spartan::version::major, spartan::version::minor, spartan::version::patch);
+            app_info.applicationVersion = app_info.engineVersion;
+
+            // deduce api version to use based on the SDK and what the driver supports
+            {
+                uint32_t driver_version = 0;
+                {
+                    // per LunarG, if vkEnumerateInstanceVersion is not present, we are running on Vulkan 1.0
+                    // https://www.lunarg.com/wp-content/uploads/2019/02/Vulkan-1.1-Compatibility-Statement_01_19.pdf
+                    auto eiv = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceVersion"));
+
+                    if (eiv)
+                    {
+                        eiv(&driver_version);
+                    }
+                    else
+                    {
+                        driver_version = VK_API_VERSION_1_0;
+                    }
+                }
+
+                // choose the version which is supported by both the sdk and the driver
+                uint32_t sdk_version = VK_HEADER_VERSION_COMPLETE;
+                app_info.apiVersion  = min(sdk_version, driver_version);
+
+                // save the api version we ended up using
+                vulkan_version::used          = app_info.apiVersion;
+                RHI_Context::api_version_cstr = vulkan_version::to_c_str(vulkan_version::used);
+
+                // some checks
+                {
+                    // if the driver hasn't been updated to the latest sdk, log a warning
+                    if (sdk_version > driver_version)
+                    {
+                        const char* version_driver = vulkan_version::to_c_str(driver_version);
+                        const char* version_sdk    = vulkan_version::to_c_str(sdk_version);
+                        SP_LOG_WARNING("Using Vulkan %s, update drivers or wait for GPU vendor to support Vulkan %s, engine may still work", version_driver, version_sdk);
+                    }
+
+                    // ensure that the machine supports Vulkan 1.4 (as we are using extensions from it)
+                    uint32_t driver_major = VK_API_VERSION_MAJOR(driver_version);
+                    uint32_t driver_minor = VK_API_VERSION_MINOR(driver_version);
+                    uint32_t min_major    = VK_API_VERSION_MAJOR(VK_API_VERSION_1_4);
+                    uint32_t min_minor    = VK_API_VERSION_MINOR(VK_API_VERSION_1_4);
+                    if (driver_major < min_major || (driver_major == min_major && driver_minor < min_minor))
+                    { 
+                        SP_ERROR_WINDOW("Your GPU doesn't support Vulkan 1.4. Ensure you have the latest drivers.");
+                    }
+                }
+            }
+
+            return app_info;
+        }
+    }
+
+    namespace functions
+    {
+        // function pointers
+        PFN_vkCreateDebugUtilsMessengerEXT    create_messenger               = nullptr;
+        PFN_vkDestroyDebugUtilsMessengerEXT   destroy_messenger              = nullptr;
+        PFN_vkSetDebugUtilsObjectTagEXT       set_object_tag                 = nullptr;
+        PFN_vkSetDebugUtilsObjectNameEXT      set_object_name                = nullptr;
+        PFN_vkCmdBeginDebugUtilsLabelEXT      marker_begin                   = nullptr;
+        PFN_vkCmdEndDebugUtilsLabelEXT        marker_end                     = nullptr;
+        PFN_vkCmdSetFragmentShadingRateKHR    set_fragment_shading_rate      = nullptr;
+        PFN_vkGetBufferDeviceAddress          get_buffer_device_address      = nullptr;
+        PFN_vkDestroyAccelerationStructureKHR destroy_acceleration_structure = nullptr;
+        PFN_vkCmdDrawMeshTasksIndirectEXT     draw_mesh_tasks_indirect       = nullptr;
+
+        void load(void** out_func, const char* name)
+        {
+            *out_func = reinterpret_cast<void*>(vkGetInstanceProcAddr(static_cast<VkInstance>(RHI_Context::instance), name));
+            if (!*out_func)
+            {
+                SP_LOG_ERROR("Failed to get function pointer for %s", name);
+            }
+        }
+
+        void load_device(void** out_func, const char* name)
+        {
+            *out_func = reinterpret_cast<void*>(vkGetDeviceProcAddr(static_cast<VkDevice>(RHI_Context::device), name));
+            if (!*out_func)
+            {
+                SP_LOG_ERROR("Failed to get device function pointer for %s", name);
+            }
+        }
+    
+        void get_pointers_from_gpu_driver()
+        {
+            // debug utils
+            {
+                if (Debugging::IsValidationLayerEnabled())
+                {
+                    load(reinterpret_cast<void**>(&create_messenger), "vkCreateDebugUtilsMessengerEXT");
+                    load(reinterpret_cast<void**>(&destroy_messenger), "vkDestroyDebugUtilsMessengerEXT");
+                    load(reinterpret_cast<void**>(&set_object_tag), "vkSetDebugUtilsObjectTagEXT");
+                    load(reinterpret_cast<void**>(&set_object_name), "vkSetDebugUtilsObjectNameEXT");
+                }
+    
+                if (Debugging::IsGpuMarkingEnabled())
+                {
+                    load(reinterpret_cast<void**>(&marker_begin), "vkCmdBeginDebugUtilsLabelEXT");
+                    load(reinterpret_cast<void**>(&marker_end), "vkCmdEndDebugUtilsLabelEXT");
+                }
+            }
+
+            // ray tracing
+            load(reinterpret_cast<void**>(&get_buffer_device_address), "vkGetBufferDeviceAddress");
+    
+            // fragment shading rate
+            load(reinterpret_cast<void**>(&set_fragment_shading_rate), "vkCmdSetFragmentShadingRateKHR");
+
+            // acceleration structure
+            load(reinterpret_cast<void**>(&destroy_acceleration_structure), "vkDestroyAccelerationStructureKHR");
+        }
+
+        void get_pointers_from_device()
+        {
+            if (RHI_Device::IsSupportedMeshShaders())
+            {
+                load_device(reinterpret_cast<void**>(&draw_mesh_tasks_indirect), "vkCmdDrawMeshTasksIndirectEXT");
+            }
+        }
+    }
+
+    namespace extensions
+    {
+        // hardware capability viewer: https://vulkan.gpuinfo.org/
+
+        vector<const char*> extensions_instance = {
+            "VK_KHR_surface",
+            "VK_KHR_win32_surface",
+            "VK_EXT_swapchain_colorspace",
+            // openxr requirements
+            "VK_KHR_external_memory_capabilities",
+            "VK_KHR_external_semaphore_capabilities",
+            "VK_KHR_external_fence_capabilities",
+            "VK_KHR_get_physical_device_properties2",
+        };
+        vector<const char*> extensions_device   = {
+            "VK_KHR_swapchain",
+            "VK_EXT_memory_budget",          // to obtain precise memory usage information from Vulkan Memory Allocator
+            "VK_KHR_fragment_shading_rate",
+            "VK_EXT_hdr_metadata",
+            "VK_KHR_robustness2",
+            "VK_KHR_synchronization2",
+            "VK_KHR_push_descriptor",
+            "VK_KHR_compute_shader_derivatives",
+            "VK_KHR_get_memory_requirements2",
+            "VK_EXT_mutable_descriptor_type", // added for XeSS mutable descriptor support
+            // openxr requirements
+            "VK_KHR_external_memory",
+            "VK_KHR_external_semaphore",
+            "VK_KHR_external_memory_win32",
+            "VK_KHR_external_semaphore_win32",
+            "VK_KHR_win32_keyed_mutex",
+            "VK_KHR_timeline_semaphore",
+            "VK_KHR_dedicated_allocation",
+            // ray tracing
+            "VK_KHR_acceleration_structure",
+            "VK_KHR_ray_tracing_pipeline",
+            "VK_KHR_deferred_host_operations",
+            "VK_KHR_ray_query",
+            "VK_KHR_ray_tracing_maintenance1",
+            // mesh shaders
+            VK_EXT_MESH_SHADER_EXTENSION_NAME
+        };
+        bool memory_priority_supported              = false;
+        bool memory_priority_enabled                = false;
+        bool pageable_device_local_memory_supported = false;
+
+        vector<const char*> get_extensions_device()
+        {
+            // enumerate all available device extensions once
+            uint32_t available_count = 0;
+            vkEnumerateDeviceExtensionProperties(RHI_Context::device_physical, nullptr, &available_count, nullptr);
+            vector<VkExtensionProperties> available(available_count);
+            vkEnumerateDeviceExtensionProperties(RHI_Context::device_physical, nullptr, &available_count, available.data());
+
+            // check each requested extension against the enumerated list
+            vector<const char*> extensions_supported;
+            for (const auto& requested : extensions_device)
+            {
+                const bool ray_tracing_extension = strcmp(requested, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) == 0 || strcmp(requested, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) == 0 || strcmp(requested, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) == 0 || strcmp(requested, VK_KHR_RAY_QUERY_EXTENSION_NAME) == 0 || strcmp(requested, VK_KHR_RAY_TRACING_MAINTENANCE_1_EXTENSION_NAME) == 0;
+                if (Debugging::IsRenderdocEnabled() && ray_tracing_extension)
+                {
+                    continue;
+                }
+
+                bool found = false;
+                for (const auto& ext : available)
+                {
+                    if (strcmp(requested, ext.extensionName) == 0)
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (found)
+                {
+                    extensions_supported.emplace_back(requested);
+                    memory_priority_supported              |= strcmp(requested, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) == 0;
+                    pageable_device_local_memory_supported |= strcmp(requested, VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME) == 0;
+                }
+                else
+                {
+                    SP_LOG_WARNING("Device extension \"%s\" is not supported", requested);
+                }
+            }
+
+            return extensions_supported;
+        }
+
+        vector<const char*> get_extensions_instance()
+        {
+            if (Debugging::IsValidationLayerEnabled())
+            {
+                extensions_instance.emplace_back("VK_EXT_debug_report");
+                extensions_instance.emplace_back("VK_EXT_debug_utils");
+                extensions_instance.emplace_back("VK_EXT_layer_settings");
+                extensions_instance.emplace_back("VK_EXT_validation_features");
+            }
+
+            // gpu markers (also uses debug utils, but it's already added above if validation is on)
+            if (Debugging::IsGpuMarkingEnabled() && !Debugging::IsValidationLayerEnabled())
+            {
+                extensions_instance.emplace_back("VK_EXT_debug_utils");
+            }
+
+            // enumerate all available instance extensions (loader + ICD)
+            uint32_t available_count = 0;
+            vkEnumerateInstanceExtensionProperties(nullptr, &available_count, nullptr);
+            vector<VkExtensionProperties> available(available_count);
+            vkEnumerateInstanceExtensionProperties(nullptr, &available_count, available.data());
+
+            // layer-provided extensions (e.g. VK_EXT_layer_settings, VK_EXT_validation_features) are only
+            // returned when enumerating with the layer name, not from the loader-level enumeration above
+            if (Debugging::IsValidationLayerEnabled())
+            {
+                uint32_t layer_ext_count = 0;
+                vkEnumerateInstanceExtensionProperties("VK_LAYER_KHRONOS_validation", &layer_ext_count, nullptr);
+                if (layer_ext_count > 0)
+                {
+                    vector<VkExtensionProperties> layer_exts(layer_ext_count);
+                    vkEnumerateInstanceExtensionProperties("VK_LAYER_KHRONOS_validation", &layer_ext_count, layer_exts.data());
+                    available.insert(available.end(), layer_exts.begin(), layer_exts.end());
+                }
+            }
+
+            // check each requested extension against the enumerated list
+            vector<const char*> extensions_supported;
+            for (const auto& requested : extensions_instance)
+            {
+                bool found = false;
+                for (const auto& ext : available)
+                {
+                    if (strcmp(requested, ext.extensionName) == 0)
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (found)
+                {
+                    extensions_supported.emplace_back(requested);
+                }
+                else
+                {
+                    SP_LOG_WARNING("Instance extension \"%s\" is not supported", requested);
+                }
+            }
+
+            return extensions_supported;
+        }
+    }
+
+#ifdef _WIN32
+    namespace ngx_dlss
+    {
+        wstring data_path;
+        const wchar_t* dll_dir = nullptr;
+        NVSDK_NGX_FeatureCommonInfo feature_info = {};
+        vector<string> instance_ext_store;
+        vector<string> device_ext_store;
+
+        bool already_requested(const vector<const char*>& list, const char* name)
+        {
+            for (const char* extension : list)
+            {
+                if (strcmp(extension, name) == 0)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        NVSDK_NGX_FeatureDiscoveryInfo make_discovery()
+        {
+            if (data_path.empty())
+            {
+                data_path = filesystem::path(FileSystem::GetExecutableDirectory()).wstring();
+                dll_dir   = data_path.c_str();
+                feature_info.PathListInfo.Path   = &dll_dir;
+                feature_info.PathListInfo.Length = 1;
+            }
+
+            NVSDK_NGX_FeatureDiscoveryInfo info = {};
+            info.SDKVersion = NVSDK_NGX_Version_API;
+            info.FeatureID  = NVSDK_NGX_Feature_SuperSampling;
+            info.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Project_Id;
+            info.Identifier.v.ProjectDesc.ProjectId     = RHI_VendorTechnology::dlss_project_id;
+            info.Identifier.v.ProjectDesc.EngineType    = NVSDK_NGX_ENGINE_TYPE_CUSTOM;
+            info.Identifier.v.ProjectDesc.EngineVersion = RHI_VendorTechnology::dlss_engine_version;
+            info.ApplicationDataPath = data_path.c_str();
+            info.FeatureInfo         = &feature_info;
+            return info;
+        }
+
+        void append_names(vector<const char*>& destination, vector<string>& store, VkExtensionProperties* props, uint32_t count)
+        {
+            store.clear();
+            for (uint32_t i = 0; i < count; i++)
+            {
+                if (!already_requested(destination, props[i].extensionName))
+                {
+                    store.emplace_back(props[i].extensionName);
+                }
+            }
+            for (const string& name : store)
+            {
+                destination.push_back(name.c_str());
+            }
+        }
+
+        void append_instance_extensions()
+        {
+            NVSDK_NGX_FeatureDiscoveryInfo info = make_discovery();
+            uint32_t count = 0;
+            VkExtensionProperties* props = nullptr;
+            NVSDK_NGX_Result result = NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements(&info, &count, &props);
+            if (NVSDK_NGX_FAILED(result))
+            {
+                SP_LOG_WARNING("DLSS instance extension query failed: 0x%x", static_cast<unsigned int>(result));
+                return;
+            }
+            if (!props || count == 0)
+            {
+                return;
+            }
+            append_names(extensions::extensions_instance, instance_ext_store, props, count);
+        }
+
+        void append_device_extensions()
+        {
+            NVSDK_NGX_FeatureDiscoveryInfo info = make_discovery();
+            uint32_t count = 0;
+            VkExtensionProperties* props = nullptr;
+            NVSDK_NGX_Result result = NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements(
+                RHI_Context::instance,
+                RHI_Context::device_physical,
+                &info,
+                &count,
+                &props
+            );
+            if (NVSDK_NGX_FAILED(result))
+            {
+                SP_LOG_WARNING("DLSS device extension query failed: 0x%x", static_cast<unsigned int>(result));
+                return;
+            }
+            if (props && count != 0)
+            {
+                append_names(extensions::extensions_device, device_ext_store, props, count);
+            }
+
+            NVSDK_NGX_FeatureRequirement requirement = {};
+            result = NVSDK_NGX_VULKAN_GetFeatureRequirements(
+                RHI_Context::instance,
+                RHI_Context::device_physical,
+                &info,
+                &requirement
+            );
+            if (NVSDK_NGX_FAILED(result))
+            {
+                SP_LOG_WARNING("DLSS feature requirements query failed: 0x%x", static_cast<unsigned int>(result));
+                return;
+            }
+            if (requirement.FeatureSupported != NVSDK_NGX_FeatureSupportResult_Supported)
+            {
+                SP_LOG_WARNING("DLSS feature requirements not met: 0x%x", static_cast<unsigned int>(requirement.FeatureSupported));
+            }
+        }
+    }
+#endif
+
+    namespace validation_layer
+    {
+        // layers configuration: https://vulkan.lunarg.com/doc/view/1.3.296.0/windows/layer_configuration.html
+
+        static const char* layer_name                           = "VK_LAYER_KHRONOS_validation";
+        static const VkBool32 setting_bool_true                 = VK_TRUE;
+        static const VkBool32 setting_enable_message_limit      = VK_TRUE;
+        static const uint32_t setting_duplicate_message_limit   = 10;
+        static const char* setting_debug_action[]               = { "VK_DBG_LAYER_ACTION_LOG_MSG" };
+        static const char* setting_report_flags[]               = { "info", "warn", "perf", "error", "debug" };
+        
+        static vector<VkLayerSettingEXT> settings_storage; // persistent storage for VkLayerSettingEXT
+        vector<VkLayerSettingEXT>& get_settings()
+        {
+            SP_ASSERT(Debugging::IsValidationLayerEnabled());
+        
+            // check layer availability
+            {
+                uint32_t layer_count;
+                vkEnumerateInstanceLayerProperties(&layer_count, nullptr);
+        
+                vector<VkLayerProperties> layers(layer_count);
+                vkEnumerateInstanceLayerProperties(&layer_count, layers.data());
+        
+                bool validation_layer_unavailable = true;
+                for (const VkLayerProperties& layer : layers)
+                {
+                    if (strcmp(layer_name, layer.layerName) == 0)
+                    {
+                        validation_layer_unavailable = false;
+                        break;
+                    }
+                }
+        
+                SP_ASSERT_MSG(!validation_layer_unavailable, "Please install the Vulkan SDK, ensure correct environment variables and restart your machine: https://vulkan.lunarg.com/sdk/home");
+            }
+
+            settings_storage =
+            {
+                { layer_name, "validate_core",                  VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &setting_bool_true },
+                { layer_name, "validate_sync",                  VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &setting_bool_true },
+                { layer_name, "validate_best_practices",        VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &setting_bool_true },
+                { layer_name, "validate_best_practices_amd",    VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &setting_bool_true },
+                { layer_name, "validate_best_practices_arm",    VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &setting_bool_true },
+                { layer_name, "validate_best_practices_img",    VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &setting_bool_true },
+                { layer_name, "validate_best_practices_nvidia", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &setting_bool_true },
+                { layer_name, "thread_safety",                  VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &setting_bool_true },
+                { layer_name, "debug_action",                   VK_LAYER_SETTING_TYPE_STRING_EXT, 1, setting_debug_action },
+                { layer_name, "report_flags",                   VK_LAYER_SETTING_TYPE_STRING_EXT, 5, setting_report_flags },
+                { layer_name, "enable_message_limit",           VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &setting_enable_message_limit },
+                { layer_name, "duplicate_message_limit",        VK_LAYER_SETTING_TYPE_UINT32_EXT, 1, &setting_duplicate_message_limit },
+            };
+
+            if (Debugging::IsGpuAssistedValidationEnabled())
+            {
+                settings_storage.push_back({ layer_name, "gpuav_enable", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &setting_bool_true });
+            }
+        
+            return settings_storage;
+        }
+
+        namespace logging
+        {
+            VkDebugUtilsMessengerEXT messenger;
+
+            // non-actionable warnings from third-party extensions and sdk best-practice heuristics that do not apply here
+            bool is_suppressed(const VkDebugUtilsMessengerCallbackDataEXT* data)
+            {
+                if (!data || !data->pMessage)
+                {
+                    return false;
+                }
+
+                const char* msg = data->pMessage;
+
+                // deprecated extensions required by openxr / xess
+                if (strstr(msg, "Attempting to enable deprecated extension"))
+                {
+                    return true;
+                }
+                if (strstr(msg, "intended to support D3D emulation layers"))
+                {
+                    return true;
+                }
+
+                // sub-allocation best-practice: would require a pool allocator for tiny resources
+                if (strstr(msg, "fully consumed by the"))
+                {
+                    return true;
+                }
+
+                // spir-v workgroup built-in deprecated in 1.6, requires newer dxc to emit LocalSizeId
+                if (strstr(msg, "Workgroup built-in"))
+                {
+                    return true;
+                }
+
+                // gpu-av instrumentation overhead warning (validation layer only, not a runtime issue)
+                if (strstr(msg, "very slow to compile"))
+                {
+                    return true;
+                }
+
+                // mutable descriptor type list count mismatch from xess descriptor pool creation
+                if (strstr(msg, "mutableDescriptorTypeListCount"))
+                {
+                    return true;
+                }
+
+                // forced feature enablement by the validation layer itself
+                if (strstr(msg, "Internal Warning: Forcing"))
+                {
+                    return true;
+                }
+
+                return false;
+            }
+
+            VKAPI_ATTR VkBool32 VKAPI_CALL log
+            (
+                VkDebugUtilsMessageSeverityFlagBitsEXT msg_severity,
+                VkDebugUtilsMessageTypeFlagsEXT msg_type,
+                const VkDebugUtilsMessengerCallbackDataEXT* p_callback_data,
+                void* p_user_data
+            )
+            {
+                if (is_suppressed(p_callback_data))
+                {
+                    return VK_FALSE;
+                }
+
+                if (/*(msg_severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT) ||*/ (msg_severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT))
+                {
+                    SP_LOG_INFO("Vulkan: %s", p_callback_data->pMessage);
+                }
+                else if (msg_severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
+                {
+                    SP_LOG_WARNING("Vulkan: %s", p_callback_data->pMessage);
+                }
+                else if (msg_severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
+                {
+                    SP_LOG_ERROR("Vulkan: %s", p_callback_data->pMessage);
+                }
+
+                return VK_FALSE;
+            }
+
+            void enable()
+            {
+                if (functions::create_messenger)
+                {
+                    VkDebugUtilsMessengerCreateInfoEXT create_info = {};
+                    create_info.sType                              = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+                    create_info.messageSeverity                    = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+                    create_info.messageType                        = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+                    create_info.pfnUserCallback                    = log;
+
+                    SP_ASSERT_VK(functions::create_messenger(RHI_Context::instance, &create_info, nullptr, &messenger));
+                }
+            }
+
+            void shutdown(VkInstance instance)
+            {
+                if (!functions::destroy_messenger)
+                {
+                    return;
+                }
+
+                functions::destroy_messenger(instance, messenger, nullptr);
+            }
+        }
+    }
+
+    namespace queues
+    {
+        void* graphics = nullptr;
+        void* compute  = nullptr;
+        void* copy     = nullptr;
+        void* present  = nullptr;
+
+        uint32_t index_graphics       = numeric_limits<uint32_t>::max();
+        uint32_t index_compute        = numeric_limits<uint32_t>::max();
+        uint32_t index_copy           = numeric_limits<uint32_t>::max();
+        uint32_t index_present        = numeric_limits<uint32_t>::max();
+        uint32_t local_index_present  = 0; // queue index within the present family
+        bool present_dedicated        = false;
+
+        array<shared_ptr<RHI_Queue>, static_cast<uint32_t>(RHI_Queue_Type::Max)> regular;
+
+        void destroy()
+        {
+            regular.fill(nullptr);
+        }
+
+        bool detect_queue_family_indices(VkPhysicalDevice physical_device)
+        {
+            uint32_t queue_family_count = 0;
+            vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, nullptr);
+
+            vector<VkQueueFamilyProperties> queue_families(queue_family_count);
+            vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, queue_families.data());
+
+            auto get_family_index = [&](VkQueueFlagBits flags, uint32_t* out_index, const set<uint32_t>& exclude_indices = {}) -> bool 
+            {
+                // dedicated first
+                for (uint32_t i = 0; i < queue_family_count; ++i) 
+                {
+                    if (exclude_indices.count(i))
+                    {
+                        continue;
+                    }
+                    const auto& props = queue_families[i];
+                    if ((props.queueFlags & flags) == flags) 
+                    { 
+                        // exact match for dedicated
+                        bool is_dedicated = true;
+                        if (flags == VK_QUEUE_COMPUTE_BIT)
+                        {
+                            is_dedicated  = !(props.queueFlags & VK_QUEUE_GRAPHICS_BIT);
+                        }
+                        if (flags == VK_QUEUE_TRANSFER_BIT)
+                        {
+                            is_dedicated = !(props.queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT));
+                        }
+                        if (is_dedicated) 
+                        {
+                            *out_index = i;
+                            return true;
+                        }
+                    }
+                }
+
+                // fallback to any supporting
+                for (uint32_t i = 0; i < queue_family_count; ++i) 
+                {
+                    if (exclude_indices.count(i))
+                    {
+                        continue;
+                    }
+                    if (queue_families[i].queueFlags & flags)
+                    {
+                        SP_LOG_WARNING("No dedicated queue family found for flags %u, using family %u instead.", flags, i);
+                        *out_index = i;
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            // graphics (no exclude, must support)
+            if (!get_family_index(VK_QUEUE_GRAPHICS_BIT, &index_graphics)) 
+            {
+                SP_LOG_ERROR("No graphics queue family.");
+                return false;
+            }
+
+            // compute (exclude graphics if possible)
+            set<uint32_t> exclude = {index_graphics};
+            if (!get_family_index(VK_QUEUE_COMPUTE_BIT, &index_compute, exclude)) 
+            {
+                if (!get_family_index(VK_QUEUE_COMPUTE_BIT, &index_compute)) 
+                { 
+                    // Fallback including graphics
+                    SP_LOG_ERROR("No compute queue family.");
+                    return false;
+                }
+                SP_LOG_INFO("Compute sharing graphics family %u.", index_graphics);
+            }
+
+            // copy (exclude graphics/compute if possible)
+            exclude = {index_graphics, index_compute};
+            if (!get_family_index(VK_QUEUE_TRANSFER_BIT, &index_copy, exclude)) 
+            {
+                if (!get_family_index(VK_QUEUE_TRANSFER_BIT, &index_copy)) 
+                {
+                    SP_LOG_ERROR("No copy queue family.");
+                    return false;
+                }
+                SP_LOG_INFO("Copy sharing family %u.", index_copy);
+            }
+
+            // present: prefer a second queue in the graphics family so present/vsync does not stall graphics
+            index_present       = index_graphics;
+            local_index_present = 0;
+            present_dedicated   = false;
+            if (queue_families[index_graphics].queueCount >= 2)
+            {
+                local_index_present = 1;
+                present_dedicated   = true;
+                SP_LOG_INFO("Dedicated present queue: graphics family %u, queue 1.", index_graphics);
+            }
+            else
+            {
+                SP_LOG_INFO("No dedicated present queue available, presenting on graphics.");
+            }
+
+            return true;
+        }
+
+    }
+
+    namespace vulkan_memory_allocator
+    {
+        mutex mutex_allocator;
+        VmaAllocator allocator;
+        unordered_map<void*, VmaAllocation> allocations;
+
+        void initialize()
+        {
+            VmaAllocatorCreateInfo allocator_info = {};
+            allocator_info.physicalDevice         = RHI_Context::device_physical;
+            allocator_info.device                 = RHI_Context::device;
+            allocator_info.instance               = RHI_Context::instance;
+            allocator_info.vulkanApiVersion       = vulkan_version::used;
+            allocator_info.flags                  = VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+            if (extensions::memory_priority_enabled)
+            {
+                allocator_info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT;
+            }
+            if (RHI_Device::IsSupportedRayTracing())
+            {
+                allocator_info.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+            }
+
+            SP_ASSERT_VK(vmaCreateAllocator(&allocator_info, &allocator));
+        }
+
+        void destroy()
+        {
+            SP_ASSERT(allocator != nullptr);
+            SP_ASSERT_MSG(allocations.empty(), "There are still allocations");
+            vmaDestroyAllocator(allocator);
+            allocator = nullptr;
+        }
+
+        void save_allocation(void* resource, VmaAllocation allocation)
+        {
+            SP_ASSERT(resource != nullptr);
+            lock_guard<mutex> lock(mutex_allocator);
+            allocations.emplace(resource, allocation);
+        }
+
+        void destroy_allocation(void* resource)
+        {
+            lock_guard<mutex> lock(mutex_allocator);
+            allocations.erase(resource);
+        }
+
+        VmaAllocation get_allocation_from_resource(void* resource)
+        {
+            lock_guard<mutex> lock(mutex_allocator);
+            auto it = allocations.find(resource);
+            return it != allocations.end() ? it->second : nullptr;
+        }
+    }
+
+    namespace descriptors
+    {
+        mutex descriptor_pipeline_mutex;
+        uint32_t allocated_descriptor_sets = 0;
+        vector<VkDescriptorPool> descriptor_pools;
+        VkPipelineCache pipeline_cache     = nullptr;
+
+        // cache
+        unordered_map<uint64_t, RHI_DescriptorSet> sets;
+        unordered_map<uint64_t, shared_ptr<RHI_DescriptorSetLayout>> layouts;
+        unordered_map<uint64_t, shared_ptr<RHI_Pipeline>> pipelines;
+        unordered_map<uint64_t, vector<RHI_Descriptor>> descriptor_cache;
+        atomic<uint64_t> current_frame = 0;
+
+        const string pipeline_cache_path = "pipeline_cache.bin";
+
+        void create_pipeline_cache()
+        {
+            VkPipelineCacheCreateInfo create_info = {};
+            create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+
+            // try to load a previously saved cache from disk
+            vector<uint8_t> cache_data;
+            {
+                ifstream file(pipeline_cache_path, ios::binary | ios::ate);
+                if (file.is_open())
+                {
+                    size_t size = static_cast<size_t>(file.tellg());
+                    if (size > 0)
+                    {
+                        cache_data.resize(size);
+                        file.seekg(0, ios::beg);
+                        file.read(reinterpret_cast<char*>(cache_data.data()), size);
+                    }
+                }
+            }
+
+            if (!cache_data.empty())
+            {
+                create_info.initialDataSize = cache_data.size();
+                create_info.pInitialData    = cache_data.data();
+            }
+
+            SP_ASSERT_VK(vkCreatePipelineCache(RHI_Context::device, &create_info, nullptr, &pipeline_cache));
+        }
+
+        void save_pipeline_cache()
+        {
+            if (!pipeline_cache)
+            {
+                return;
+            }
+
+            size_t data_size = 0;
+            SP_ASSERT_VK(vkGetPipelineCacheData(RHI_Context::device, pipeline_cache, &data_size, nullptr));
+
+            if (data_size > 0)
+            {
+                vector<uint8_t> data(data_size);
+                SP_ASSERT_VK(vkGetPipelineCacheData(RHI_Context::device, pipeline_cache, &data_size, data.data()));
+
+                ofstream file(pipeline_cache_path, ios::binary);
+                if (file.is_open())
+                {
+                    file.write(reinterpret_cast<const char*>(data.data()), data_size);
+                }
+            }
+        }
+
+        VkDescriptorPool create_descriptor_pool()
+        {
+            static array<VkDescriptorPoolSize, 7> pool_sizes =
+            {
+                VkDescriptorPoolSize{ VK_DESCRIPTOR_TYPE_SAMPLER,                    32 * rhi_max_descriptor_set_count },
+                VkDescriptorPoolSize{ VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,              rhi_max_array_size + 32 * rhi_max_descriptor_set_count },
+                VkDescriptorPoolSize{ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,              rhi_max_array_size * rhi_max_descriptor_set_count },
+                VkDescriptorPoolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             32 * rhi_max_descriptor_set_count },
+                VkDescriptorPoolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,     32 * rhi_max_descriptor_set_count },
+                VkDescriptorPoolSize{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,     32 * rhi_max_descriptor_set_count },
+                VkDescriptorPoolSize{ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 32 * rhi_max_descriptor_set_count }
+            };
+
+            VkDescriptorPoolCreateInfo pool_create_info = {};
+            pool_create_info.sType                      = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+            pool_create_info.flags                      = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT_EXT;
+            pool_create_info.poolSizeCount              = RHI_Device::IsSupportedRayTracing() ? static_cast<uint32_t>(pool_sizes.size()) : static_cast<uint32_t>(pool_sizes.size() - 1);
+            pool_create_info.pPoolSizes                 = pool_sizes.data();
+            pool_create_info.maxSets                    = rhi_max_descriptor_set_count;
+
+            VkDescriptorPool pool = nullptr;
+            SP_ASSERT_VK(vkCreateDescriptorPool(RHI_Context::device, &pool_create_info, nullptr, &pool));
+            return pool;
+        }
+
+        void create_pool()
+        {
+            descriptors::descriptor_pools.push_back(create_descriptor_pool());
+            Profiler::m_rhi_descriptor_set_count = 0;
+        }
+
+        void merge_descriptors(vector<RHI_Descriptor>& base_descriptors, const vector<RHI_Descriptor>& additional_descriptors)
+        {
+            for (const RHI_Descriptor& descriptor_additional : additional_descriptors)
+            {
+                bool updated_existing = false;
+                for (RHI_Descriptor& descriptor_base : base_descriptors)
+                {
+                    if (descriptor_base.slot == descriptor_additional.slot && descriptor_base.space == descriptor_additional.space)
+                    {
+                        descriptor_base.stage |= descriptor_additional.stage;
+                        descriptor_base.used  |= descriptor_additional.used;
+                        updated_existing = true;
+                        break;
+                    }
+                }
+
+                // if no updating took place, this is an additional shader only resource, add it
+                if (!updated_existing)
+                {
+                    base_descriptors.emplace_back(descriptor_additional);
+                }
+            }
+        }
+
+        void get_descriptors_from_pipeline_state(RHI_PipelineState& pipeline_state, RHI_Descriptor out_descriptors[256], size_t& out_count)
+        {
+            SP_ASSERT(pipeline_state.GetHash() != 0);
+
+            uint64_t pipeline_state_hash = pipeline_state.GetHash();
+            auto cached_descriptors_it = descriptor_cache.find(pipeline_state_hash);
+        
+            static RHI_Descriptor static_buffer[256];
+            size_t static_size = 0;
+        
+            if (cached_descriptors_it != descriptor_cache.end())
+            {
+                const auto& cached = cached_descriptors_it->second;
+                SP_ASSERT(cached.size() <= 256);
+        
+                for (size_t i = 0; i < cached.size(); ++i)
+                {
+                    static_buffer[i] = cached[i];
+                }
+                static_size = cached.size();
+            }
+            else
+            {
+                static_size = 0;
+        
+                auto merge_descriptors = [&](const vector<RHI_Descriptor>& src)
+                {
+                    for (const auto& d : src)
+                    {
+                        bool merged = false;
+                        for (size_t i = 0; i < static_size; ++i)
+                        {
+                            if (static_buffer[i].slot == d.slot && static_buffer[i].space == d.space)
+                            {
+                                static_buffer[i].stage |= d.stage;
+                                static_buffer[i].used  |= d.used;
+                                merged = true;
+                                break;
+                            }
+                        }
+
+                        if (!merged)
+                        {
+                            if (d.IsBindless())
+                            {
+                                continue;
+                            }
+                            SP_ASSERT(static_size < 256);
+                            static_buffer[static_size++] = d;
+                        }
+                    }
+                };
+        
+                if (pipeline_state.IsCompute())
+                {
+                    SP_ASSERT(pipeline_state.shaders[RHI_Shader_Type::Compute]->GetCompilationState() == RHI_ShaderCompilationState::Succeeded);
+                    merge_descriptors(pipeline_state.shaders[RHI_Shader_Type::Compute]->GetDescriptors());
+                }
+                else if (pipeline_state.IsGraphics())
+                {
+                    if (pipeline_state.HasMeshShaders())
+                    {
+                        SP_ASSERT(pipeline_state.shaders[RHI_Shader_Type::MeshShader]->GetCompilationState() == RHI_ShaderCompilationState::Succeeded);
+                        merge_descriptors(pipeline_state.shaders[RHI_Shader_Type::MeshShader]->GetDescriptors());
+                    }
+                    else
+                    {
+                        SP_ASSERT(pipeline_state.shaders[RHI_Shader_Type::Vertex]->GetCompilationState() == RHI_ShaderCompilationState::Succeeded);
+                        merge_descriptors(pipeline_state.shaders[RHI_Shader_Type::Vertex]->GetDescriptors());
+                    }
+
+                    if (pipeline_state.shaders[RHI_Shader_Type::Pixel])
+                    {
+                        merge_descriptors(pipeline_state.shaders[RHI_Shader_Type::Pixel]->GetDescriptors());
+                    }
+
+                    if (pipeline_state.shaders[RHI_Shader_Type::Hull])
+                    {
+                        merge_descriptors(pipeline_state.shaders[RHI_Shader_Type::Hull]->GetDescriptors());
+                    }
+
+                    if (pipeline_state.shaders[RHI_Shader_Type::Domain])
+                    {
+                        merge_descriptors(pipeline_state.shaders[RHI_Shader_Type::Domain]->GetDescriptors());
+                    }
+                }
+                else if (pipeline_state.IsRayTracing())
+                {
+                    SP_ASSERT(pipeline_state.shaders[RHI_Shader_Type::RayGeneration]->GetCompilationState() == RHI_ShaderCompilationState::Succeeded);
+                    merge_descriptors(pipeline_state.shaders[RHI_Shader_Type::RayGeneration]->GetDescriptors());
+
+                    if (pipeline_state.shaders[RHI_Shader_Type::RayMiss])
+                    {
+                        merge_descriptors(pipeline_state.shaders[RHI_Shader_Type::RayMiss]->GetDescriptors());
+                    }
+
+                    if (pipeline_state.shaders[RHI_Shader_Type::RayHit])
+                    {
+                        merge_descriptors(pipeline_state.shaders[RHI_Shader_Type::RayHit]->GetDescriptors());
+                    }
+                }
+        
+                // sort by slot
+                sort(static_buffer, static_buffer + static_size, [](const RHI_Descriptor& a, const RHI_Descriptor& b)
+                {
+                    return a.slot < b.slot;
+                });
+        
+                // cache as vector (first-time allocation unavoidable)
+                descriptor_cache[pipeline_state_hash] = vector<RHI_Descriptor>(static_buffer, static_buffer + static_size);
+            }
+        
+            // copy to output array
+            out_count = static_size;
+            for (size_t i = 0; i < static_size; ++i)
+            {
+                out_descriptors[i] = static_buffer[i];
+            }
+        }
+
+        shared_ptr<RHI_DescriptorSetLayout> get_or_create_descriptor_set_layout(RHI_PipelineState& pipeline_state)
+        {
+            // get descriptors from pipeline state
+            static RHI_Descriptor descriptors[256];
+            size_t descriptor_count = 0;
+            get_descriptors_from_pipeline_state(pipeline_state, descriptors, descriptor_count);
+
+            // compute a hash for the descriptors (only valid entries, including type to avoid collisions)
+            uint64_t hash = 0;
+            for (size_t i = 0; i < descriptor_count; ++i)
+            {
+                hash = rhi_hash_combine(hash, static_cast<uint64_t>(descriptors[i].slot));
+                hash = rhi_hash_combine(hash, static_cast<uint64_t>(descriptors[i].stage));
+                hash = rhi_hash_combine(hash, static_cast<uint64_t>(descriptors[i].type));
+            }
+
+            // search for a descriptor set layout which matches this hash
+            auto it     = layouts.find(hash);
+            // if there is no descriptor set layout for this particular hash, create one
+            if (it == layouts.end())
+            {
+                it = layouts.emplace(
+                    make_pair(hash, make_shared<RHI_DescriptorSetLayout>(descriptors, descriptor_count, pipeline_state.name))
+                ).first;
+            }
+            shared_ptr<RHI_DescriptorSetLayout> descriptor_set_layout = it->second;
+
+            return descriptor_set_layout;
+        }
+
+        namespace bindless
+        {
+            // resource configuration - defines how each bindless resource type is set up
+            struct ResourceConfig
+            {
+                VkDescriptorType descriptor_type;
+                uint32_t register_shift; // rhi_shader_register_shift_t or _s
+                uint32_t slot;           // hlsl register slot
+                uint32_t count;          // descriptor array count
+                const char* name;
+            };
+
+            // lookup table indexed by RHI_Device_Bindless_Resource
+            static const ResourceConfig configs[] =
+            {
+                { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  rhi_shader_register_shift_t, 15, rhi_max_array_size, "material_textures"   }, // MaterialTextures
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rhi_shader_register_shift_t, 16, 1,                  "material_parameters" }, // MaterialParameters
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rhi_shader_register_shift_t, 17, 1,                  "light_parameters"    }, // LightParameters
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rhi_shader_register_shift_t, 18, 1,                  "aabbs"               }, // Aabbs
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rhi_shader_register_shift_t, 19, 1,                  "draw_data"           }, // DrawData
+                { VK_DESCRIPTOR_TYPE_SAMPLER,        rhi_shader_register_shift_s, 0,  1,                  "samplers_comparison" }, // SamplersComparison
+                { VK_DESCRIPTOR_TYPE_SAMPLER,        rhi_shader_register_shift_s, 1,  8,                  "samplers_regular"    }, // SamplersRegular
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rhi_shader_register_shift_t, 20, 1,                  "geometry_vertices"   }, // GeometryVertices
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rhi_shader_register_shift_t, 22, 1,                  "geometry_indices"    }, // GeometryIndices
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rhi_shader_register_shift_t, 23, 1,                  "instances"           }, // Instances
+            };
+            static_assert(sizeof(configs) / sizeof(configs[0]) == static_cast<size_t>(RHI_Device_Bindless_Resource::Max), "config table size mismatch");
+
+            // storage
+            array<VkDescriptorSet, static_cast<uint32_t>(RHI_Device_Bindless_Resource::Max)> sets          = {};
+            array<VkDescriptorSetLayout, static_cast<uint32_t>(RHI_Device_Bindless_Resource::Max)> layouts = {};
+
+            uint32_t get_binding(RHI_Device_Bindless_Resource type)
+            {
+                const ResourceConfig& cfg = configs[static_cast<uint32_t>(type)];
+                return cfg.register_shift + cfg.slot;
+            }
+
+            void create_layout_and_set(RHI_Device_Bindless_Resource type)
+            {
+                uint32_t index              = static_cast<uint32_t>(type);
+                const ResourceConfig& cfg   = configs[index];
+                uint32_t binding            = cfg.register_shift + cfg.slot;
+
+                // layout
+                VkDescriptorSetLayoutBinding layout_binding = {};
+                layout_binding.binding                      = binding;
+                layout_binding.descriptorType               = cfg.descriptor_type;
+                layout_binding.descriptorCount              = cfg.count;
+                layout_binding.stageFlags                   = VK_SHADER_STAGE_VERTEX_BIT |
+                                                              VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                                                              VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT |
+                                                              VK_SHADER_STAGE_TASK_BIT_EXT |
+                                                              VK_SHADER_STAGE_MESH_BIT_EXT |
+                                                              VK_SHADER_STAGE_FRAGMENT_BIT |
+                                                              VK_SHADER_STAGE_COMPUTE_BIT |
+                                                              VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+                                                              VK_SHADER_STAGE_MISS_BIT_KHR |
+                                                              VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+
+                VkDescriptorBindingFlags binding_flags = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+
+                VkDescriptorSetLayoutBindingFlagsCreateInfo binding_flags_info = {};
+                binding_flags_info.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+                binding_flags_info.bindingCount  = 1;
+                binding_flags_info.pBindingFlags = &binding_flags;
+
+                VkDescriptorSetLayoutCreateInfo layout_info = {};
+                layout_info.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+                layout_info.bindingCount = 1;
+                layout_info.pBindings    = &layout_binding;
+                layout_info.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT_EXT;
+                layout_info.pNext        = &binding_flags_info;
+
+                SP_ASSERT_VK(vkCreateDescriptorSetLayout(RHI_Context::device, &layout_info, nullptr, &layouts[index]));
+                RHI_Device::SetResourceName(static_cast<void*>(layouts[index]), RHI_Resource_Type::DescriptorSetLayout, cfg.name);
+
+                // set
+                VkDescriptorSetVariableDescriptorCountAllocateInfoEXT count_info = {};
+                count_info.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO_EXT;
+                count_info.descriptorSetCount = 1;
+                count_info.pDescriptorCounts  = &cfg.count;
+
+                VkDescriptorSetAllocateInfo alloc_info = {};
+                alloc_info.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+                alloc_info.descriptorPool     = descriptors::descriptor_pools.front();
+                alloc_info.descriptorSetCount = 1;
+                alloc_info.pSetLayouts        = &layouts[index];
+                alloc_info.pNext              = &count_info;
+
+                SP_ASSERT_VK(vkAllocateDescriptorSets(RHI_Context::device, &alloc_info, &sets[index]));
+                RHI_Device::SetResourceName(static_cast<void*>(sets[index]), RHI_Resource_Type::DescriptorSet, cfg.name);
+            }
+
+            void initialize()
+            {
+                for (uint32_t i = 0; i < static_cast<uint32_t>(RHI_Device_Bindless_Resource::Max); i++)
+                {
+                    create_layout_and_set(static_cast<RHI_Device_Bindless_Resource>(i));
+                }
+            }
+
+            void update_textures(const array<RHI_Texture*, rhi_max_array_size>* textures)
+            {
+                const uint32_t index      = static_cast<uint32_t>(RHI_Device_Bindless_Resource::MaterialTextures);
+                const ResourceConfig& cfg = configs[index];
+
+                static thread_local vector<VkDescriptorImageInfo> image_infos;
+                image_infos.resize(cfg.count);
+
+                void* fallback = Renderer::GetStandardTexture(Renderer_StandardTexture::Checkerboard)->GetRhiSrv();
+
+                for (uint32_t i = 0; i < cfg.count; ++i)
+                {
+                    RHI_Texture* tex     = (*textures)[i];
+                    void* srv            = (tex && tex->GetRhiSrv()) ? tex->GetRhiSrv() : fallback;
+                    image_infos[i].imageView   = static_cast<VkImageView>(srv);
+                    image_infos[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                }
+
+                VkWriteDescriptorSet write = {};
+                write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                write.dstSet          = sets[index];
+                write.dstBinding      = get_binding(RHI_Device_Bindless_Resource::MaterialTextures);
+                write.dstArrayElement = 0;
+                write.descriptorType  = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                write.descriptorCount = cfg.count;
+                write.pImageInfo      = image_infos.data();
+
+                vkUpdateDescriptorSets(RHI_Context::device, 1, &write, 0, nullptr);
+            }
+
+            void update_samplers(RHI_Device_Bindless_Resource type, const shared_ptr<RHI_Sampler>* samplers, uint32_t count)
+            {
+                const uint32_t index = static_cast<uint32_t>(type);
+
+                // max sampler count is small enough for the stack
+                constexpr uint32_t max_samplers = 16;
+                SP_ASSERT(count <= max_samplers);
+                VkDescriptorImageInfo image_infos[max_samplers] = {};
+                for (uint32_t i = 0; i < count; ++i)
+                {
+                    image_infos[i].sampler = static_cast<VkSampler>(samplers[i]->GetRhiResource());
+                }
+
+                VkWriteDescriptorSet write = {};
+                write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                write.dstSet          = sets[index];
+                write.dstBinding      = get_binding(type);
+                write.dstArrayElement = 0;
+                write.descriptorType  = VK_DESCRIPTOR_TYPE_SAMPLER;
+                write.descriptorCount = count;
+                write.pImageInfo      = image_infos;
+
+                vkUpdateDescriptorSets(RHI_Context::device, 1, &write, 0, nullptr);
+            }
+
+            void update_buffer(RHI_Device_Bindless_Resource type, RHI_Buffer* buffer)
+            {
+                const uint32_t index = static_cast<uint32_t>(type);
+
+                VkDescriptorBufferInfo buffer_info = {};
+                buffer_info.buffer = static_cast<VkBuffer>(buffer->GetRhiResource());
+                buffer_info.offset = 0;
+                buffer_info.range  = buffer->GetObjectSize();
+
+                VkWriteDescriptorSet write = {};
+                write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                write.dstSet          = sets[index];
+                write.dstBinding      = get_binding(type);
+                write.dstArrayElement = 0;
+                write.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                write.descriptorCount = 1;
+                write.pBufferInfo     = &buffer_info;
+
+                vkUpdateDescriptorSets(RHI_Context::device, 1, &write, 0, nullptr);
+            }
+        }
+
+        void release()
+        {
+            sets.clear();
+            layouts.clear();
+            pipelines.clear();
+            descriptor_cache.clear();
+
+            for (uint32_t i = 0; i < static_cast<uint32_t>(bindless::layouts.size()); i++)
+            {
+                if (bindless::layouts[i])
+                {
+                    RHI_Device::DeletionQueueAdd(RHI_Resource_Type::DescriptorSetLayout, bindless::layouts[i]);
+                }
+            }
+            bindless::sets.fill(nullptr);
+            bindless::layouts.fill(nullptr);
+        }
+    }
+
+    namespace device_features
+    {
+        VkPhysicalDeviceFeatures2 features                                           = {};
+        VkPhysicalDeviceRobustness2FeaturesEXT features_robustness                   = {};
+        VkPhysicalDeviceVulkan13Features features_1_3                                = {};
+        VkPhysicalDeviceVulkan12Features features_1_2                                = {};
+        VkPhysicalDeviceVulkan11Features features_1_1                                = {};
+        VkPhysicalDeviceFragmentShadingRateFeaturesKHR features_vrs                  = {};
+        VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR features_derivatives     = {};
+        VkPhysicalDeviceMemoryPriorityFeaturesEXT features_memory_priority           = {};
+        VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT features_pageable_memory = {};
+        VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT features_mutable_descriptor = {}; // xess
+        VkPhysicalDeviceRayQueryFeaturesKHR features_ray_query                       = {};
+        VkPhysicalDeviceAccelerationStructureFeaturesKHR features_accel_struct       = {};
+        VkPhysicalDeviceRayTracingPipelineFeaturesKHR features_ray_tracing_pipeline  = {};
+        VkPhysicalDeviceMeshShaderFeaturesEXT features_mesh_shader                   = {};
+
+        void detect(bool* is_shading_rate_supported, bool* is_xess_supported, bool* is_ray_tracing_supported, bool* is_mesh_shaders_supported)
+        {
+            // features that will be enabled
+            features_vrs.sType                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
+            features_vrs.pNext                  = nullptr;
+            features_derivatives.sType          = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR;
+            features_derivatives.pNext          = &features_vrs;
+            features_memory_priority.sType      = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT;
+            features_memory_priority.pNext      = &features_derivatives;
+            features_pageable_memory.sType      = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT;
+            features_pageable_memory.pNext      = extensions::memory_priority_supported ? static_cast<void*>(&features_memory_priority) : static_cast<void*>(&features_derivatives);
+            features_robustness.sType           = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT;
+            features_robustness.pNext           = extensions::pageable_device_local_memory_supported ? static_cast<void*>(&features_pageable_memory) : (extensions::memory_priority_supported ? static_cast<void*>(&features_memory_priority) : static_cast<void*>(&features_derivatives));
+            features_1_1.sType                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+            features_1_1.pNext                  = &features_robustness;
+            features_1_2.sType                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+            features_1_2.pNext                  = &features_1_1;
+            features_1_3.sType                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+            features_1_3.pNext                  = &features_1_2;
+            features_mutable_descriptor.sType   = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT;
+            features_mutable_descriptor.pNext   = &features_1_3;
+            features_mesh_shader.sType          = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
+            features_mesh_shader.pNext          = &features_mutable_descriptor;
+            features_accel_struct.sType         = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+            features_accel_struct.pNext         = &features_mesh_shader;
+            features_ray_query.sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+            features_ray_query.pNext            = &features_accel_struct;
+            features_ray_tracing_pipeline.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
+            features_ray_tracing_pipeline.pNext = &features_ray_query;
+            features.sType                      = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            features.pNext                      = &features_ray_tracing_pipeline;
+
+            // detect which features are supported
+            VkPhysicalDeviceFragmentShadingRateFeaturesKHR support_vrs                  = {};
+            support_vrs.sType                                                           = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
+            VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR support_derivatives     = {};
+            support_derivatives.sType                                                   = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR;
+            support_derivatives.pNext                                                   = &support_vrs;
+            VkPhysicalDeviceMemoryPriorityFeaturesEXT support_memory_priority            = {};
+            support_memory_priority.sType                                                = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT;
+            support_memory_priority.pNext                                                = &support_derivatives;
+            VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT support_pageable_memory = {};
+            support_pageable_memory.sType                                                = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT;
+            support_pageable_memory.pNext                                                = extensions::memory_priority_supported ? static_cast<void*>(&support_memory_priority) : static_cast<void*>(&support_derivatives);
+            VkPhysicalDeviceRobustness2FeaturesEXT support_robustness                   = {};
+            support_robustness.sType                                                    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT;
+            support_robustness.pNext                                                    = extensions::pageable_device_local_memory_supported ? static_cast<void*>(&support_pageable_memory) : (extensions::memory_priority_supported ? static_cast<void*>(&support_memory_priority) : static_cast<void*>(&support_derivatives));
+            VkPhysicalDeviceVulkan11Features support_1_1                                = {};
+            support_1_1.sType                                                           = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+            support_1_1.pNext                                                           = &support_robustness;
+            VkPhysicalDeviceVulkan12Features support_1_2                                = {};
+            support_1_2.sType                                                           = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+            support_1_2.pNext                                                           = &support_1_1;
+            VkPhysicalDeviceVulkan13Features support_1_3                                = {};
+            support_1_3.sType                                                           = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+            support_1_3.pNext                                                           = &support_1_2;
+            VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT support_mutable_descriptor = {};
+            support_mutable_descriptor.sType                                            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT;
+            support_mutable_descriptor.pNext                                            = &support_1_3;
+            VkPhysicalDeviceMeshShaderFeaturesEXT support_mesh_shader                   = {};
+            support_mesh_shader.sType                                                   = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
+            support_mesh_shader.pNext                                                   = &support_mutable_descriptor;
+            VkPhysicalDeviceAccelerationStructureFeaturesKHR support_accel_struct       = {};
+            support_accel_struct.sType                                                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+            support_accel_struct.pNext                                                  = &support_mesh_shader;
+            VkPhysicalDeviceRayQueryFeaturesKHR support_ray_query                       = {};
+            support_ray_query.sType                                                     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+            support_ray_query.pNext                                                     = &support_accel_struct;
+            VkPhysicalDeviceRayTracingPipelineFeaturesKHR support_ray_tracing_pipeline  = {};
+            support_ray_tracing_pipeline.sType                                          = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
+            support_ray_tracing_pipeline.pNext                                          = &support_ray_query;
+            VkPhysicalDeviceFeatures2 support                                           = {};
+            support.sType                                                               = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            support.pNext                                                               = &support_ray_tracing_pipeline;
+            vkGetPhysicalDeviceFeatures2(RHI_Context::device_physical, &support);
+
+            // check if certain features are supported and enable them
+            {
+                // variable shading rate
+                *is_shading_rate_supported = support_vrs.attachmentFragmentShadingRate == VK_TRUE;
+                if (*is_shading_rate_supported)
+                {
+                    // enable this feature conditionally (no assert) as older GPUs like NV 1080 and Radeon RX Vega do not support it
+                    // support details: https://vulkan.gpuinfo.org/listdevicescoverage.php?platform=windows&extension=VK_KHR_fragment_shading_rate
+                    features_vrs.attachmentFragmentShadingRate = VK_TRUE;
+                }
+
+                // misc
+                {
+                    features_derivatives.computeDerivativeGroupQuads = support_derivatives.computeDerivativeGroupQuads;
+                    features_derivatives.computeDerivativeGroupLinear = support_derivatives.computeDerivativeGroupLinear;
+                    features_memory_priority.memoryPriority = support_memory_priority.memoryPriority;
+                    features_pageable_memory.pageableDeviceLocalMemory = support_pageable_memory.pageableDeviceLocalMemory;
+                    extensions::memory_priority_enabled = features_memory_priority.memoryPriority == VK_TRUE;
+                    features_1_2.vulkanMemoryModel = support_1_2.vulkanMemoryModel;
+                    features_1_2.vulkanMemoryModelDeviceScope = support_1_2.vulkanMemoryModelDeviceScope;
+                    features_1_2.storageBuffer8BitAccess = support_1_2.storageBuffer8BitAccess;
+                    features_1_1.storageBuffer16BitAccess = support_1_1.storageBuffer16BitAccess;
+
+                    // tessellation
+                    SP_ASSERT(support.features.tessellationShader == VK_TRUE);
+                    features.features.tessellationShader = VK_TRUE;
+
+                    // depth clamp
+                    SP_ASSERT(support.features.depthClamp == VK_TRUE);
+                    features.features.depthClamp = VK_TRUE;
+
+                    // 64-bit integers in shaders (needed for buffer device address)
+                    SP_ASSERT(support.features.shaderInt64 == VK_TRUE);
+                    features.features.shaderInt64 = VK_TRUE;
+
+                    // anisotropic filtering
+                    SP_ASSERT(support.features.samplerAnisotropy == VK_TRUE);
+                    features.features.samplerAnisotropy = VK_TRUE;
+
+                    // line and point rendering
+                    SP_ASSERT(support.features.fillModeNonSolid == VK_TRUE);
+                    features.features.fillModeNonSolid = VK_TRUE;
+
+                    // lines with adjustable thickness
+                    SP_ASSERT(support.features.wideLines == VK_TRUE);
+                    features.features.wideLines = VK_TRUE;
+
+                    // cubemaps
+                    SP_ASSERT(support.features.imageCubeArray == VK_TRUE);
+                    features.features.imageCubeArray = VK_TRUE;
+
+                    // pipeline statistics
+                    SP_ASSERT(support.features.pipelineStatisticsQuery == VK_TRUE);
+                    features.features.pipelineStatisticsQuery = VK_TRUE;
+
+                    // gpu-driven indirect drawing
+                    SP_ASSERT(support.features.multiDrawIndirect == VK_TRUE);
+                    features.features.multiDrawIndirect = VK_TRUE;
+                    SP_ASSERT(support.features.drawIndirectFirstInstance == VK_TRUE);
+                    features.features.drawIndirectFirstInstance = VK_TRUE;
+                    SP_ASSERT(support_1_2.drawIndirectCount == VK_TRUE);
+                    features_1_2.drawIndirectCount = VK_TRUE;
+                    SP_ASSERT(support_1_1.shaderDrawParameters == VK_TRUE);
+                    features_1_1.shaderDrawParameters = VK_TRUE;
+
+                    // multiview for vr stereo rendering (core in vulkan 1.1)
+                    SP_ASSERT(support_1_1.multiview == VK_TRUE);
+                    features_1_1.multiview = VK_TRUE;
+
+                    // storage buffer access from vertex and fragment shaders (needed for bindless draw data)
+                    SP_ASSERT(support.features.vertexPipelineStoresAndAtomics == VK_TRUE);
+                    features.features.vertexPipelineStoresAndAtomics = VK_TRUE;
+                    SP_ASSERT(support.features.fragmentStoresAndAtomics == VK_TRUE);
+                    features.features.fragmentStoresAndAtomics = VK_TRUE;
+                }
+
+                // quality of life improvements
+                {
+                    // dynamic render passes and no frame buffer objects
+                    SP_ASSERT(support_1_3.dynamicRendering == VK_TRUE);
+                    features_1_3.dynamicRendering = VK_TRUE;
+
+                    // better synchronization
+                    SP_ASSERT(support_1_3.synchronization2 == VK_TRUE);
+                    features_1_3.synchronization2 = VK_TRUE;
+
+                    // timeline semaphores
+                    SP_ASSERT(support_1_2.timelineSemaphore == VK_TRUE);
+                    features_1_2.timelineSemaphore = VK_TRUE;
+
+                    // timeline semaphore counter
+                    SP_ASSERT(support.features.shaderFloat64 == VK_TRUE);
+                    features.features.shaderFloat64 = VK_TRUE;
+                }
+
+                // descriptors
+                {
+                    SP_ASSERT(support_1_2.descriptorBindingVariableDescriptorCount == VK_TRUE);
+                    features_1_2.descriptorBindingVariableDescriptorCount = VK_TRUE;
+
+                    SP_ASSERT(support_1_2.descriptorBindingSampledImageUpdateAfterBind == VK_TRUE);
+                    features_1_2.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+
+                    SP_ASSERT(support_1_2.descriptorBindingStorageBufferUpdateAfterBind == VK_TRUE);
+                    features_1_2.descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE;
+
+                    SP_ASSERT(support_1_2.descriptorBindingPartiallyBound == VK_TRUE);
+                    features_1_2.descriptorBindingPartiallyBound = VK_TRUE;
+
+                    SP_ASSERT(support_1_2.runtimeDescriptorArray == VK_TRUE);
+                    features_1_2.runtimeDescriptorArray = VK_TRUE;
+
+                    SP_ASSERT(support_1_2.descriptorIndexing == VK_TRUE);
+                    features_1_2.descriptorIndexing = VK_TRUE;
+
+                    // terrain picks its layer textures per pixel, so the bindless index diverges within a wave
+                    SP_ASSERT(support_1_2.shaderSampledImageArrayNonUniformIndexing == VK_TRUE);
+                    features_1_2.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+
+                    SP_ASSERT(support_1_2.shaderStorageBufferArrayNonUniformIndexing == VK_TRUE);
+                    features_1_2.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
+
+                    SP_ASSERT(support_robustness.nullDescriptor == VK_TRUE);
+                    features_robustness.nullDescriptor = VK_TRUE;
+
+                }
+
+                // amd fidelityfx cas/spd
+                {
+                    // spd
+                    SP_ASSERT(support_1_2.shaderSubgroupExtendedTypes == VK_TRUE);
+                    features_1_2.shaderSubgroupExtendedTypes = VK_TRUE;
+
+                    SP_ASSERT(support_1_3.shaderDemoteToHelperInvocation == VK_TRUE);
+                    features_1_3.shaderDemoteToHelperInvocation = VK_TRUE;
+
+                    // optional fast-paths used by cas/spd when the device exposes them
+                    if (support_1_2.shaderFloat16 == VK_TRUE)
+                    {
+                        features_1_2.shaderFloat16 = VK_TRUE;
+                    }
+                    if (support.features.shaderInt16 == VK_TRUE)
+                    {
+                        features.features.shaderInt16 = VK_TRUE;
+                    }
+                    if (support_1_3.subgroupSizeControl == VK_TRUE)
+                    {
+                        features_1_3.subgroupSizeControl = VK_TRUE;
+                    }
+                }
+
+                // xess
+                {
+                    SP_ASSERT(support_1_2.shaderInt8 == VK_TRUE);
+                    features_1_2.shaderInt8 = VK_TRUE;
+
+                    SP_ASSERT(support_1_3.shaderIntegerDotProduct == VK_TRUE);
+                    features_1_3.shaderIntegerDotProduct = VK_TRUE;
+
+                    SP_ASSERT(support_1_2.scalarBlockLayout == VK_TRUE);
+                    features_1_2.scalarBlockLayout = VK_TRUE;
+
+                    if (support_mutable_descriptor.mutableDescriptorType == VK_TRUE)
+                    {
+                        features_mutable_descriptor.mutableDescriptorType = VK_TRUE;
+                        *is_xess_supported = true;
+                    }
+                    else
+                    {
+                        features.pNext = features.pNext; // remove from chain
+                    }
+                }
+
+                // ray tracing
+                {
+                    *is_ray_tracing_supported = !Debugging::IsRenderdocEnabled() && support_accel_struct.accelerationStructure == VK_TRUE && support_ray_tracing_pipeline.rayTracingPipeline == VK_TRUE && support_ray_query.rayQuery == VK_TRUE;
+
+                    if (*is_ray_tracing_supported)
+                    {
+                        SP_ASSERT(support_accel_struct.accelerationStructure == VK_TRUE);
+                        features_accel_struct.accelerationStructure = VK_TRUE;
+
+                        SP_ASSERT(support_ray_tracing_pipeline.rayTracingPipeline == VK_TRUE);
+                        features_ray_tracing_pipeline.rayTracingPipeline = VK_TRUE;
+
+                        SP_ASSERT(support_ray_query.rayQuery == VK_TRUE);
+                        features_ray_query.rayQuery = VK_TRUE;
+
+                        SP_ASSERT(support_1_2.bufferDeviceAddress == VK_TRUE);
+                        features_1_2.bufferDeviceAddress = VK_TRUE;
+                    }
+                    else
+                    {
+                        // remove from chain
+                        features.pNext = features_ray_tracing_pipeline.pNext;
+                    }
+                }
+
+                // mesh shaders
+                {
+                    *is_mesh_shaders_supported = support_mesh_shader.meshShader == VK_TRUE;
+
+                    if (*is_mesh_shaders_supported)
+                    {
+                        features_mesh_shader.meshShader = VK_TRUE;
+                        features_mesh_shader.taskShader = support_mesh_shader.taskShader;
+                        SP_LOG_INFO("VK_EXT_mesh_shader supported (task shader: %s)",
+                            support_mesh_shader.taskShader == VK_TRUE ? "yes" : "no");
+                    }
+                    else
+                    {
+                        // remove from chain
+                        features_accel_struct.pNext = features_mesh_shader.pNext;
+                    }
+                }
+
+                // directx shader compiler spir-v output automatically enables certain capabilities
+                {
+                    // geometry
+                    SP_ASSERT(support.features.geometryShader == VK_TRUE);
+                    features.features.geometryShader = VK_TRUE;
+                }
+            }
+        }
+
+    }
+
+    namespace device_physical
+    {
+        void detect_all()
+        {
+            uint32_t device_count = 0;
+            if (vkEnumeratePhysicalDevices(RHI_Context::instance, &device_count, nullptr) != VK_SUCCESS)
+            {
+                SP_ERROR_WINDOW("Ensure you're not using incorrect or experimental drivers. Update your graphics drivers and uninstall Vulkan 'Compatibility Packs'.");
+            }
+
+            SP_ASSERT_MSG(device_count != 0, "There are no available physical devices");
+            
+            vector<VkPhysicalDevice> physical_devices(device_count);
+            SP_ASSERT_MSG(
+                vkEnumeratePhysicalDevices(RHI_Context::instance, &device_count, physical_devices.data()) == VK_SUCCESS,
+                "Failed to enumerate physical devices"
+            );
+            
+            // register all available physical devices
+            for (const VkPhysicalDevice& device_physical : physical_devices)
+            {
+                // properties
+                VkPhysicalDeviceVulkan12Properties device_properties_1_2 = {};
+                device_properties_1_2.sType                              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES;
+                VkPhysicalDeviceProperties2 device_properties            = {};
+                device_properties.sType                                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+                device_properties.pNext                                  = &device_properties_1_2;
+                vkGetPhysicalDeviceProperties2(device_physical, &device_properties);
+
+                // memory properties
+                VkPhysicalDeviceMemoryProperties device_memory_properties = {};
+                vkGetPhysicalDeviceMemoryProperties(device_physical, &device_memory_properties);
+
+                // deduce device type
+                RHI_PhysicalDevice_Type type = RHI_PhysicalDevice_Type::Max;
+                if (device_properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)
+                {
+                    type = RHI_PhysicalDevice_Type::Integrated;
+                }
+                if (device_properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+                {
+                    type = RHI_PhysicalDevice_Type::Discrete;
+                }
+                if (device_properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU)
+                {
+                    type = RHI_PhysicalDevice_Type::Virtual;
+                }
+                if (device_properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)
+                {
+                    type = RHI_PhysicalDevice_Type::Cpu;
+                }
+
+                // find the local device memory heap size
+                uint64_t vram_size_bytes = 0;
+                for (uint32_t i = 0; i < device_memory_properties.memoryHeapCount; i++)
+                {
+                    if (device_memory_properties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                    {
+                        vram_size_bytes = device_memory_properties.memoryHeaps[i].size;
+                        break;
+                    }
+                }
+                SP_ASSERT(vram_size_bytes > 0);
+
+                // register
+                RHI_Device::PhysicalDeviceRegister(RHI_PhysicalDevice
+                (
+                    device_properties.properties.apiVersion,     // api version
+                    device_properties.properties.driverVersion,  // driver version
+                    device_properties_1_2.driverInfo,            // driver info - For AMD, this matches the version shown in Adrenalin, the driver version field is an internal value.
+                    device_properties.properties.vendorID,       // vendor id
+                    type,                                        // type
+                    &device_properties.properties.deviceName[0], // name
+                    vram_size_bytes,                             // memory
+                    static_cast<void*>(device_physical)          // data
+                ));
+            }
+        }
+
+        void select_primary()
+        {
+            // go through all the devices (sorted from best to worst based on their properties)
+            for (uint32_t device_index = 0; device_index < RHI_Device::PhysicalDeviceGet().size(); device_index++)
+            {
+                VkPhysicalDevice device = static_cast<VkPhysicalDevice>(RHI_Device::PhysicalDeviceGet()[device_index].GetNativeHandle());
+
+                // get the first device which supports graphics, compute and transfer queues
+                if (queues::detect_queue_family_indices(device))
+                {
+                    RHI_Device::PhysicalDeviceSetPrimary(device_index);
+                    RHI_Context::device_physical = device;
+                    break;
+                }
+            }
+        }
+    }
+
+    void RHI_Device::Initialize()
+    {
+        // instance
+        {
+            // if VK_LAYER_PATH points to a non-existent directory (stale sdk install), clear it
+            // so the loader falls back to the windows registry which has the correct layer paths
+            {
+                char* layer_path = nullptr;
+                size_t len       = 0;
+                _dupenv_s(&layer_path, &len, "VK_LAYER_PATH");
+                if (layer_path)
+                {
+                    struct stat layer_stat;
+                    if (stat(layer_path, &layer_stat) != 0 || !(layer_stat.st_mode & S_IFDIR))
+                    {
+                        SP_LOG_WARNING("VK_LAYER_PATH points to \"%s\" which doesn't exist, clearing it", layer_path);
+                        _putenv_s("VK_LAYER_PATH", "");
+                    }
+                    free(layer_path);
+                }
+            }
+
+            VkInstanceCreateInfo info_instance      = {};
+            info_instance.sType                     = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+            VkApplicationInfo app_info              = create_application_info();
+            info_instance.pApplicationInfo          = &app_info;
+
+            // extensions
+#ifdef _WIN32
+            ngx_dlss::append_instance_extensions();
+#endif
+            vector<const char*> extensions_instance = extensions::get_extensions_instance();
+            info_instance.enabledExtensionCount     = static_cast<uint32_t>(extensions_instance.size());
+            info_instance.ppEnabledExtensionNames   = extensions_instance.data();
+            // check if the validation layer is actually installed before trying to enable it,
+            // some loaders silently accept a missing layer instead of returning VK_ERROR_LAYER_NOT_PRESENT
+            bool validation_layer_available = false;
+            if (Debugging::IsValidationLayerEnabled())
+            {
+                uint32_t layer_count = 0;
+                vkEnumerateInstanceLayerProperties(&layer_count, nullptr);
+                vector<VkLayerProperties> layers(layer_count);
+                vkEnumerateInstanceLayerProperties(&layer_count, layers.data());
+
+                for (const VkLayerProperties& layer : layers)
+                {
+                    if (strcmp(validation_layer::layer_name, layer.layerName) == 0)
+                    {
+                        validation_layer_available = true;
+                        break;
+                    }
+                }
+
+                if (!validation_layer_available)
+                {
+                    SP_LOG_ERROR("Validation layer requested but VK_LAYER_KHRONOS_validation is not installed. "
+                                 "Install the Vulkan SDK from https://vulkan.lunarg.com/sdk/home and restart.");
+                }
+            }
+
+            info_instance.enabledLayerCount       = validation_layer_available ? 1 : 0;
+            info_instance.ppEnabledLayerNames     = validation_layer_available ? &validation_layer::layer_name : nullptr;
+
+            // configure validation layer settings
+            bool layer_settings_supported      = false;
+            bool validation_features_supported  = false;
+            for (const auto& ext : extensions_instance)
+            {
+                if (strcmp(ext, "VK_EXT_layer_settings") == 0)
+                {
+                    layer_settings_supported = true;
+                }
+                if (strcmp(ext, "VK_EXT_validation_features") == 0)
+                {
+                    validation_features_supported = true;
+                }
+            }
+
+            VkLayerSettingsCreateInfoEXT info_settings         = {};
+            vector<VkLayerSettingEXT> settings;
+            VkValidationFeaturesEXT info_validation_features   = {};
+            vector<VkValidationFeatureEnableEXT> enabled_features;
+            if (validation_layer_available)
+            {
+                if (layer_settings_supported)
+                {
+                    // preferred: fine-grained layer configuration via VK_EXT_layer_settings
+                    info_settings.sType        = VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT;
+                    settings                   = validation_layer::get_settings();
+                    info_settings.pSettings    = settings.data();
+                    info_settings.settingCount = static_cast<uint32_t>(settings.size());
+                    info_instance.pNext        = &info_settings;
+                }
+                else if (validation_features_supported)
+                {
+                    // fallback: VkValidationFeaturesEXT for loaders that don't expose VK_EXT_layer_settings
+                    enabled_features.push_back(VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT);
+                    enabled_features.push_back(VK_VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT);
+                    if (Debugging::IsGpuAssistedValidationEnabled())
+                    {
+                        enabled_features.push_back(VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT);
+                    }
+
+                    info_validation_features.sType                         = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+                    info_validation_features.enabledValidationFeatureCount  = static_cast<uint32_t>(enabled_features.size());
+                    info_validation_features.pEnabledValidationFeatures     = enabled_features.data();
+                    info_instance.pNext                                    = &info_validation_features;
+                }
+            }
+
+            // create the vulkan instance
+            SP_ASSERT_VK(vkCreateInstance(&info_instance, nullptr, &RHI_Context::instance));
+
+            functions::get_pointers_from_gpu_driver();
+            validation_layer::logging::enable();
+        }
+
+        // device
+        {
+            // detect and select primary
+            device_physical::detect_all();
+            device_physical::select_primary();
+
+            // queues
+            vector<VkDeviceQueueCreateInfo> queue_create_infos;
+            {
+                queues::detect_queue_family_indices(RHI_Context::device_physical);
+
+                // one create info per unique family, queue count covers the highest local index we need
+                unordered_map<uint32_t, uint32_t> family_queue_counts;
+                auto require_queue = [&](uint32_t family, uint32_t local_index)
+                {
+                    uint32_t needed = local_index + 1;
+                    auto it = family_queue_counts.find(family);
+                    if (it == family_queue_counts.end() || it->second < needed)
+                    {
+                        family_queue_counts[family] = needed;
+                    }
+                };
+                require_queue(queues::index_graphics, 0);
+                require_queue(queues::index_compute, 0);
+                require_queue(queues::index_copy, 0);
+                require_queue(queues::index_present, queues::local_index_present);
+
+                static float queue_priorities[2] = { 1.0f, 1.0f };
+                for (const auto& entry : family_queue_counts)
+                {
+                    VkDeviceQueueCreateInfo queue_create_info = {};
+                    queue_create_info.sType                   = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+                    queue_create_info.flags                   = 0;
+                    queue_create_info.queueFamilyIndex        = entry.first;
+                    queue_create_info.queueCount              = entry.second;
+                    queue_create_info.pQueuePriorities        = queue_priorities;
+                    queue_create_infos.push_back(queue_create_info);
+                }
+            }
+
+            // properties
+            {
+                VkPhysicalDeviceRayTracingPipelinePropertiesKHR ray_tracing_properties = {};
+                ray_tracing_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
+
+                VkPhysicalDeviceFragmentShadingRatePropertiesKHR shading_rate_properties = {};
+                shading_rate_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR;
+
+                VkPhysicalDeviceAccelerationStructurePropertiesKHR acceleration_structure_properties = {};
+                acceleration_structure_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR;
+                acceleration_structure_properties.pNext = &ray_tracing_properties;
+
+                ray_tracing_properties.pNext = &shading_rate_properties;
+
+                VkPhysicalDeviceVulkan13Properties device_properties_1_3 = {};
+                device_properties_1_3.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES;
+                device_properties_1_3.pNext = &acceleration_structure_properties;
+
+                VkPhysicalDeviceProperties2 properties_device = {};
+                properties_device.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+                properties_device.pNext = &device_properties_1_3;
+
+                vkGetPhysicalDeviceProperties2(static_cast<VkPhysicalDevice>(RHI_Context::device_physical), &properties_device);
+
+                // save some properties
+                m_timestamp_period                         = properties_device.properties.limits.timestampPeriod;
+                m_min_uniform_buffer_offset_alignment      = properties_device.properties.limits.minUniformBufferOffsetAlignment;
+                m_min_storage_buffer_offset_alignment      = properties_device.properties.limits.minStorageBufferOffsetAlignment;
+                m_min_acceleration_buffer_offset_alignment = acceleration_structure_properties.minAccelerationStructureScratchOffsetAlignment;
+                m_max_texture_1d_dimension                 = properties_device.properties.limits.maxImageDimension1D;
+                m_max_texture_2d_dimension                 = properties_device.properties.limits.maxImageDimension2D;
+                m_max_texture_3d_dimension                 = properties_device.properties.limits.maxImageDimension3D;
+                m_max_texture_cube_dimension               = properties_device.properties.limits.maxImageDimensionCube;
+                m_max_texture_array_layers                 = properties_device.properties.limits.maxImageArrayLayers;
+                m_max_push_constant_size                   = properties_device.properties.limits.maxPushConstantsSize;
+                m_max_shading_rate_texel_size_x            = shading_rate_properties.maxFragmentShadingRateAttachmentTexelSize.width;
+                m_max_shading_rate_texel_size_y            = shading_rate_properties.maxFragmentShadingRateAttachmentTexelSize.height;
+                m_optimal_buffer_copy_offset_alignment     = properties_device.properties.limits.optimalBufferCopyOffsetAlignment;
+                m_shader_group_handle_size                 = ray_tracing_properties.shaderGroupHandleSize;
+                m_shader_group_handle_alignment            = ray_tracing_properties.shaderGroupHandleAlignment;
+                m_shader_group_base_alignment              = ray_tracing_properties.shaderGroupBaseAlignment;
+
+                // disable profiler if timestamps are not supported
+                if (Debugging::IsGpuTimingEnabled())
+                {
+                    SP_ASSERT_MSG(properties_device.properties.limits.timestampComputeAndGraphics, "Device doesn't support timestamps");
+                }
+            }
+  
+#ifdef _WIN32
+            ngx_dlss::append_device_extensions();
+#endif
+            vector<const char*> extensions_supported = extensions::get_extensions_device();
+            device_features::detect(&m_is_shading_rate_supported, &m_xess_supported, &m_is_ray_tracing_supported, &m_is_mesh_shaders_supported);
+            m_dlss_supported = GetPrimaryPhysicalDevice() && GetPrimaryPhysicalDevice()->IsNvidia();
+
+            // create
+            {
+                VkDeviceCreateInfo create_info           = {};
+                create_info.sType                        = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+                create_info.queueCreateInfoCount         = static_cast<uint32_t>(queue_create_infos.size());
+                create_info.pQueueCreateInfos            = queue_create_infos.data();
+                create_info.pNext                        = &device_features::features;
+                create_info.enabledExtensionCount        = static_cast<uint32_t>(extensions_supported.size());
+                create_info.ppEnabledExtensionNames      = extensions_supported.data();
+
+                SP_ASSERT_VK(vkCreateDevice(RHI_Context::device_physical, &create_info, nullptr, &RHI_Context::device));
+                SP_LOG_INFO("Vulkan %s", vulkan_version::to_c_str(vulkan_version::used));
+                functions::get_pointers_from_device();
+            }
+        }
+
+        // create queues
+        {
+            vkGetDeviceQueue(RHI_Context::device, queues::index_graphics, 0, reinterpret_cast<VkQueue*>(&queues::graphics));
+            SetResourceName(queues::graphics, RHI_Resource_Type::Queue, "graphics");
+
+            vkGetDeviceQueue(RHI_Context::device, queues::index_compute, 0, reinterpret_cast<VkQueue*>(&queues::compute));
+            SetResourceName(queues::compute, RHI_Resource_Type::Queue, "compute");
+
+            vkGetDeviceQueue(RHI_Context::device, queues::index_copy, 0, reinterpret_cast<VkQueue*>(&queues::copy));
+            SetResourceName(queues::copy, RHI_Resource_Type::Queue, "copy");
+
+            vkGetDeviceQueue(RHI_Context::device, queues::index_present, queues::local_index_present, reinterpret_cast<VkQueue*>(&queues::present));
+            SetResourceName(queues::present, RHI_Resource_Type::Queue, queues::present_dedicated ? "present" : "present_shared_graphics");
+
+            queues::regular[static_cast<uint32_t>(RHI_Queue_Type::Graphics)] = make_shared<RHI_Queue>(RHI_Queue_Type::Graphics, "graphics");
+            queues::regular[static_cast<uint32_t>(RHI_Queue_Type::Compute)]  = make_shared<RHI_Queue>(RHI_Queue_Type::Compute,  "compute");
+            queues::regular[static_cast<uint32_t>(RHI_Queue_Type::Copy)]     = make_shared<RHI_Queue>(RHI_Queue_Type::Copy,     "copy");
+            queues::regular[static_cast<uint32_t>(RHI_Queue_Type::Present)]  = make_shared<RHI_Queue>(RHI_Queue_Type::Present,  "present");
+        }
+
+        vulkan_memory_allocator::initialize();
+        descriptors::create_pool();
+        descriptors::create_pipeline_cache();
+        descriptors::bindless::initialize();
+    }
+
+    void RHI_Device::Tick(const uint64_t frame_count)
+    {
+        // vmaSetCurrentFrameIndex must run every frame, it queries the budget once instead of per allocation
+        vmaSetCurrentFrameIndex(vulkan_memory_allocator::allocator, static_cast<uint32_t>(frame_count));
+
+        descriptors::current_frame.store(frame_count, memory_order_relaxed);
+
+        // evict descriptor sets unused for 300+ frames to prevent unbounded growth
+        constexpr uint64_t max_unused_frames = 300;
+        if (frame_count % 60 == 0)
+        {
+            lock_guard<mutex> lock(descriptors::descriptor_pipeline_mutex);
+            for (auto it = descriptors::sets.begin(); it != descriptors::sets.end();)
+            {
+                if (frame_count - it->second.GetLastUsedFrame() > max_unused_frames)
+                {
+                    it = descriptors::sets.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        }
+
+        DeletionQueueParse();
+    }
+
+    uint64_t RHI_Device::GetDescriptorSetFrame()
+    {
+        return descriptors::current_frame.load(memory_order_relaxed);
+    }
+
+    void RHI_Device::DescriptorSetInvalidateReferencingResource(void* resource)
+    {
+        // cached sets are keyed on this pointer, a later hash collision would return a set holding destroyed gpu handles
+        if (!resource)
+        {
+            return;
+        }
+
+        lock_guard<mutex> lock(descriptors::descriptor_pipeline_mutex);
+        for (auto it = descriptors::sets.begin(); it != descriptors::sets.end();)
+        {
+            if (it->second.IsReferingToResource(resource))
+            {
+                it = descriptors::sets.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
+    void RHI_Device::Destroy()
+    {
+        SP_ASSERT(queues::graphics != nullptr);
+
+        DestroySwapChain();
+
+        // destroy queues
+        QueueWaitAll();
+        queues::destroy();
+
+        // pipeline cache - save to disk before destroying
+        descriptors::save_pipeline_cache();
+        if (descriptors::pipeline_cache)
+        {
+            vkDestroyPipelineCache(RHI_Context::device, descriptors::pipeline_cache, nullptr);
+            descriptors::pipeline_cache = nullptr;
+        }
+
+        // descriptor pools
+        for (VkDescriptorPool pool : descriptors::descriptor_pools)
+        {
+            vkDestroyDescriptorPool(RHI_Context::device, pool, nullptr);
+        }
+        descriptors::descriptor_pools.clear();
+
+        // debug messenger
+        if (Debugging::IsValidationLayerEnabled())
+        {
+            validation_layer::logging::shutdown(RHI_Context::instance);
+        }
+
+        // descriptors
+        descriptors::release();
+
+        // release pooled staging buffers
+        StagingBufferPoolDestroy();
+
+        // the destructor of all the resources enqueues it's vk buffer memory for de-allocation;
+        // the gpu is fully idle after QueueWaitAll(), so force-retire everything regardless of age
+        deletion_queue_frame += renderer_draw_data_buffer_count + 2;
+        RHI_Device::DeletionQueueParse();
+
+        // destroy the allocator itself and assert if any allocations are left
+        vulkan_memory_allocator::destroy();
+
+        // device and instance
+        vkDestroyDevice(RHI_Context::device, nullptr);
+        vkDestroyInstance(RHI_Context::instance, nullptr);
+    }
+
+    // queues
+
+    uint32_t RHI_Device::GetQueueIndex(const RHI_Queue_Type type)
+    {
+        if (type == RHI_Queue_Type::Graphics)
+        {
+            return queues::index_graphics;
+        }
+        else if (type == RHI_Queue_Type::Copy)
+        {
+            return queues::index_copy;
+        }
+        else if (type == RHI_Queue_Type::Compute)
+        {
+            return queues::index_compute;
+        }
+        else if (type == RHI_Queue_Type::Present)
+        {
+            return queues::index_present;
+        }
+
+        return 0;
+    }
+
+    RHI_Queue* RHI_Device::GetQueue(const RHI_Queue_Type type)
+    {
+        if (type == RHI_Queue_Type::Graphics)
+        {
+            return queues::regular[static_cast<uint32_t>(RHI_Queue_Type::Graphics)].get();
+        }
+
+        if (type == RHI_Queue_Type::Compute)
+        {
+            return queues::regular[static_cast<uint32_t>(RHI_Queue_Type::Compute)].get();
+        }
+
+        if (type == RHI_Queue_Type::Copy)
+        {
+            return queues::regular[static_cast<uint32_t>(RHI_Queue_Type::Copy)].get();
+        }
+
+        if (type == RHI_Queue_Type::Present)
+        {
+            return queues::regular[static_cast<uint32_t>(RHI_Queue_Type::Present)].get();
+        }
+
+        return nullptr;
+    }
+
+    void* RHI_Device::GetQueueRhiResource(const RHI_Queue_Type type)
+    {
+        if (type == RHI_Queue_Type::Graphics)
+        {
+            return queues::graphics;
+        }
+
+        if (type == RHI_Queue_Type::Copy)
+        {
+            return queues::copy;
+        }
+
+        if (type == RHI_Queue_Type::Compute)
+        {
+            return queues::compute;
+        }
+
+        if (type == RHI_Queue_Type::Present)
+        {
+            return queues::present;
+        }
+
+        return nullptr;
+    }
+
+    void RHI_Device::QueueWaitAll(const bool flush)
+    {
+        for (uint32_t i = 0; i < static_cast<uint32_t>(RHI_Queue_Type::Max); i++)
+        {
+            if (queues::regular[i])
+            {
+                queues::regular[i]->Wait(flush);
+            }
+        }
+    }
+
+
+    // deletion queue
+
+    void RHI_Device::DeletionQueueAdd(const RHI_Resource_Type resource_type, void* resource)
+    {
+        if (!resource)
+        {
+            return;
+        }
+
+        lock_guard<mutex> guard(mutex_deletion_queue);
+        deletion_queue.push_back({ resource_type, resource, deletion_queue_frame });
+    }
+
+    void RHI_Device::DeletionQueueParse()
+    {
+        lock_guard<mutex> guard(mutex_deletion_queue);
+
+        deletion_queue_frame++;
+
+        // with renderer_draw_data_buffer_count lists rotating per queue, anything older than that many frames is no longer in flight
+        const uint64_t safe_age = renderer_draw_data_buffer_count + 1;
+
+        auto it = deletion_queue.begin();
+        while (it != deletion_queue.end())
+        {
+            if ((deletion_queue_frame - it->frame) < safe_age)
+            {
+                ++it;
+                continue;
+            }
+
+            void* resource                  = it->resource;
+            RHI_Resource_Type resource_type = it->type;
+
+            switch (resource_type)
+            {
+                case RHI_Resource_Type::Image:                 MemoryTextureDestroy(resource);                                                                                            break;
+                case RHI_Resource_Type::ImageView:             vkDestroyImageView(RHI_Context::device, static_cast<VkImageView>(resource), nullptr);                                      break;
+                case RHI_Resource_Type::Sampler:               vkDestroySampler(RHI_Context::device, reinterpret_cast<VkSampler>(resource), nullptr);                                     break;
+                case RHI_Resource_Type::Buffer:                MemoryBufferDestroy(resource);                                                                                             break;
+                case RHI_Resource_Type::Shader:                vkDestroyShaderModule(RHI_Context::device, static_cast<VkShaderModule>(resource), nullptr);                                break;
+                case RHI_Resource_Type::Semaphore:             vkDestroySemaphore(RHI_Context::device, static_cast<VkSemaphore>(resource), nullptr);                                      break;
+                case RHI_Resource_Type::Fence:                 vkDestroyFence(RHI_Context::device, static_cast<VkFence>(resource), nullptr);                                              break;
+                case RHI_Resource_Type::DescriptorSetLayout:   vkDestroyDescriptorSetLayout(RHI_Context::device, static_cast<VkDescriptorSetLayout>(resource), nullptr);                  break;
+                case RHI_Resource_Type::QueryPool:             vkDestroyQueryPool(RHI_Context::device, static_cast<VkQueryPool>(resource), nullptr);                                      break;
+                case RHI_Resource_Type::Pipeline:              vkDestroyPipeline(RHI_Context::device, static_cast<VkPipeline>(resource), nullptr);                                        break;
+                case RHI_Resource_Type::PipelineLayout:        vkDestroyPipelineLayout(RHI_Context::device, static_cast<VkPipelineLayout>(resource), nullptr);                            break;
+                case RHI_Resource_Type::AccelerationStructure: functions::destroy_acceleration_structure(RHI_Context::device,static_cast<VkAccelerationStructureKHR>(resource), nullptr); break;
+                default:                                       SP_ASSERT_MSG(false, "Unknown resource");                                                                                  break;
+            }
+
+            // descriptor set invalidation is handled synchronously by the rhi resource
+            // owner before queueing here, so the cache is already coherent at this point
+            it = deletion_queue.erase(it);
+        }
+    }
+
+    void RHI_Device::DeletionQueueFlush()
+    {
+        {
+            lock_guard<mutex> guard(mutex_deletion_queue);
+            for (auto& entry : deletion_queue)
+                entry.frame = 0;
+        }
+
+        DeletionQueueParse();
+    }
+
+    bool RHI_Device::DeletionQueueNeedsToParse()
+    {
+        lock_guard<mutex> guard(mutex_deletion_queue);
+
+        if (deletion_queue.empty())
+        {
+            return false;
+        }
+
+        const uint64_t safe_age = renderer_draw_data_buffer_count + 1;
+        for (const auto& entry : deletion_queue)
+        {
+            if ((deletion_queue_frame + 1 - entry.frame) >= safe_age)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // descriptors
+
+    void RHI_Device::AllocateDescriptorSet(void*& resource, RHI_DescriptorSetLayout* descriptor_set_layout, const vector<RHI_DescriptorWithBinding>& descriptors_vec)
+    {
+        SP_ASSERT(resource == nullptr);
+        SP_ASSERT(!descriptors::descriptor_pools.empty());
+
+        array<void*, 1> descriptor_set_layouts    = { descriptor_set_layout->GetRhiResource() };
+        VkDescriptorSetAllocateInfo allocate_info = {};
+        allocate_info.sType                       = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocate_info.descriptorSetCount          = 1;
+        allocate_info.pSetLayouts                 = reinterpret_cast<VkDescriptorSetLayout*>(descriptor_set_layouts.data());
+
+        // try the most recent pool first; if full, create a new pool and retry
+        allocate_info.descriptorPool = descriptors::descriptor_pools.back();
+        VkResult result = vkAllocateDescriptorSets(RHI_Context::device, &allocate_info, reinterpret_cast<VkDescriptorSet*>(&resource));
+
+        if (result == VK_ERROR_OUT_OF_POOL_MEMORY || result == VK_ERROR_FRAGMENTED_POOL)
+        {
+            descriptors::descriptor_pools.push_back(descriptors::create_descriptor_pool());
+            allocate_info.descriptorPool = descriptors::descriptor_pools.back();
+            SP_ASSERT_VK(vkAllocateDescriptorSets(RHI_Context::device, &allocate_info, reinterpret_cast<VkDescriptorSet*>(&resource)));
+        }
+        else
+        {
+            SP_ASSERT_VK(result);
+        }
+
+        descriptors::allocated_descriptor_sets++;
+        Profiler::m_rhi_descriptor_set_count++;
+    }
+
+    void* RHI_Device::GetDescriptorSet(const RHI_Device_Bindless_Resource resource_type)
+    {
+        return static_cast<void*>(descriptors::bindless::sets[static_cast<uint32_t>(resource_type)]);
+    }
+
+    void* RHI_Device::GetDescriptorSetLayout(const RHI_Device_Bindless_Resource resource_type)
+    {
+        return static_cast<void*>(descriptors::bindless::layouts[static_cast<uint32_t>(resource_type)]);
+    }
+
+    unordered_map<uint64_t, RHI_DescriptorSet>& RHI_Device::GetDescriptorSets()
+    {
+        return descriptors::sets;
+    }
+
+    mutex& RHI_Device::GetDescriptorSetMutex()
+    {
+        return descriptors::descriptor_pipeline_mutex;
+    }
+
+    uint32_t RHI_Device::GetDescriptorType(const RHI_Descriptor& descriptor)
+    {
+        if (descriptor.type == RHI_Descriptor_Type::Image)
+        {
+            return VkDescriptorType::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        }
+
+        if (descriptor.type == RHI_Descriptor_Type::TextureStorage)
+        {
+            return VkDescriptorType::VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        }
+
+        if (descriptor.type == RHI_Descriptor_Type::StructuredBuffer)
+        {
+            return VkDescriptorType::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+        }
+
+        if (descriptor.type == RHI_Descriptor_Type::ConstantBuffer)
+        {
+            return VkDescriptorType::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        }
+
+        if (descriptor.type == RHI_Descriptor_Type::AccelerationStructure)
+        {
+            return VkDescriptorType::VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        }
+
+        SP_ASSERT_MSG(false, "Unhandled descriptor type");
+        return VkDescriptorType::VK_DESCRIPTOR_TYPE_MAX_ENUM;
+    }
+
+    void RHI_Device::UpdateBindlessMaterials(array<RHI_Texture*, rhi_max_array_size>* textures, RHI_Buffer* parameters)
+    {
+        lock_guard<mutex> lock(descriptors::descriptor_pipeline_mutex);
+        if (textures)
+        {
+            descriptors::bindless::update_textures(textures);
+        }
+
+        if (parameters)
+        {
+            descriptors::bindless::update_buffer(RHI_Device_Bindless_Resource::MaterialParameters, parameters);
+        }
+    }
+
+    void RHI_Device::UpdateBindlessLights(RHI_Buffer* parameters)
+    {
+        if (parameters)
+        {
+            lock_guard<mutex> lock(descriptors::descriptor_pipeline_mutex);
+            descriptors::bindless::update_buffer(RHI_Device_Bindless_Resource::LightParameters, parameters);
+        }
+    }
+
+    void RHI_Device::UpdateBindlessSamplers(const shared_ptr<RHI_Sampler>* samplers, uint32_t count)
+    {
+        if (samplers && count >= 9)
+        {
+            lock_guard<mutex> lock(descriptors::descriptor_pipeline_mutex);
+            descriptors::bindless::update_samplers(RHI_Device_Bindless_Resource::SamplersComparison, &samplers[0], 1);
+            descriptors::bindless::update_samplers(RHI_Device_Bindless_Resource::SamplersRegular, &samplers[1], 8);
+        }
+    }
+
+    void RHI_Device::UpdateBindlessAABBs(RHI_Buffer* buffer)
+    {
+        if (buffer)
+        {
+            lock_guard<mutex> lock(descriptors::descriptor_pipeline_mutex);
+            descriptors::bindless::update_buffer(RHI_Device_Bindless_Resource::Aabbs, buffer);
+        }
+    }
+
+    void RHI_Device::UpdateBindlessDrawData(RHI_Buffer* buffer)
+    {
+        if (buffer)
+        {
+            lock_guard<mutex> lock(descriptors::descriptor_pipeline_mutex);
+            descriptors::bindless::update_buffer(RHI_Device_Bindless_Resource::DrawData, buffer);
+        }
+    }
+
+    void RHI_Device::UpdateBindlessGeometryVertices(RHI_Buffer* buffer)
+    {
+        if (buffer)
+        {
+            lock_guard<mutex> lock(descriptors::descriptor_pipeline_mutex);
+            descriptors::bindless::update_buffer(RHI_Device_Bindless_Resource::GeometryVertices, buffer);
+        }
+    }
+
+    void RHI_Device::UpdateBindlessGeometryIndices(RHI_Buffer* buffer)
+    {
+        if (buffer)
+        {
+            lock_guard<mutex> lock(descriptors::descriptor_pipeline_mutex);
+            descriptors::bindless::update_buffer(RHI_Device_Bindless_Resource::GeometryIndices, buffer);
+        }
+    }
+
+    void RHI_Device::UpdateBindlessInstances(RHI_Buffer* buffer)
+    {
+        if (buffer)
+        {
+            lock_guard<mutex> lock(descriptors::descriptor_pipeline_mutex);
+            descriptors::bindless::update_buffer(RHI_Device_Bindless_Resource::Instances, buffer);
+        }
+    }
+
+    // pipelines
+
+    void RHI_Device::GetOrCreatePipeline(RHI_PipelineState& pso, RHI_Pipeline*& pipeline, RHI_DescriptorSetLayout*& descriptor_set_layout)
+    {
+        SP_ASSERT(pso.GetHash() != 0);
+
+        lock_guard<mutex> lock(descriptors::descriptor_pipeline_mutex);
+
+        descriptor_set_layout = descriptors::get_or_create_descriptor_set_layout(pso).get();
+
+        // if no pipeline exists, create one
+        uint64_t hash = pso.GetHash();
+        auto it = descriptors::pipelines.find(hash);
+        if (it == descriptors::pipelines.end())
+        {
+            // create a new pipeline
+            it = descriptors::pipelines.emplace(make_pair(hash, make_shared<RHI_Pipeline>(pso, descriptor_set_layout))).first;
+        }
+
+        pipeline = it->second.get();
+    }
+
+    uint32_t RHI_Device::GetPipelineCount()
+    {
+        return static_cast<uint32_t>(descriptors::pipelines.size());
+    }
+
+    void* RHI_Device::GetPipelineCache()
+    {
+        return static_cast<void*>(descriptors::pipeline_cache);
+    }
+
+    // memory
+
+    void* RHI_Device::MemoryGetMappedDataFromBuffer(void* resource)
+    {
+        VmaAllocation allocation = vulkan_memory_allocator::get_allocation_from_resource(resource);
+        if (allocation)
+        {
+            VmaAllocationInfo alloc_info;
+            vmaGetAllocationInfo(vulkan_memory_allocator::allocator, allocation, &alloc_info);
+            return alloc_info.pMappedData;
+        }
+        return nullptr;
+    }
+
+    void RHI_Device::MemoryBufferCreate(void*& resource, const uint64_t size, uint32_t flags_usage, uint32_t flags_memory, const void* data, const char* name)
+    {
+        // buffer info
+        VkBufferCreateInfo buffer_create_info = {};
+        buffer_create_info.sType              = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        buffer_create_info.size               = size;
+        buffer_create_info.usage              = flags_usage;
+        buffer_create_info.sharingMode        = VK_SHARING_MODE_EXCLUSIVE;
+        array<uint32_t, 3> queue_families      = {};
+        uint32_t queue_family_count            = 0;
+        auto add_queue_family = [&](uint32_t queue_family)
+        {
+            if (find(queue_families.begin(), queue_families.begin() + queue_family_count, queue_family) == queue_families.begin() + queue_family_count)
+            {
+                queue_families[queue_family_count++] = queue_family;
+            }
+        };
+        add_queue_family(queues::index_graphics);
+        add_queue_family(queues::index_compute);
+        add_queue_family(queues::index_copy);
+        if (queue_family_count > 1)
+        {
+            buffer_create_info.sharingMode           = VK_SHARING_MODE_CONCURRENT;
+            buffer_create_info.queueFamilyIndexCount = queue_family_count;
+            buffer_create_info.pQueueFamilyIndices   = queue_families.data();
+        }
+
+        // allocation info
+        VmaAllocationCreateInfo allocation_create_info = {};
+        allocation_create_info.usage                   = VMA_MEMORY_USAGE_AUTO;
+        allocation_create_info.flags                   = 0;            // flags vma
+        allocation_create_info.requiredFlags           = flags_memory; // flags vulkan
+        bool gpu_writable = (flags_usage & (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR)) != 0;
+        allocation_create_info.priority = gpu_writable ? 0.9f : ((flags_memory & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 ? 0.7f : 0.3f);
+        
+        // for large buffers (>16mb), use dedicated allocations to avoid vma pooling
+        const uint64_t size_16_mb = 16 * 1024 * 1024;
+        if (size >= size_16_mb)
+        {
+            allocation_create_info.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+        }
+
+        bool is_mappable = (flags_memory & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+        if (is_mappable)
+        {
+            const bool cpu_readback =
+                (
+                    flags_usage &
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                ) != 0 &&
+                (
+                    flags_usage &
+                    ~VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                ) == 0;
+            allocation_create_info.flags |=
+                cpu_readback
+                    ? VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
+                    : VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+            allocation_create_info.flags |= VMA_ALLOCATION_CREATE_MAPPED_BIT; // mappable
+
+            if (Debugging::IsRenderdocEnabled())
+            {
+                VkPhysicalDeviceMemoryProperties memory_properties;
+                vkGetPhysicalDeviceMemoryProperties(RHI_Context::device_physical, &memory_properties);
+                for (uint32_t i = 0; i < memory_properties.memoryTypeCount; i++)
+                {
+                    const VkMemoryPropertyFlags properties = memory_properties.memoryTypes[i].propertyFlags;
+                    if ((properties & flags_memory) == flags_memory && (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0)
+                    {
+                        allocation_create_info.memoryTypeBits |= 1u << i;
+                    }
+                }
+            }
+        }
+
+        // allocate
+        VmaAllocation allocation = nullptr;
+        VmaAllocationInfo allocation_info;
+        VkResult result = vmaCreateBuffer(
+            vulkan_memory_allocator::allocator,
+                &buffer_create_info,
+                &allocation_create_info,
+                reinterpret_cast<VkBuffer*>(&resource),
+                &allocation,
+                &allocation_info);
+
+        if (result != VK_SUCCESS)
+        {
+            SP_LOG_WARNING("vmaCreateBuffer failed for '%s' (%llu bytes): %s", name, size, vkresult_to_string(result));
+            resource = nullptr;
+            return;
+        }
+
+        // if a pointer to the buffer data has been passed, map the buffer and copy over the data
+        if (data)
+        {
+            SP_ASSERT_MSG(is_mappable, "Mapping initial data requires the buffer to be created with a VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT memory flag");
+        
+            // non-coherent memory needs a manual invalidate before reads and a flush after writes, map and unmap do not do it
+        
+            void* mapped_data = nullptr;
+            SP_ASSERT_VK(vmaMapMemory(vulkan_memory_allocator::allocator, allocation, &mapped_data));
+            memcpy(mapped_data, data, size);
+            SP_ASSERT_VK(vmaFlushAllocation(vulkan_memory_allocator::allocator, allocation, 0, size));
+            vmaUnmapMemory(vulkan_memory_allocator::allocator, allocation);
+        }
+
+        vmaSetAllocationName(vulkan_memory_allocator::allocator, allocation, name);
+        vulkan_memory_allocator::save_allocation(resource, allocation);
+    }
+
+    void RHI_Device::MemoryBufferDestroy(void*& resource)
+    {
+        VmaAllocation allocation = vulkan_memory_allocator::get_allocation_from_resource(resource);
+        if (allocation)
+        {
+            vmaDestroyBuffer(vulkan_memory_allocator::allocator, static_cast<VkBuffer>(resource), allocation);
+            vulkan_memory_allocator::destroy_allocation(resource);
+            resource = nullptr;
+        }
+    }
+
+    void RHI_Device::MemoryTextureCreate(RHI_Texture* texture)
+    {
+        // external memory (if needed)
+        VkExternalMemoryImageCreateInfo external_memory_image_create_info = {};
+        external_memory_image_create_info.sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+        #if defined(_WIN32)
+        external_memory_image_create_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHR;
+        #else
+        external_memory_image_create_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR;
+        #endif
+
+        // describe image
+        VkImageCreateInfo create_info_image = {};
+        create_info_image.sType             = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        create_info_image.pNext             = nullptr;
+        create_info_image.imageType         = texture->GetType() == RHI_Texture_Type::Type3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+        create_info_image.flags             = texture->GetType() == RHI_Texture_Type::TypeCube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+        create_info_image.usage             = get_image_usage_flags(texture);
+        create_info_image.extent.width      = texture->GetWidth();
+        create_info_image.extent.height     = texture->GetHeight();
+        create_info_image.extent.depth      = texture->GetType() == RHI_Texture_Type::Type3D ? texture->GetDepth() : 1;
+        create_info_image.mipLevels         = texture->GetMipCount();
+        create_info_image.arrayLayers       = texture->GetType() == RHI_Texture_Type::Type3D ? 1 : texture->GetDepth();
+        create_info_image.format            = vulkan_format[rhi_format_to_index(texture->GetFormat())];
+        create_info_image.tiling            = get_format_tiling(texture);
+        create_info_image.initialLayout     = vulkan_image_layout[static_cast<uint8_t>(texture->GetLayout(0))];
+        create_info_image.samples           = VK_SAMPLE_COUNT_1_BIT;
+        create_info_image.sharingMode       = VK_SHARING_MODE_EXCLUSIVE;
+
+        // enable concurrent sharing between graphics and compute queue families for async compute
+        uint32_t concurrent_families[2] = { queues::index_graphics, queues::index_compute };
+        if ((texture->GetFlags() & RHI_Texture_ConcurrentSharing) && queues::index_graphics != queues::index_compute)
+        {
+            create_info_image.sharingMode           = VK_SHARING_MODE_CONCURRENT;
+            create_info_image.queueFamilyIndexCount = 2;
+            create_info_image.pQueueFamilyIndices   = concurrent_families;
+        }
+
+        // check physical device format support
+        {
+            VkPhysicalDeviceImageFormatInfo2 format_info = {};
+            format_info.sType                           = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
+            format_info.format                          = create_info_image.format;
+            format_info.type                            = create_info_image.imageType;
+            format_info.tiling                          = create_info_image.tiling;
+            format_info.usage                           = create_info_image.usage;
+            format_info.flags                           = create_info_image.flags;
+
+            VkImageFormatProperties2 properties = {};
+            properties.sType                    = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
+
+            VkResult result = vkGetPhysicalDeviceImageFormatProperties2(RHI_Context::device_physical, &format_info, &properties);
+            SP_ASSERT_MSG(result != VK_ERROR_FORMAT_NOT_SUPPORTED, "The GPU doesn't support this image format with the specified properties");
+        }
+
+        // allocate
+        VmaAllocationInfo allocation_info;
+        VmaAllocation allocation;
+        {
+            VmaAllocationCreateInfo create_info_allocation  = {};
+            create_info_allocation.usage                    = VMA_MEMORY_USAGE_AUTO;
+            create_info_allocation.flags                    = (texture->GetFlags() & RHI_Texture_Mappable) ? VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT : 0;
+            bool gpu_writable = texture->IsRtv() || texture->IsDsv() || texture->IsUav();
+            create_info_allocation.priority = texture->GetFlags() & RHI_Texture_Mappable ? 0.3f : (gpu_writable ? 0.9f : 0.7f);
+            
+            // for large textures (>16mb), use dedicated allocations to avoid vma pooling
+            // this ensures memory is returned to the driver when freed rather than held in pools
+            uint32_t bytes_per_pixel  = rhi_format_to_bytes(texture->GetFormat());
+            uint64_t texture_size     = static_cast<uint64_t>(texture->GetWidth()) * texture->GetHeight() * texture->GetDepth() * texture->GetMipCount() * bytes_per_pixel;
+            const uint64_t size_16_mb = 16 * 1024 * 1024;
+            if (texture_size >= size_16_mb)
+            {
+                create_info_allocation.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+            }
+
+            void*& resource = texture->GetRhiResource();
+            VkResult result = vmaCreateImage
+            (
+                vulkan_memory_allocator::allocator,
+                &create_info_image,
+                &create_info_allocation,
+                reinterpret_cast<VkImage*>(&resource),
+                &allocation,
+                &allocation_info
+            );
+
+            if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY)
+            {
+                SP_ERROR_WINDOW
+                (
+                    "Failed to allocate texture due to insufficient memory. "
+                    "This likely occurred while loading a large scene or too many materials/textures."
+                );
+            }
+
+            SP_ASSERT_VK(result);
+
+            // set allocation name and data
+            vmaSetAllocationName(vulkan_memory_allocator::allocator, allocation, texture->GetObjectName().c_str());
+            RHI_Device::SetResourceName(allocation->GetMemory(), RHI_Resource_Type::DeviceMemory, texture->GetObjectName().c_str());
+        }
+
+        // get mapped data pointer
+        if (texture->GetFlags() & RHI_Texture_Mappable)
+        {
+            void*& mapped_data = texture->GetMappedData();
+            mapped_data = allocation_info.pMappedData;
+        }
+
+        vulkan_memory_allocator::save_allocation(texture->GetRhiResource(), allocation);
+    }
+
+    void RHI_Device::MemoryTextureDestroy(void*& resource)
+    {
+        VmaAllocation allocation = vulkan_memory_allocator::get_allocation_from_resource(resource);
+        if (allocation)
+        {
+            vmaDestroyImage(vulkan_memory_allocator::allocator, static_cast<VkImage>(resource), allocation);
+            vulkan_memory_allocator::destroy_allocation(resource);
+            resource = nullptr;
+        }
+    }
+
+    void RHI_Device::MemoryMap(void* resource, void*& mapped_data)
+    {
+        VmaAllocation allocation = vulkan_memory_allocator::get_allocation_from_resource(resource);
+        if (allocation)
+        {
+            SP_ASSERT_VK(vmaMapMemory(vulkan_memory_allocator::allocator, allocation, &mapped_data));
+        }
+    }
+
+    void RHI_Device::MemoryUnmap(void* resource)
+    {
+        VmaAllocation allocation = vulkan_memory_allocator::get_allocation_from_resource(resource);
+        if (allocation)
+        {
+            vmaUnmapMemory(vulkan_memory_allocator::allocator, allocation);
+        }
+    }
+
+    namespace
+    {
+        // cached at init time since physical device memory properties never change
+        VkPhysicalDeviceMemoryProperties cached_memory_properties = {};
+        bool memory_properties_cached = false;
+
+        const VkPhysicalDeviceMemoryProperties& get_memory_properties()
+        {
+            if (!memory_properties_cached)
+            {
+                vkGetPhysicalDeviceMemoryProperties(static_cast<VkPhysicalDevice>(RHI_Context::device_physical), &cached_memory_properties);
+                memory_properties_cached = true;
+            }
+            return cached_memory_properties;
+        }
+    }
+
+    uint64_t RHI_Device::MemoryGetAllocatedMb()
+    {
+        uint64_t bytes = 0;
+        const VkPhysicalDeviceMemoryProperties& memory_properties = get_memory_properties();
+
+        VmaBudget budgets[VK_MAX_MEMORY_HEAPS];
+        vmaGetHeapBudgets(vulkan_memory_allocator::allocator, budgets);
+
+        for (uint32_t i = 0; i < VK_MAX_MEMORY_HEAPS; i++)
+        {
+            if (memory_properties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            {
+                if (budgets[i].budget < (1ull << 60))
+                {
+                    bytes += budgets[i].usage;
+                }
+            }
+        }
+
+        return bytes / (1024ull * 1024ull);
+    }
+
+    uint64_t RHI_Device::MemoryGetAvailableMb()
+    {
+        uint64_t bytes = 0;
+        const VkPhysicalDeviceMemoryProperties& memory_properties = get_memory_properties();
+
+        VmaBudget budgets[VK_MAX_MEMORY_HEAPS];
+        vmaGetHeapBudgets(vulkan_memory_allocator::allocator, budgets);
+
+        for (uint32_t i = 0; i < VK_MAX_MEMORY_HEAPS; i++)
+        {
+            if (memory_properties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            {
+                if (budgets[i].budget < (1ull << 60))
+                {
+                    bytes += budgets[i].budget;
+                }
+            }
+        }
+
+        return bytes / (1024ull * 1024ull);
+    }
+
+    uint64_t RHI_Device::MemoryGetTotalMb()
+    {
+        uint64_t bytes = 0;
+        const VkPhysicalDeviceMemoryProperties& memory_properties = get_memory_properties();
+
+        for (uint32_t i = 0; i < memory_properties.memoryHeapCount; i++)
+        {
+            if (memory_properties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            {
+                bytes += memory_properties.memoryHeaps[i].size;
+            }
+        }
+
+        return bytes / (1024ull * 1024ull);
+    }
+
+    // staging buffers
+
+    void* RHI_Device::StagingBufferAcquire(uint64_t size)
+    {
+        void* buffer = nullptr;
+        MemoryBufferCreate(buffer, size,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            nullptr, "staging");
+        return buffer;
+    }
+
+    void RHI_Device::StagingBufferRelease(void* buffer)
+    {
+        if (!buffer)
+        {
+            return;
+        }
+
+        MemoryBufferDestroy(buffer);
+    }
+
+    void RHI_Device::StagingBufferPoolDestroy()
+    {
+        // no-op: buffers are destroyed immediately on release
+    }
+
+    // markers
+
+    void RHI_Device::MarkerBegin(RHI_CommandList* cmd_list, const char* name, const math::Vector4& color)
+    {
+        VkDebugUtilsLabelEXT label = {};
+        label.sType                = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+        label.pNext                = nullptr;
+        label.pLabelName           = name;
+        label.color[0]             = color.x;
+        label.color[1]             = color.y;
+        label.color[2]             = color.z;
+        label.color[3]             = color.w;
+
+        functions::marker_begin(static_cast<VkCommandBuffer>(cmd_list->GetRhiResource()), &label);
+    }
+
+    void RHI_Device::MarkerEnd(RHI_CommandList* cmd_list)
+    {
+        functions::marker_end(static_cast<VkCommandBuffer>(cmd_list->GetRhiResource()));
+    }
+
+    // misc
+
+    uint64_t RHI_Device::GetBufferDeviceAddress(void* buffer)
+    {
+        VkBufferDeviceAddressInfo address_info = {};
+        address_info.sType                     = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+        address_info.pNext                     = nullptr;
+        address_info.buffer                    = static_cast<VkBuffer>(buffer);
+        return functions::get_buffer_device_address(static_cast<VkDevice>(RHI_Context::device), &address_info);
+    }
+
+    void RHI_Device::SetResourceName(void* resource, const RHI_Resource_Type resource_type, const char* name)
+    {
+        if (Debugging::IsValidationLayerEnabled()) // function pointers are not initialized if validation disabled
+        {
+            SP_ASSERT(resource != nullptr);
+            SP_ASSERT(functions::set_object_name != nullptr);
+
+            VkDebugUtilsObjectNameInfoEXT name_info = {};
+            name_info.sType                         = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+            name_info.pNext                         = nullptr;
+            name_info.objectType                    = vulkan_object_type[static_cast<uint32_t>(resource_type)];
+            name_info.objectHandle                  = reinterpret_cast<uint64_t>(resource);
+            name_info.pObjectName                   = name;
+
+            functions::set_object_name(RHI_Context::device, &name_info);
+        }
+    }
+
+    void RHI_Device::SetVariableRateShading(const RHI_CommandList* cmd_list, const bool enabled)
+    {
+        if (!m_is_shading_rate_supported)
+        {
+            return;
+        }
+        if (cmd_list->m_vrs_valid && cmd_list->m_vrs_enabled == enabled)
+        {
+            return;
+        }
+        cmd_list->m_vrs_enabled = enabled;
+        cmd_list->m_vrs_valid   = true;
+
+        // set the fragment shading rate state for the current pipeline
+        VkExtent2D fragment_size = { 1, 1 };
+        VkFragmentShadingRateCombinerOpKHR combiner_operatins[2];
+
+        // the combiners determine how the different shading rate values for the pipeline, primitives and attachment are combined
+        if (enabled)
+        {
+            // if shading rate from attachment is enabled, we set the combiner, so that the values from the attachment are used
+            // combiner for pipeline (a) and primitive (b) - Not used in this sample
+            combiner_operatins[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+            // combiner for pipeline (a) and attachment (b), replace the pipeline default value (fragment_size) with the fragment sizes stored in the attachment
+            combiner_operatins[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR;
+        }
+        else
+        {
+            // if shading rate from attachment is disabled, we keep the value set via the dynamic state
+            combiner_operatins[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+            combiner_operatins[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+        }
+
+        functions::set_fragment_shading_rate(static_cast<VkCommandBuffer>(cmd_list->GetRhiResource()), &fragment_size, combiner_operatins);
+    }
+}

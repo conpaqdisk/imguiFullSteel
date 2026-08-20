@@ -1,0 +1,1431 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES =========================
+#include "pch.h"
+#include <filesystem>
+#include "Material.h"
+#include "../resource/ResourceCache.h"
+#include "../rhi/RHI_Texture.h"
+#include "../world/World.h"
+#include "../core/ProgressTracker.h"
+SP_WARNINGS_OFF
+#include "../io/pugixml.hpp"
+SP_WARNINGS_ON
+//====================================
+
+//= NAMESPACES ===============
+using namespace std;
+using namespace spartan::math;
+//============================
+
+namespace spartan
+{
+    namespace
+    {
+        const char* material_property_to_char_ptr(MaterialProperty material_property)
+        {
+            switch (material_property)
+            {
+                // System / meta
+                case MaterialProperty::Gltf:                       return "gltf";
+        
+                // World / geometry context
+                case MaterialProperty::WorldHeight:                return "world_space_height";
+                case MaterialProperty::WorldWidth:                 return "world_space_width";
+                case MaterialProperty::WorldSpaceUv:               return "world_space_uv";
+                case MaterialProperty::Tessellation:               return "tessellation";
+        
+                // Core PBR
+                case MaterialProperty::ColorR:                     return "color_r";
+                case MaterialProperty::ColorG:                     return "color_g";
+                case MaterialProperty::ColorB:                     return "color_b";
+                case MaterialProperty::ColorA:                     return "color_a";
+                case MaterialProperty::Roughness:                  return "roughness";
+                case MaterialProperty::Metalness:                  return "metalness";
+                case MaterialProperty::Normal:                     return "normal";
+                case MaterialProperty::Height:                     return "height";
+        
+                // Extended PBR
+                case MaterialProperty::Clearcoat:                  return "clearcoat";
+                case MaterialProperty::Clearcoat_Roughness:        return "clearcoat_roughness";
+                case MaterialProperty::Anisotropic:                return "anisotropic";
+                case MaterialProperty::AnisotropicRotation:        return "anisotropic_rotation";
+                case MaterialProperty::Sheen:                      return "sheen";
+                case MaterialProperty::SubsurfaceScattering:       return "subsurface_scattering";
+                case MaterialProperty::FlakeStrength:              return "flake_strength";
+                case MaterialProperty::FlakeScale:                 return "flake_scale";
+                case MaterialProperty::PearlStrength:              return "pearl_strength";
+                case MaterialProperty::PearlColorR:                return "pearl_color_r";
+                case MaterialProperty::PearlColorG:                return "pearl_color_g";
+                case MaterialProperty::PearlColorB:                return "pearl_color_b";
+                case MaterialProperty::CoatTintR:                  return "coat_tint_r";
+                case MaterialProperty::CoatTintG:                  return "coat_tint_g";
+                case MaterialProperty::CoatTintB:                  return "coat_tint_b";
+                case MaterialProperty::CoatTintStrength:           return "coat_tint_strength";
+                case MaterialProperty::Ior:                        return "ior";
+                case MaterialProperty::Absorption:                 return "absorption";
+                case MaterialProperty::Thickness:                  return "thickness";
+                case MaterialProperty::PaintPreset:                return "paint_preset";
+                case MaterialProperty::SurfacePreset:              return "surface_preset";
+                case MaterialProperty::NormalFromAlbedo:           return "normal_from_albedo";
+                case MaterialProperty::EmissiveFromAlbedo:         return "emissive_from_albedo";
+        
+                // Texture transforms
+                case MaterialProperty::TextureTilingX:             return "texture_tiling_x";
+                case MaterialProperty::TextureTilingY:             return "texture_tiling_y";
+                case MaterialProperty::TextureOffsetX:             return "texture_offset_x";
+                case MaterialProperty::TextureOffsetY:             return "texture_offset_y";
+                case MaterialProperty::TextureInvertX:             return "texture_invert_x";
+                case MaterialProperty::TextureInvertY:             return "texture_invert_y";
+                case MaterialProperty::TextureRotation:            return "texture_rotation";
+        
+                // Special effects
+                case MaterialProperty::IsTerrain:                  return "texture_slope_based";
+                case MaterialProperty::IsGrassBlade:               return "is_grass_blade";
+                case MaterialProperty::IsFlower:                   return "is_flower";
+                case MaterialProperty::WindAnimation:              return "wind_animation";
+                case MaterialProperty::ColorVariationFromInstance: return "color_variation_from_instance";
+                case MaterialProperty::IsWater:                    return "vertex_animate_water";
+                case MaterialProperty::MotionBlurRadial:           return "motion_blur_radial";
+        
+                // Render settings
+                case MaterialProperty::CullMode:                   return "cull_mode";
+        
+                // Sentinel
+                case MaterialProperty::Max:                        return "max";
+        
+                default:
+                {
+                    SP_ASSERT_MSG(false, "Unknown material property");
+                    return nullptr;
+                }
+            }
+        }
+
+        // per path mutex map, serializes concurrent saves so the tmp file and rename are not raced
+        mutex& save_mutex_for(const string& file_path)
+        {
+            static mutex map_mutex;
+            static unordered_map<string, unique_ptr<mutex>> mutexes;
+            lock_guard<mutex> guard(map_mutex);
+            auto it = mutexes.find(file_path);
+            if (it == mutexes.end())
+            {
+                it = mutexes.emplace(file_path, make_unique<mutex>()).first;
+            }
+            return *it->second;
+        }
+    }
+
+    namespace texture_processing
+    {
+        void pack_occlusion_roughness_metalness_height(
+            const vector<byte>& occlusion,
+            const vector<byte>& roughness,
+            const vector<byte>& metalness,
+            const vector<byte>& height,
+            const bool is_gltf,
+            vector<byte>& output
+        )
+        {
+            SP_ASSERT_MSG(
+                occlusion.size() == roughness.size() &&
+                roughness.size() == metalness.size() &&
+                metalness.size() == height.size(),
+                "The dimensions must be equal"
+            );
+
+            // just like gltf: occlusion, roughness and metalness as r, g, b channels respectively
+            for (size_t i = 0; i < occlusion.size(); i += 4)
+            {
+                output[i + 0] = occlusion[i];
+                output[i + 1] = roughness[i + (is_gltf ? 1 : 0)];
+                output[i + 2] = metalness[i + (is_gltf ? 2 : 0)];
+                output[i + 3] = height[i];
+            }
+        }
+
+        void merge_alpha_mask_into_color_alpha(vector<byte>& albedo, vector<byte>& mask)
+        {
+            SP_ASSERT_MSG(albedo.size() == mask.size(), "The dimensions must be equal");
+        
+            for (size_t i = 0; i < albedo.size(); i += 4)
+            {
+                float alpha_albedo   = static_cast<float>(albedo[i + 3]) / 255.0f; // channel a
+                float alpha_mask     = static_cast<float>(mask[i]) / 255.0f;       // channel r
+                float alpha_combined = min(alpha_albedo, alpha_mask);
+
+                albedo[i + 3] = static_cast<byte>(alpha_combined * 255.0f);
+            }
+        }
+
+        void generate_normal_from_albedo(const vector<byte>& albedo_data, vector<byte>& normal_data, uint32_t width, uint32_t height, bool flip_y = true, float intensity = 4.0f)
+        {
+            // validate inputs
+            SP_ASSERT_MSG(albedo_data.size() == width * height * 4, "Invalid albedo data size");
+            SP_ASSERT_MSG(intensity > 0.0f, "Intensity must be positive");
+            normal_data.resize(width * height * 4);
+        
+            // 5x5 sobel kernels for x and y gradients
+            const int sobel_x[5][5] =
+            {
+                {-2, -1,  0,  1,  2},
+                {-3, -2,  0,  2,  3},
+                {-4, -3,  0,  3,  4},
+                {-3, -2,  0,  2,  3},
+                {-2, -1,  0,  1,  2}
+            };
+            const int sobel_y[5][5] =
+            {
+                {-2, -3, -4, -3, -2},
+                {-1, -2, -3, -2, -1},
+                { 0,  0,  0,  0,  0},
+                { 1,  2,  3,  2,  1},
+                { 2,  3,  4,  3,  2}
+            };
+        
+            // function to get perceptual luminance (grayscale)
+            auto get_grayscale = [&](uint32_t px, uint32_t py) -> float
+            {
+                uint32_t index = (py * width + px) * 4;
+                float r = static_cast<float>(to_integer<uint8_t>(albedo_data[index + 0])) / 255.0f;
+                float g = static_cast<float>(to_integer<uint8_t>(albedo_data[index + 1])) / 255.0f;
+                float b = static_cast<float>(to_integer<uint8_t>(albedo_data[index + 2])) / 255.0f;
+                // perceptual luminance (itu-r bt.709)
+                return 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            };
+        
+            // temporary buffer for normal map before post-processing
+            vector<Vector3> temp_normals(width * height);
+        
+            // compute gradients and normals
+            for (uint32_t y = 0; y < height; ++y)
+            {
+                for (uint32_t x = 0; x < width; ++x)
+                {
+                    float gx = 0.0f, gy = 0.0f;
+        
+                    // apply 5x5 sobel kernels
+                    for (int j = -2; j <= 2; ++j)
+                    {
+                        for (int i = -2; i <= 2; ++i)
+                        {
+                            int px = (x + i + width) % width;
+                            int py = (y + j + height) % height;
+                            float value = get_grayscale(px, py);
+                            gx += value * sobel_x[j + 2][i + 2];
+                            gy += value * sobel_y[j + 2][i + 2];
+                        }
+                    }
+        
+                    // normalize gradient magnitude and apply intensity
+                    float scale = 1.0f / 128.0f;
+                    gx *= scale * intensity;
+                    gy *= scale * intensity;
+        
+                    // compute normal (z = 1 for surface facing up)
+                    Vector3 normal(gx, flip_y ? -gy : gy, 1.0f);
+                    normal.Normalize();
+        
+                    // store in temporary buffer
+                    temp_normals[y * width + x] = normal;
+                }
+            }
+        
+            // 3x3 gaussian kernel for smoothing
+            const float gaussian[3][3] =
+            {
+                {1.0f / 16.0f, 2.0f / 16.0f, 1.0f / 16.0f},
+                {2.0f / 16.0f, 4.0f / 16.0f, 2.0f / 16.0f},
+                {1.0f / 16.0f, 2.0f / 16.0f, 1.0f / 16.0f}
+            };
+        
+            // apply gaussian blur and store final normals
+            for (uint32_t y = 0; y < height; ++y)
+            {
+                for (uint32_t x = 0; x < width; ++x)
+                {
+                    Vector3 blurred_normal(0.0f, 0.0f, 0.0f);
+        
+                    // apply gaussian blur
+                    for (int j = -1; j <= 1; ++j)
+                    {
+                        for (int i = -1; i <= 1; ++i)
+                        {
+                            int px = (x + i + width) % width;
+                            int py = (y + j + height) % height;
+                            Vector3 n = temp_normals[py * width + px];
+                            float weight = gaussian[j + 1][i + 1];
+                            blurred_normal.x += n.x * weight;
+                            blurred_normal.y += n.y * weight;
+                            blurred_normal.z += n.z * weight;
+                        }
+                    }
+        
+                    // re-normalize after blurring
+                    blurred_normal.Normalize();
+        
+                    // map to [0,1] for storage
+                    blurred_normal = (blurred_normal + Vector3::One) * 0.5f;
+        
+                    // store in output
+                    uint32_t index = (y * width + x) * 4;
+                    normal_data[index + 0] = static_cast<byte>(static_cast<uint8_t>(blurred_normal.x * 255.0f)); // r: x direction
+                    normal_data[index + 1] = static_cast<byte>(static_cast<uint8_t>(blurred_normal.y * 255.0f)); // g: y direction
+                    normal_data[index + 2] = static_cast<byte>(static_cast<uint8_t>(blurred_normal.z * 255.0f)); // b: z direction
+                    normal_data[index + 3] = static_cast<byte>(255); // a: full opacity
+                }
+            }
+        }
+
+        void resize_texture(const vector<byte>& src_data, uint32_t src_width, uint32_t src_height, uint32_t src_channels, vector<byte>& dst_data, uint32_t dst_width, uint32_t dst_height)
+        {
+            SP_ASSERT_MSG(src_channels >= 1 && src_channels <= 4, "Invalid channel count");
+            SP_ASSERT_MSG(src_data.size() == src_width * src_height * src_channels, "Invalid source data size");
+            dst_data.resize(dst_width * dst_height * 4);
+
+            auto get_pixel = [&](uint32_t x, uint32_t y) -> Vector4
+            {
+                x = clamp(x, 0u, src_width - 1);
+                y = clamp(y, 0u, src_height - 1);
+                uint32_t index = (y * src_width + x) * src_channels;
+
+                // handle different channel counts - expand to RGBA
+                float r = static_cast<float>(src_data[index + 0]) / 255.0f;
+                float g = (src_channels >= 2) ? static_cast<float>(src_data[index + 1]) / 255.0f : r;
+                float b = (src_channels >= 3) ? static_cast<float>(src_data[index + 2]) / 255.0f : r;
+                float a = (src_channels >= 4) ? static_cast<float>(src_data[index + 3]) / 255.0f : 1.0f;
+
+                return Vector4(r, g, b, a);
+            };
+
+            for (uint32_t y = 0; y < dst_height; ++y)
+            {
+                for (uint32_t x = 0; x < dst_width; ++x)
+                {
+                    // bilinear interpolation
+                    float src_x = static_cast<float>(x) * src_width / dst_width;
+                    float src_y = static_cast<float>(y) * src_height / dst_height;
+
+                    uint32_t x0 = static_cast<uint32_t>(src_x);
+                    uint32_t y0 = static_cast<uint32_t>(src_y);
+                    float fx    = src_x - x0;
+                    float fy    = src_y - y0;
+
+                    Vector4 p00 = get_pixel(x0, y0);
+                    Vector4 p10 = get_pixel(x0 + 1, y0);
+                    Vector4 p01 = get_pixel(x0, y0 + 1);
+                    Vector4 p11 = get_pixel(x0 + 1, y0 + 1);
+
+                    Vector4 interpolated = Vector4::Lerp(Vector4::Lerp(p00, p10, fx), Vector4::Lerp(p01, p11, fx), fy);
+                    uint32_t index       = (y * dst_width + x) * 4;
+                    dst_data[index + 0]  = static_cast<byte>(interpolated.x * 255.0f);
+                    dst_data[index + 1]  = static_cast<byte>(interpolated.y * 255.0f);
+                    dst_data[index + 2]  = static_cast<byte>(interpolated.z * 255.0f);
+                    dst_data[index + 3]  = static_cast<byte>(interpolated.w * 255.0f);
+                }
+            }
+        }
+
+        vector<byte> get_texture_data_or_default(RHI_Texture* texture, const size_t expected_size, const byte default_value)
+        {
+            RHI_Texture_Mip* mip = texture ? texture->GetMip(0, 0) : nullptr;
+            if (mip && !mip->bytes.empty())
+                return mip->bytes;
+
+            return vector<byte>(expected_size, default_value);
+        }
+
+
+        void pack_textures(Material* material, const uint8_t slot)
+        {
+            // get textures
+            RHI_Texture* texture_color      = material->GetTexture(MaterialTextureType::Color, slot);
+            RHI_Texture* texture_normal     = material->GetTexture(MaterialTextureType::Normal, slot);
+            RHI_Texture* texture_alpha_mask = material->GetTexture(MaterialTextureType::AlphaMask, slot);
+            RHI_Texture* texture_occlusion  = material->GetTexture(MaterialTextureType::Occlusion, slot);
+            RHI_Texture* texture_roughness  = material->GetTexture(MaterialTextureType::Roughness, slot);
+            RHI_Texture* texture_metalness  = material->GetTexture(MaterialTextureType::Metalness, slot);
+            RHI_Texture* texture_height     = material->GetTexture(MaterialTextureType::Height, slot);
+        
+            // check for normal_from_albedo flag
+            if (material->GetProperty(MaterialProperty::NormalFromAlbedo) == 1.0f && texture_color && !texture_color->IsCompressedFormat())
+            {
+                // get albedo dimensions
+                uint32_t width     = texture_color->GetWidth();
+                uint32_t height    = texture_color->GetHeight();
+                uint32_t depth     = texture_color->GetDepth();
+                uint32_t mip_count = texture_color->GetMipCount();
+        
+                // generate normal map name
+                string normal_name = "normal_from_" + texture_color->GetObjectName() + "_slot" + to_string(slot);
+        
+                // check if normal map already exists
+                shared_ptr<RHI_Texture> texture_normal_new = ResourceCache::GetByName<RHI_Texture>(normal_name);
+                if (!texture_normal_new)
+                {
+                    texture_normal_new = make_shared<RHI_Texture>(
+                        RHI_Texture_Type::Type2D,
+                        width,
+                        height,
+                        depth,
+                        mip_count,
+                        RHI_Format::R8G8B8A8_Unorm,
+                        RHI_Texture_Srv | RHI_Texture_Compress,
+                        normal_name.c_str()
+                    );
+                    texture_normal_new->SetCompressionFormat(RHI_Format::BC5_Unorm);
+        
+                    // allocate mip
+                    texture_normal_new->AllocateMip();
+        
+                    // generate normal map data
+                    vector<byte> normal_data;
+                    texture_processing::generate_normal_from_albedo(
+                        texture_color->GetMip(0, 0)->bytes,
+                        normal_data,
+                        width,
+                        height
+                    );
+                    texture_normal_new->GetMip(0, 0)->bytes = move(normal_data);
+
+                    // cache the new texture, Material::PrepareForGpu uploads after releasing m_mutex
+                    texture_normal_new->SetResourceFilePath(texture_color->GetObjectName() + "_normal_from_albedo.png"); // that's a hack, need to fix the ResourceCache to rely on a hash, not names and paths
+                    texture_normal_new = ResourceCache::Cache<RHI_Texture>(texture_normal_new);
+                }
+        
+                // set the new normal texture
+                material->SetTexture(MaterialTextureType::Normal, texture_normal_new, slot);
+                texture_normal = texture_normal_new.get();
+            }
+        
+            // helper to check if texture is valid for packing
+            auto is_valid_for_packing = [](RHI_Texture* tex) -> bool
+            {
+                return tex && !tex->IsCompressedFormat() && tex->GetWidth() > 0 && tex->GetHeight() > 0;
+            };
+
+            // find max resolution among relevant textures
+            uint32_t max_width = 1, max_height = 1;
+            auto check_texture_res = [&](RHI_Texture* tex)
+            {
+                if (is_valid_for_packing(tex))
+                {
+                    max_width  = max(max_width, tex->GetWidth());
+                    max_height = max(max_height, tex->GetHeight());
+                }
+            };
+            check_texture_res(texture_color);
+            check_texture_res(texture_occlusion);
+            check_texture_res(texture_roughness);
+            check_texture_res(texture_metalness);
+            check_texture_res(texture_height);
+
+            // find max mip count among relevant textures
+            uint32_t max_mip_count = 1;
+            auto check_mip = [&](RHI_Texture* tex)
+            {
+                if (is_valid_for_packing(tex))
+                {
+                    max_mip_count = max(max_mip_count, tex->GetMipCount());
+                }
+            };
+            check_mip(texture_color);
+            check_mip(texture_occlusion);
+            check_mip(texture_roughness);
+            check_mip(texture_metalness);
+            check_mip(texture_height);
+        
+            // pack textures
+            {
+                // step 1: pack alpha mask into color alpha (resize if needed)
+                if (texture_alpha_mask)
+                {
+                    if (!texture_color)
+                    {
+                        material->SetTexture(MaterialTextureType::Color, texture_alpha_mask);
+                    }
+                    else
+                    {
+                        if (!texture_color->IsCompressedFormat() && !texture_alpha_mask->IsCompressedFormat())
+                        {
+                            if (texture_color->GetWidth() != texture_alpha_mask->GetWidth() || texture_color->GetHeight() != texture_alpha_mask->GetHeight())
+                            {
+                                vector<byte> resized_mask;
+                                texture_processing::resize_texture(
+                                    texture_alpha_mask->GetMip(0, 0)->bytes,
+                                    texture_alpha_mask->GetWidth(),
+                                    texture_alpha_mask->GetHeight(),
+                                    texture_alpha_mask->GetChannelCount(),
+                                    resized_mask,
+                                    texture_color->GetWidth(),
+                                    texture_color->GetHeight()
+                                );
+                                texture_processing::merge_alpha_mask_into_color_alpha(texture_color->GetMip(0, 0)->bytes, resized_mask);
+                            }
+                            else
+                            {
+                                texture_processing::merge_alpha_mask_into_color_alpha(texture_color->GetMip(0, 0)->bytes, texture_alpha_mask->GetMip(0, 0)->bytes);
+                            }
+
+                            // the merged alpha now carries the mask, so flag the color texture as transparent
+                            // this drives BC3 compression below, otherwise BC1 would silently drop the alpha
+                            texture_color->SetFlag(RHI_Texture_Transparent, true);
+                        }
+                    }
+                }
+        
+                // step 2: pack occlusion, roughness, metalness, and height into a single texture
+                {
+                    // helper to check if texture data is available for packing
+                    auto has_packable_data = [](RHI_Texture* tex) -> bool
+                    {
+                        if (!tex || tex->IsCompressedFormat())
+                            return false;
+                        RHI_Texture_Mip* mip = tex->GetMip(0, 0);
+                        return mip && !mip->bytes.empty();
+                    };
+        
+                    // generate unique name including slot to handle multi-slot materials (e.g. terrain)
+                    string tex_name = material->GetObjectName() + "_packed_slot" + to_string(slot);
+                    
+                    // for repacking, remove the old packed texture from cache so we create a fresh one
+                    shared_ptr<RHI_Texture> texture_packed = ResourceCache::GetByName<RHI_Texture>(tex_name);
+                    if (texture_packed)
+                    {
+                        ResourceCache::Remove(texture_packed);
+                        texture_packed = nullptr;
+                    }
+
+                    // always create packed texture - use material properties as fallback when texture data is unavailable
+                    {
+                        // create packed texture
+                        string packed_name = tex_name + ".tex_packed";
+                        texture_packed = make_shared<RHI_Texture>
+                        (
+                            RHI_Texture_Type::Type2D,
+                            max_width,
+                            max_height,
+                            1, // assuming depth=1
+                            1, // mip_count=1 for now
+                            RHI_Format::R8G8B8A8_Unorm,
+                            RHI_Texture_Srv | RHI_Texture_Compress,
+                            tex_name.c_str()
+                        );
+                        texture_packed->SetResourceName(packed_name);
+                        texture_packed->SetPersistent(
+                            material->IsPersistent()
+                        );
+                        texture_packed->SetCompressionFormat(RHI_Format::BC3_Unorm);
+                        
+                        // set resource file path so the texture can be cached and properly referenced by materials
+                        // the path matches what World::SaveToFile uses when saving textures
+                        string packed_path = string(ResourceCache::GetProjectDirectory()) + packed_name + ".texture";
+                        texture_packed->SetResourceFilePath(packed_path);
+                        
+                        texture_packed->AllocateMip();
+        
+                        const size_t packed_size = max_width * max_height * 4;
+
+                        // get texture data or use material property-based defaults
+                        // when textures are compressed or have empty bytes, fall back to material properties
+                        byte roughness_default = static_cast<byte>(material->GetProperty(MaterialProperty::Roughness) * 255.0f);
+                        byte metalness_default = static_cast<byte>(material->GetProperty(MaterialProperty::Metalness) * 255.0f);
+
+                        vector<byte> occlusion_data = texture_processing::get_texture_data_or_default(
+                            has_packable_data(texture_occlusion) ? texture_occlusion : nullptr, packed_size, static_cast<byte>(255));
+                        vector<byte> roughness_data = texture_processing::get_texture_data_or_default(
+                            has_packable_data(texture_roughness) ? texture_roughness : nullptr, packed_size, roughness_default);
+                        vector<byte> metalness_data = texture_processing::get_texture_data_or_default(
+                            has_packable_data(texture_metalness) ? texture_metalness : nullptr, packed_size, metalness_default);
+                        vector<byte> height_data = texture_processing::get_texture_data_or_default(
+                            has_packable_data(texture_height) ? texture_height : nullptr, packed_size, static_cast<byte>(127));
+        
+                        // resize if necessary (only when texture data is available)
+                        if (has_packable_data(texture_occlusion) && (texture_occlusion->GetWidth() != max_width || texture_occlusion->GetHeight() != max_height))
+                        {
+                            texture_processing::resize_texture(texture_occlusion->GetMip(0, 0)->bytes, texture_occlusion->GetWidth(), texture_occlusion->GetHeight(), texture_occlusion->GetChannelCount(), occlusion_data, max_width, max_height);
+                        }
+                        if (has_packable_data(texture_roughness) && (texture_roughness->GetWidth() != max_width || texture_roughness->GetHeight() != max_height))
+                        {
+                            texture_processing::resize_texture(texture_roughness->GetMip(0, 0)->bytes, texture_roughness->GetWidth(), texture_roughness->GetHeight(), texture_roughness->GetChannelCount(), roughness_data, max_width, max_height);
+                        }
+                        if (has_packable_data(texture_metalness) && (texture_metalness->GetWidth() != max_width || texture_metalness->GetHeight() != max_height))
+                        {
+                            texture_processing::resize_texture(texture_metalness->GetMip(0, 0)->bytes, texture_metalness->GetWidth(), texture_metalness->GetHeight(), texture_metalness->GetChannelCount(), metalness_data, max_width, max_height);
+                        }
+                        if (has_packable_data(texture_height) && (texture_height->GetWidth() != max_width || texture_height->GetHeight() != max_height))
+                        {
+                            texture_processing::resize_texture(texture_height->GetMip(0, 0)->bytes, texture_height->GetWidth(), texture_height->GetHeight(), texture_height->GetChannelCount(), height_data, max_width, max_height);
+                        }
+        
+                        texture_processing::pack_occlusion_roughness_metalness_height(
+                            move(occlusion_data),
+                            move(roughness_data),
+                            move(metalness_data),
+                            move(height_data),
+                            material->GetProperty(MaterialProperty::Gltf) == 1.0f,
+                            texture_packed->GetMip(0, 0)->bytes
+                        );
+
+                        // Material::PrepareForGpu uploads after releasing m_mutex
+                        texture_packed = ResourceCache::Cache<RHI_Texture>(texture_packed);
+                    }
+        
+                    material->SetTexture(MaterialTextureType::Packed, texture_packed, slot);
+                }
+            }
+
+            // mark non-packed material textures for compression with appropriate formats;
+            // this runs after packing so the raw data has already been read for channel packing
+            if (texture_color && !texture_color->IsCompressedFormat())
+            {
+                texture_color->SetFlag(RHI_Texture_Compress);
+                texture_color->SetCompressionFormat(texture_color->IsSemiTransparent() ? RHI_Format::BC3_Unorm : RHI_Format::BC1_Unorm);
+            }
+
+            if (texture_normal && !texture_normal->IsCompressedFormat())
+            {
+                texture_normal->SetFlag(RHI_Texture_Compress);
+                texture_normal->SetCompressionFormat(RHI_Format::BC5_Unorm);
+            }
+        }
+    }
+
+    Material::Material() : IResource(ResourceType::Material)
+    {
+        m_textures.fill(nullptr);
+        m_properties.fill(0.0f);
+
+        SetProperty(MaterialProperty::ColorR,         1.0f);
+        SetProperty(MaterialProperty::ColorG,         1.0f);
+        SetProperty(MaterialProperty::ColorB,         1.0f);
+        SetProperty(MaterialProperty::ColorA,         1.0f);
+        SetProperty(MaterialProperty::Roughness,      1.0f);
+        SetProperty(MaterialProperty::TextureTilingX, 1.0f);
+        SetProperty(MaterialProperty::TextureTilingY, 1.0f);
+        SetProperty(MaterialProperty::TextureInvertX, 0.0f);
+        SetProperty(MaterialProperty::TextureInvertY, 0.0f);
+        SetProperty(MaterialProperty::FlakeScale,     120.0f);
+        SetProperty(MaterialProperty::PearlColorR,    1.0f);
+        SetProperty(MaterialProperty::PearlColorG,    1.0f);
+        SetProperty(MaterialProperty::PearlColorB,    1.0f);
+        SetProperty(MaterialProperty::CoatTintR,      1.0f);
+        SetProperty(MaterialProperty::CoatTintG,      1.0f);
+        SetProperty(MaterialProperty::CoatTintB,      1.0f);
+        SetProperty(MaterialProperty::Ior,            EnumToIor(MaterialIor::Glass));
+        SetProperty(MaterialProperty::WorldHeight,    1.0f);
+        SetProperty(MaterialProperty::CullMode,       static_cast<float>(RHI_CullMode::Back));
+
+        const char* project_dir = ResourceCache::GetProjectDirectory();
+        char file_path[512];
+        snprintf(file_path, sizeof(file_path), "%smaterials\\empty.xml", project_dir);
+        SetResourceFilePath(file_path);
+    }
+
+    void Material::ApplyPaintPreset(MaterialPaintPreset preset, const Color& color, bool save)
+    {
+        ResetPresetProperties(false);
+        SetColorInternal(color, false);
+
+        switch (preset)
+        {
+            case MaterialPaintPreset::GlossSolid:
+            {
+                SetPropertyInternal(MaterialProperty::Roughness,           0.08f, false);
+                SetPropertyInternal(MaterialProperty::Clearcoat,           1.0f,  false);
+                SetPropertyInternal(MaterialProperty::Clearcoat_Roughness, 0.05f, false);
+                SetPropertyInternal(MaterialProperty::Normal,              0.03f, false);
+                SetPropertyInternal(MaterialProperty::TextureTilingX,      100.0f, false);
+                SetPropertyInternal(MaterialProperty::TextureTilingY,      100.0f, false);
+                break;
+            }
+            case MaterialPaintPreset::Metallic:
+            {
+                SetPropertyInternal(MaterialProperty::Roughness,           0.26f, false);
+                SetPropertyInternal(MaterialProperty::Metalness,           0.02f, false);
+                SetPropertyInternal(MaterialProperty::Clearcoat,           0.9f,  false);
+                SetPropertyInternal(MaterialProperty::Clearcoat_Roughness, 0.1f,  false);
+                SetPropertyInternal(MaterialProperty::Anisotropic,         0.1f,  false);
+                SetPropertyInternal(MaterialProperty::Normal,              0.04f, false);
+                SetPropertyInternal(MaterialProperty::FlakeStrength,       0.18f, false);
+                SetPropertyInternal(MaterialProperty::FlakeScale,          160.0f, false);
+                SetPropertyInternal(MaterialProperty::TextureTilingX,      130.0f, false);
+                SetPropertyInternal(MaterialProperty::TextureTilingY,      130.0f, false);
+                break;
+            }
+            case MaterialPaintPreset::Satin:
+            {
+                SetPropertyInternal(MaterialProperty::Roughness,           0.42f, false);
+                SetPropertyInternal(MaterialProperty::Clearcoat,           0.75f, false);
+                SetPropertyInternal(MaterialProperty::Clearcoat_Roughness, 0.45f, false);
+                SetPropertyInternal(MaterialProperty::Normal,              0.02f, false);
+                SetPropertyInternal(MaterialProperty::TextureTilingX,      80.0f, false);
+                SetPropertyInternal(MaterialProperty::TextureTilingY,      80.0f, false);
+                break;
+            }
+            case MaterialPaintPreset::Matte:
+            {
+                SetPropertyInternal(MaterialProperty::Roughness, 0.82f, false);
+                SetPropertyInternal(MaterialProperty::Sheen,     0.15f, false);
+                SetPropertyInternal(MaterialProperty::Normal,    0.02f, false);
+                break;
+            }
+            case MaterialPaintPreset::Pearl:
+            {
+                SetPropertyInternal(MaterialProperty::Roughness,           0.18f, false);
+                SetPropertyInternal(MaterialProperty::Clearcoat,           1.0f,  false);
+                SetPropertyInternal(MaterialProperty::Clearcoat_Roughness, 0.07f, false);
+                SetPropertyInternal(MaterialProperty::Sheen,               0.25f, false);
+                SetPropertyInternal(MaterialProperty::Normal,              0.04f, false);
+                SetPropertyInternal(MaterialProperty::PearlStrength,       0.55f, false);
+                SetPropertyInternal(MaterialProperty::PearlColorR,         0.55f, false);
+                SetPropertyInternal(MaterialProperty::PearlColorG,         0.78f, false);
+                SetPropertyInternal(MaterialProperty::PearlColorB,         1.0f,  false);
+                SetPropertyInternal(MaterialProperty::FlakeStrength,       0.18f, false);
+                SetPropertyInternal(MaterialProperty::FlakeScale,          140.0f, false);
+                SetPropertyInternal(MaterialProperty::TextureTilingX,      120.0f, false);
+                SetPropertyInternal(MaterialProperty::TextureTilingY,      120.0f, false);
+                break;
+            }
+            case MaterialPaintPreset::Candy:
+            {
+                SetPropertyInternal(MaterialProperty::Roughness,             0.12f, false);
+                SetPropertyInternal(MaterialProperty::Clearcoat,             1.0f,  false);
+                SetPropertyInternal(MaterialProperty::Clearcoat_Roughness,   0.035f, false);
+                SetPropertyInternal(MaterialProperty::SubsurfaceScattering,  0.18f, false);
+                SetPropertyInternal(MaterialProperty::Normal,                0.015f, false);
+                SetPropertyInternal(MaterialProperty::CoatTintR,             1.0f, false);
+                SetPropertyInternal(MaterialProperty::CoatTintG,             0.12f, false);
+                SetPropertyInternal(MaterialProperty::CoatTintB,             0.04f, false);
+                SetPropertyInternal(MaterialProperty::CoatTintStrength,      0.45f, false);
+                break;
+            }
+            case MaterialPaintPreset::Chameleon:
+            {
+                SetPropertyInternal(MaterialProperty::Roughness,           0.16f, false);
+                SetPropertyInternal(MaterialProperty::Clearcoat,           1.0f,  false);
+                SetPropertyInternal(MaterialProperty::Clearcoat_Roughness, 0.06f, false);
+                SetPropertyInternal(MaterialProperty::Sheen,               0.5f,  false);
+                SetPropertyInternal(MaterialProperty::Anisotropic,         0.15f, false);
+                SetPropertyInternal(MaterialProperty::Normal,              0.04f, false);
+                SetPropertyInternal(MaterialProperty::PearlStrength,       0.9f,  false);
+                SetPropertyInternal(MaterialProperty::PearlColorR,         0.25f, false);
+                SetPropertyInternal(MaterialProperty::PearlColorG,         0.9f,  false);
+                SetPropertyInternal(MaterialProperty::PearlColorB,         1.0f,  false);
+                SetPropertyInternal(MaterialProperty::CoatTintR,           0.55f, false);
+                SetPropertyInternal(MaterialProperty::CoatTintG,           0.2f,  false);
+                SetPropertyInternal(MaterialProperty::CoatTintB,           1.0f,  false);
+                SetPropertyInternal(MaterialProperty::CoatTintStrength,    0.25f, false);
+                SetPropertyInternal(MaterialProperty::FlakeStrength,       0.25f, false);
+                SetPropertyInternal(MaterialProperty::FlakeScale,          180.0f, false);
+                break;
+            }
+            case MaterialPaintPreset::Max:
+            default:
+            {
+                SP_ASSERT_MSG(false, "Unknown material paint preset");
+                break;
+            }
+        }
+
+        SetPropertyInternal(MaterialProperty::PaintPreset,   static_cast<float>(preset) + 1.0f, false);
+        SetPropertyInternal(MaterialProperty::SurfacePreset, 0.0f, false);
+
+        if (save)
+        {
+            SaveToFile(GetResourceFilePath());
+        }
+    }
+
+    void Material::ApplySurfacePreset(MaterialSurfacePreset preset, bool save)
+    {
+        ResetPresetProperties(false);
+
+        switch (preset)
+        {
+            case MaterialSurfacePreset::GlassClear:
+            {
+                SetColorInternal(Color(0.85f, 0.95f, 1.0f, 0.12f), false);
+                SetPropertyInternal(MaterialProperty::Roughness,           0.02f, false);
+                SetPropertyInternal(MaterialProperty::Clearcoat,           1.0f,  false);
+                SetPropertyInternal(MaterialProperty::Clearcoat_Roughness, 0.02f, false);
+                SetPropertyInternal(MaterialProperty::Ior,                 EnumToIor(MaterialIor::Glass), false);
+                SetPropertyInternal(MaterialProperty::Absorption,          0.15f, false);
+                SetPropertyInternal(MaterialProperty::Thickness,           0.006f, false);
+                break;
+            }
+            case MaterialSurfacePreset::GlassTinted:
+            {
+                SetColorInternal(Color(0.08f, 0.1f, 0.12f, 0.35f), false);
+                SetPropertyInternal(MaterialProperty::Roughness,           0.04f, false);
+                SetPropertyInternal(MaterialProperty::Clearcoat,           1.0f,  false);
+                SetPropertyInternal(MaterialProperty::Clearcoat_Roughness, 0.04f, false);
+                SetPropertyInternal(MaterialProperty::Ior,                 EnumToIor(MaterialIor::Glass), false);
+                SetPropertyInternal(MaterialProperty::Absorption,          1.2f,  false);
+                SetPropertyInternal(MaterialProperty::Thickness,           0.006f, false);
+                break;
+            }
+            case MaterialSurfacePreset::HeadlightLens:
+            {
+                SetColorInternal(Color(1.0f, 0.96f, 0.82f, 0.25f), false);
+                SetPropertyInternal(MaterialProperty::Roughness,           0.06f, false);
+                SetPropertyInternal(MaterialProperty::Clearcoat,           1.0f,  false);
+                SetPropertyInternal(MaterialProperty::Clearcoat_Roughness, 0.06f, false);
+                SetPropertyInternal(MaterialProperty::Ior,                 EnumToIor(MaterialIor::Glass), false);
+                SetPropertyInternal(MaterialProperty::Absorption,          0.35f, false);
+                SetPropertyInternal(MaterialProperty::Thickness,           0.012f, false);
+                break;
+            }
+            case MaterialSurfacePreset::TaillightLens:
+            {
+                SetColorInternal(Color(1.0f, 0.04f, 0.02f, 0.4f), false);
+                SetPropertyInternal(MaterialProperty::Roughness,           0.1f,  false);
+                SetPropertyInternal(MaterialProperty::Clearcoat,           0.8f,  false);
+                SetPropertyInternal(MaterialProperty::Clearcoat_Roughness, 0.12f, false);
+                SetPropertyInternal(MaterialProperty::Ior,                 EnumToIor(MaterialIor::Glass), false);
+                SetPropertyInternal(MaterialProperty::Absorption,          2.5f,  false);
+                SetPropertyInternal(MaterialProperty::Thickness,           0.01f, false);
+                break;
+            }
+            case MaterialSurfacePreset::RubberTire:
+            {
+                SetColorInternal(Color(0.015f, 0.014f, 0.013f, 1.0f), false);
+                SetPropertyInternal(MaterialProperty::Roughness, 0.92f, false);
+                SetPropertyInternal(MaterialProperty::Normal,    0.35f, false);
+                break;
+            }
+            case MaterialSurfacePreset::CarbonFiber:
+            {
+                SetColorInternal(Color(0.015f, 0.016f, 0.017f, 1.0f), false);
+                SetPropertyInternal(MaterialProperty::Roughness,           0.38f, false);
+                SetPropertyInternal(MaterialProperty::Clearcoat,           0.65f, false);
+                SetPropertyInternal(MaterialProperty::Clearcoat_Roughness, 0.18f, false);
+                SetPropertyInternal(MaterialProperty::Anisotropic,         0.7f,  false);
+                SetPropertyInternal(MaterialProperty::AnisotropicRotation, 0.125f, false);
+                SetPropertyInternal(MaterialProperty::Normal,              0.25f, false);
+                break;
+            }
+            case MaterialSurfacePreset::Chrome:
+            {
+                SetColorInternal(Color(0.95f, 0.94f, 0.92f, 1.0f), false);
+                SetPropertyInternal(MaterialProperty::Roughness, 0.05f, false);
+                SetPropertyInternal(MaterialProperty::Metalness, 1.0f,  false);
+                break;
+            }
+            case MaterialSurfacePreset::PolishedMetal:
+            {
+                SetColorInternal(Color(0.72f, 0.7f, 0.66f, 1.0f), false);
+                SetPropertyInternal(MaterialProperty::Roughness, 0.22f, false);
+                SetPropertyInternal(MaterialProperty::Metalness, 1.0f,  false);
+                break;
+            }
+            case MaterialSurfacePreset::BrakeDisc:
+            {
+                SetColorInternal(Color(0.62f, 0.6f, 0.56f, 1.0f), false);
+                SetPropertyInternal(MaterialProperty::Roughness,           0.36f, false);
+                SetPropertyInternal(MaterialProperty::Metalness,           1.0f,  false);
+                SetPropertyInternal(MaterialProperty::Anisotropic,         1.0f,  false);
+                SetPropertyInternal(MaterialProperty::AnisotropicRotation, 0.2f,  false);
+                break;
+            }
+            case MaterialSurfacePreset::Leather:
+            {
+                SetColorInternal(Color(0.035f, 0.03f, 0.026f, 1.0f), false);
+                SetPropertyInternal(MaterialProperty::Roughness, 0.75f, false);
+                SetPropertyInternal(MaterialProperty::Sheen,     0.25f, false);
+                SetPropertyInternal(MaterialProperty::Normal,    0.08f, false);
+                break;
+            }
+            case MaterialSurfacePreset::BlackPlastic:
+            {
+                SetColorInternal(Color(0.006f, 0.006f, 0.006f, 1.0f), false);
+                SetPropertyInternal(MaterialProperty::Roughness,           0.55f, false);
+                SetPropertyInternal(MaterialProperty::Clearcoat,           0.25f, false);
+                SetPropertyInternal(MaterialProperty::Clearcoat_Roughness, 0.35f, false);
+                break;
+            }
+            case MaterialSurfacePreset::EmissiveRedLight:
+            {
+                // keep saturated red chroma, strength stays well below the 100k nit full scale so bloom stays red
+                SetColorInternal(Color(1.0f, 0.02f, 0.01f, 1.0f), false);
+                SetPropertyInternal(MaterialProperty::Roughness,          0.2f, false);
+                SetPropertyInternal(MaterialProperty::EmissiveFromAlbedo, 0.02f, false);
+                break;
+            }
+            case MaterialSurfacePreset::EmissiveWhiteLight:
+            {
+                SetColorInternal(Color(1.0f, 0.86f, 0.58f, 1.0f), false);
+                SetPropertyInternal(MaterialProperty::Roughness,          0.15f, false);
+                SetPropertyInternal(MaterialProperty::EmissiveFromAlbedo, 1.0f, false);
+                break;
+            }
+            case MaterialSurfacePreset::Max:
+            default:
+            {
+                SP_ASSERT_MSG(false, "Unknown material surface preset");
+                break;
+            }
+        }
+
+        SetPropertyInternal(MaterialProperty::PaintPreset,   0.0f, false);
+        SetPropertyInternal(MaterialProperty::SurfacePreset, static_cast<float>(preset) + 1.0f, false);
+
+        if (save)
+        {
+            SaveToFile(GetResourceFilePath());
+        }
+    }
+
+    shared_ptr<Material> Material::Clone(const string& resource_name) const
+    {
+        shared_ptr<Material> clone = make_shared<Material>();
+        clone->SetResourceName(resource_name);
+        clone->m_textures      = m_textures;
+        clone->m_properties    = m_properties;
+        clone->m_flags         = m_flags;
+        clone->m_needs_repack  = false;
+        clone->m_resource_state.store(
+            ResourceState::PreparedForGpu,
+            memory_order_release
+        );
+        clone->m_object_size   = sizeof(*clone);
+
+        return clone;
+    }
+
+    void Material::LoadFromFile(const string& file_path)
+    {
+        pugi::xml_document doc;
+        pugi::xml_parse_result result = doc.load_file(file_path.c_str());
+        if (!result)
+        {
+            SP_LOG_ERROR("Failed to load XML file %s, pugi: %s", file_path.c_str(), result.description());
+            return;
+        }
+
+        SetResourceFilePath(file_path);
+        pugi::xml_node node_material = doc.child("Material");
+        if (!node_material)
+        {
+            SP_LOG_ERROR("Material file missing root node: %s", file_path.c_str());
+            return;
+        }
+
+        // load properties
+        for (uint32_t i = 0; i < static_cast<uint32_t>(MaterialProperty::Max); ++i)
+        {
+            const char* attribute_name = material_property_to_char_ptr(static_cast<MaterialProperty>(i));
+            if (pugi::xml_node property_node = node_material.child(attribute_name))
+            {
+                m_properties[i] = property_node.text().as_float();
+            }
+        }
+        bump_revision();
+    
+        // load textures (skip packed textures as they're regenerated from source textures during PrepareForGpu)
+        pugi::xml_node textures_node = node_material.child("textures");
+        for (uint32_t type = 0; type < static_cast<uint32_t>(MaterialTextureType::Max); ++type)
+        {
+            if (static_cast<MaterialTextureType>(type) == MaterialTextureType::Packed)
+            {
+                continue;
+            }
+
+            for (uint32_t slot = 0; slot < slots_per_texture; ++slot)
+            {
+                uint32_t index   = type * slots_per_texture + slot;
+                string node_name = "texture_" + to_string(index);
+                pugi::xml_node node_texture = textures_node.child(node_name.c_str());
+                if (!node_texture)
+                {
+                    continue;
+                }
+    
+                string tex_name = node_texture.attribute("texture_name").as_string();
+                string tex_path = node_texture.attribute("texture_path").as_string();
+
+                // by path first since paths are unique, names like normal collide and procedural textures have no file behind them
+                shared_ptr<RHI_Texture> texture;
+                if (!tex_path.empty() && FileSystem::Exists(tex_path))
+                {
+                    texture = ResourceCache::Load<RHI_Texture>(tex_path);
+                }
+
+                if (!texture && !tex_name.empty())
+                {
+                    texture = ResourceCache::GetByName<RHI_Texture>(tex_name);
+                }
+    
+                if (texture)
+                {
+                    SetTexture(static_cast<MaterialTextureType>(type), texture.get(), slot, false);
+                }
+            }
+        }
+    
+        m_object_size = sizeof(*this);
+    }
+    
+    void Material::SaveToFile(const string& file_path)
+    {
+        // skip when called without a resolved path
+        if (file_path.empty())
+        {
+            return;
+        }
+
+        // serialize concurrent saves of the same path, the tmp file and rename must not race
+        lock_guard<mutex> file_lock(save_mutex_for(file_path));
+
+        SetResourceFilePath(file_path);
+        pugi::xml_document doc;
+        pugi::xml_node material_node = doc.append_child("Material");
+
+        // save properties
+        for (uint32_t i = 0; i < static_cast<uint32_t>(MaterialProperty::Max); ++i)
+        {
+            const char* attribute_name = material_property_to_char_ptr(static_cast<MaterialProperty>(i));
+            material_node.append_child(attribute_name).text().set(m_properties[i]);
+        }
+
+        // save textures (skip packed textures as they're regenerated from source textures during PrepareForGpu)
+        pugi::xml_node textures_node = material_node.append_child("textures");
+        textures_node.append_attribute("count").set_value(static_cast<uint32_t>(m_textures.size()));
+        for (uint32_t type = 0; type < static_cast<uint32_t>(MaterialTextureType::Max); ++type)
+        {
+            if (static_cast<MaterialTextureType>(type) == MaterialTextureType::Packed)
+            {
+                continue;
+            }
+
+            for (uint32_t slot = 0; slot < slots_per_texture; ++slot)
+            {
+                uint32_t index   = type * slots_per_texture + slot;
+                string node_name = "texture_" + to_string(index);
+                pugi::xml_node texture_node = textures_node.append_child(node_name.c_str());
+                texture_node.append_attribute("texture_type").set_value(type);
+                texture_node.append_attribute("texture_slot").set_value(slot);
+                texture_node.append_attribute("texture_name").set_value(m_textures[index] ? m_textures[index]->GetObjectName().c_str() : "");
+                texture_node.append_attribute("texture_path").set_value(m_textures[index] ? m_textures[index]->GetResourceFilePath().c_str() : "");
+            }
+        }
+
+        // atomic write so a reader on another thread never observes a truncated file
+        const string tmp_path = file_path + ".tmp";
+        if (!doc.save_file(tmp_path.c_str()))
+        {
+            SP_LOG_ERROR("Failed to write %s", tmp_path.c_str());
+            return;
+        }
+
+        std::error_code ec;
+        std::filesystem::rename(tmp_path, file_path, ec);
+        if (ec)
+        {
+            // fall back to copy + remove for cross volume cases
+            std::filesystem::copy_file(tmp_path, file_path, std::filesystem::copy_options::overwrite_existing, ec);
+            std::filesystem::remove(tmp_path, ec);
+            if (ec)
+            {
+                SP_LOG_ERROR("Failed to commit %s, %s", file_path.c_str(), ec.message().c_str());
+            }
+        }
+    }
+
+    void Material::SetTexture(const MaterialTextureType texture_type, RHI_Texture* texture, const uint8_t slot, const bool auto_adjust_multiplier)
+    {
+        SP_ASSERT(slot < slots_per_texture);
+
+        bool should_prepare = false;
+        {
+            lock_guard<recursive_mutex> lock(m_mutex);
+
+            // calculate the actual array index based on texture type and slot
+            uint32_t array_index = (static_cast<uint32_t>(texture_type) * slots_per_texture) + slot;
+
+            // check if the texture is actually changing
+            RHI_Texture* previous_texture = m_textures[array_index];
+            bool texture_changed = (previous_texture != texture);
+
+            m_textures[array_index] = texture;
+
+            if (texture_changed)
+            {
+                bump_revision();
+            }
+
+            // mark for repacking if this texture type contributes to the packed texture and actually changed
+            if (texture_changed && IsPackableTextureType(texture_type))
+            {
+                m_needs_repack = true;
+
+                // if already prepared for gpu, schedule async repack outside the lock
+                if (m_resource_state == ResourceState::PreparedForGpu)
+                {
+                    should_prepare = true;
+                }
+            }
+        }
+
+        if (should_prepare)
+        {
+            PrepareForGpu();
+        }
+
+        if (auto_adjust_multiplier)
+        {
+            if (texture_type == MaterialTextureType::Metalness)
+            {
+                SetProperty(MaterialProperty::Metalness, 1.0f);
+            }
+            else if (texture_type == MaterialTextureType::Normal)
+            {
+                SetProperty(MaterialProperty::Normal, 1.0f);
+            }
+            else if (texture_type == MaterialTextureType::Roughness)
+            {
+                SetProperty(MaterialProperty::Roughness, 1.0f);
+            }
+            else if (texture_type == MaterialTextureType::Height)
+            {
+                SetProperty(MaterialProperty::Height, 1.0f);
+            }
+        }
+
+        // save on change, but not during loading (auto_adjust_multiplier is false when called from LoadFromFile)
+        if (auto_adjust_multiplier)
+        {
+            SaveToFile(GetResourceFilePath());
+        }
+    }
+
+    void Material::SetTexture(const MaterialTextureType texture_type, shared_ptr<RHI_Texture> texture, const uint8_t slot)
+    {
+        SetTexture(texture_type, texture.get(), slot);
+    }
+
+    void Material::SetTexture(const MaterialTextureType texture_type, const string& file_path, const uint8_t slot)
+    {
+        // only packed textures get compressed, the gpu upload is deferred so pack_textures can still mutate the cpu bytes
+        SetTexture(texture_type, ResourceCache::Load<RHI_Texture>(file_path, RHI_Texture_Srv | RHI_Texture_DeferUpload), slot);
+    }
+ 
+    bool Material::HasTextureOfType(const string& path) const
+    {
+        for (const auto& texture : m_textures)
+        {
+            if (!texture)
+            {
+                continue;
+            }
+
+            if (texture->GetResourceFilePath() == path)
+                return true;
+        }
+
+        return false;
+    }
+
+    bool Material::HasTextureOfType(const MaterialTextureType texture_type) const
+    {
+        for (uint32_t slot = 0; slot < slots_per_texture; slot++)
+        {
+            if (m_textures[static_cast<uint32_t>(texture_type) * slots_per_texture + slot] != nullptr)
+                return true;
+        }
+    
+        return false;
+    }
+
+    string Material::GetTexturePathByType(const MaterialTextureType texture_type, const uint8_t slot)
+    {
+        RHI_Texture* texture = m_textures[static_cast<uint32_t>(texture_type) * slots_per_texture + slot];
+        return texture ? texture->GetResourceFilePath() : "";
+    }
+
+    vector<string> Material::GetTexturePaths()
+    {
+        vector<string> paths;
+        for (const auto& texture : m_textures)
+        {
+            if (!texture)
+            {
+                continue;
+            }
+
+            paths.emplace_back(texture->GetResourceFilePath());
+        }
+
+        return paths;
+    }
+
+    RHI_Texture* Material::GetTexture(const MaterialTextureType texture_type, const uint8_t slot)
+    {
+        // unlocked read, IsAlphaTested/sort/draw call this every frame and a mutex there costs milliseconds
+        // writers (SetTexture/PrepareForGpu) still take m_mutex
+        return m_textures[(static_cast<uint32_t>(texture_type) * slots_per_texture) + slot];
+    }
+
+    void Material::PrepareForGpu()
+    {
+        // keep alive if owned by shared_ptr so sync gpu work cannot free this mid-call
+        shared_ptr<IResource> self_keep_alive = weak_from_this().lock();
+
+        array<RHI_Texture*, static_cast<uint32_t>(MaterialTextureType::Max) * slots_per_texture> textures{};
+        {
+            lock_guard<recursive_mutex> lock(m_mutex);
+
+            // skip if already preparing or if no repack is needed for already-prepared materials
+            if (m_resource_state == ResourceState::PreparingForGpu)
+            {
+                return;
+            }
+
+            bool is_repack = m_resource_state == ResourceState::PreparedForGpu;
+            if (is_repack && !m_needs_repack)
+            {
+                return;
+            }
+
+            m_resource_state = ResourceState::PreparingForGpu;
+
+            // pack textures (this happens synchronously to ensure data is ready)
+            for (uint8_t slot = 0; slot < GetUsedSlotCount(); slot++)
+            {
+                texture_processing::pack_textures(this, slot);
+            }
+
+            m_needs_repack = false;
+            textures       = m_textures;
+        }
+
+        // gpu prep outside the material lock, ImmediateExecution and compress can take a while
+        for (RHI_Texture* texture : textures)
+        {
+            if (texture && texture->GetResourceState() == ResourceState::Max)
+            {
+                texture->PrepareForGpu();
+            }
+        }
+
+        bool needs_repack = false;
+        {
+            lock_guard<recursive_mutex> lock(m_mutex);
+            m_resource_state = ResourceState::PreparedForGpu;
+            needs_repack     = m_needs_repack;
+        }
+
+        // textures set during preparation, repack once more
+        if (needs_repack)
+        {
+            PrepareForGpu();
+        }
+    }
+
+    uint32_t Material::GetUsedSlotCount() const
+    {
+        // array to track highest used slot for each texture type
+        uint32_t max_used_slot[static_cast<size_t>(MaterialTextureType::Max)] = { 0 };
+    
+        // iterate through each texture type
+        for (size_t type = 0; type < static_cast<size_t>(MaterialTextureType::Max); type++)
+        {
+            // check each slot for this type
+            for (uint32_t slot = 0; slot < slots_per_texture; ++slot)
+            {
+                // calculate array index using the helper function
+                uint32_t index = (static_cast<uint32_t>(type) * slots_per_texture) + slot;
+                
+                // if this slot has a texture, update the max used slot for this type
+                if (m_textures[index])
+                {
+                    max_used_slot[type] = slot + 1; // +1 because we want count, not index
+                }
+            }
+        }
+    
+        // return the maximum used slot count across all texture types (minimum of 1)
+        return max<uint32_t>(*max_element(begin(max_used_slot), end(max_used_slot)), 1);
+    }
+
+    void Material::SetPropertyInternal(MaterialProperty property_type, float value, bool save)
+    {
+        if (m_properties[static_cast<uint32_t>(property_type)] == value)
+        {
+            return;
+        }
+
+        if (property_type == MaterialProperty::ColorA)
+        {
+            // if an object switches from opaque to transparent or vice versa, make the world update so that the renderer
+            // goes through the entities and makes the ones that use this material, render in the correct mode.
+            float current_alpha = m_properties[static_cast<uint32_t>(property_type)];
+            if ((current_alpha != 1.0f && value == 1.0f) || (current_alpha == 1.0f && value != 1.0f))
+            {
+                RHI_CullMode cull_mode = value < 1.0f ? RHI_CullMode::None : RHI_CullMode::Back;
+                m_properties[static_cast<uint32_t>(MaterialProperty::CullMode)] = static_cast<float>(cull_mode);
+            }
+        }
+
+        m_properties[static_cast<uint32_t>(property_type)] = value;
+        bump_revision();
+
+        // save on change
+        if (save)
+        {
+            SaveToFile(GetResourceFilePath());
+        }
+    }
+
+    void Material::SetColorInternal(const Color& color, bool save)
+    {
+        SetPropertyInternal(MaterialProperty::ColorR, color.r, false);
+        SetPropertyInternal(MaterialProperty::ColorG, color.g, false);
+        SetPropertyInternal(MaterialProperty::ColorB, color.b, false);
+        SetPropertyInternal(MaterialProperty::ColorA, color.a, false);
+
+        if (save)
+        {
+            SaveToFile(GetResourceFilePath());
+        }
+    }
+
+    void Material::ResetPresetProperties(bool save)
+    {
+        SetPropertyInternal(MaterialProperty::ColorA,               1.0f, false);
+        SetPropertyInternal(MaterialProperty::Roughness,            1.0f, false);
+        SetPropertyInternal(MaterialProperty::Metalness,            0.0f, false);
+        SetPropertyInternal(MaterialProperty::Normal,               0.0f, false);
+        SetPropertyInternal(MaterialProperty::Height,               0.0f, false);
+        SetPropertyInternal(MaterialProperty::Clearcoat,            0.0f, false);
+        SetPropertyInternal(MaterialProperty::Clearcoat_Roughness,  0.0f, false);
+        SetPropertyInternal(MaterialProperty::Anisotropic,          0.0f, false);
+        SetPropertyInternal(MaterialProperty::AnisotropicRotation,  0.0f, false);
+        SetPropertyInternal(MaterialProperty::Sheen,                0.0f, false);
+        SetPropertyInternal(MaterialProperty::SubsurfaceScattering, 0.0f, false);
+        SetPropertyInternal(MaterialProperty::FlakeStrength,        0.0f, false);
+        SetPropertyInternal(MaterialProperty::FlakeScale,           120.0f, false);
+        SetPropertyInternal(MaterialProperty::PearlStrength,        0.0f, false);
+        SetPropertyInternal(MaterialProperty::PearlColorR,          1.0f, false);
+        SetPropertyInternal(MaterialProperty::PearlColorG,          1.0f, false);
+        SetPropertyInternal(MaterialProperty::PearlColorB,          1.0f, false);
+        SetPropertyInternal(MaterialProperty::CoatTintR,            1.0f, false);
+        SetPropertyInternal(MaterialProperty::CoatTintG,            1.0f, false);
+        SetPropertyInternal(MaterialProperty::CoatTintB,            1.0f, false);
+        SetPropertyInternal(MaterialProperty::CoatTintStrength,     0.0f, false);
+        SetPropertyInternal(MaterialProperty::Ior,                  EnumToIor(MaterialIor::Glass), false);
+        SetPropertyInternal(MaterialProperty::Absorption,           0.0f, false);
+        SetPropertyInternal(MaterialProperty::Thickness,            0.0f, false);
+        SetPropertyInternal(MaterialProperty::PaintPreset,          0.0f, false);
+        SetPropertyInternal(MaterialProperty::SurfacePreset,        0.0f, false);
+        SetPropertyInternal(MaterialProperty::EmissiveFromAlbedo,   0.0f, false);
+        SetPropertyInternal(MaterialProperty::TextureTilingX,       1.0f, false);
+        SetPropertyInternal(MaterialProperty::TextureTilingY,       1.0f, false);
+
+        if (save)
+        {
+            SaveToFile(GetResourceFilePath());
+        }
+    }
+
+    void Material::SetProperty(const MaterialProperty property_type, float value)
+    {
+        SetPropertyInternal(property_type, value, true);
+    }
+
+    void Material::SetColor(const Color& color)
+    {
+        SetColorInternal(color, true);
+    }
+
+    bool Material::IsAlphaTested()
+    {
+        // hot path for draw sort and shadow passes, read slots directly
+        RHI_Texture* color = m_textures[static_cast<uint32_t>(MaterialTextureType::Color) * slots_per_texture];
+        const bool albedo_mask = color && color->IsSemiTransparent();
+        return HasTextureOfType(MaterialTextureType::AlphaMask) || albedo_mask;
+    }
+
+    float Material::EnumToIor(const MaterialIor ior)
+    {
+        switch (ior)
+        {
+            case MaterialIor::Air:      return 1.0f;
+            case MaterialIor::Water:    return 1.33f;
+            case MaterialIor::Eyes:     return 1.38f;
+            case MaterialIor::Glass:    return 1.52f;
+            case MaterialIor::Sapphire: return 1.76f;
+            case MaterialIor::Diamond:  return 2.42f;
+            default:                    return 1.0f;
+        }
+    }
+
+    MaterialIor Material::IorToEnum(const float ior)
+    {
+        const float epsilon = 0.001f;
+
+        if (abs(ior - 1.0f)  < epsilon)
+            return MaterialIor::Air;
+        if (abs(ior - 1.33f) < epsilon)
+            return MaterialIor::Water;
+        if (abs(ior - 1.38f) < epsilon)
+            return MaterialIor::Eyes;
+        if (abs(ior - 1.52f) < epsilon)
+            return MaterialIor::Glass;
+        if (abs(ior - 1.76f) < epsilon)
+            return MaterialIor::Sapphire;
+        if (abs(ior - 2.42f) < epsilon)
+            return MaterialIor::Diamond;
+
+        return MaterialIor::Air;
+    }
+
+    bool Material::IsPackableTextureType(MaterialTextureType type) const
+    {
+        // these texture types contribute to the packed texture (occlusion, roughness, metalness, height)
+        // or affect color packing (alpha mask into color alpha)
+        switch (type)
+        {
+            case MaterialTextureType::Color:
+            case MaterialTextureType::Roughness:
+            case MaterialTextureType::Metalness:
+            case MaterialTextureType::Occlusion:
+            case MaterialTextureType::Height:
+            case MaterialTextureType::AlphaMask:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    void Material::ClearPackedTextures()
+    {
+        // clear only packed texture slots - these are cached in ResourceCache and become
+        // dangling pointers when ResourceCache::Shutdown() is called
+        uint32_t packed_base_index = static_cast<uint32_t>(MaterialTextureType::Packed) * slots_per_texture;
+        for (uint32_t slot = 0; slot < slots_per_texture; ++slot)
+        {
+            m_textures[packed_base_index + slot] = nullptr;
+        }
+    }
+}

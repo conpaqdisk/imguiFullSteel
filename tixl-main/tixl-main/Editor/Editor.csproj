@@ -1,0 +1,253 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <Import Project="$(SolutionDir)/Tixl.props" />
+    <PropertyGroup>
+        <TargetFramework>$(TixlNetFrameworkVersion)</TargetFramework>
+        <VersionPrefix>$(TixlVersion)</VersionPrefix>
+        <VersionSuffix>$(TixlVersionSuffix)</VersionSuffix>
+        <InformationalVersion>$(Version)</InformationalVersion>
+        <OutputType>Exe</OutputType>
+        <!-- Allow launching on the next major .NET runtime if the targeted one isn't installed.
+             "Major" rolls forward at most one major version (e.g. net10 app on .NET 11),
+             which is conservative enough for an app that does runtime Roslyn compilation
+             and heavy native interop. See issue #1043. -->
+        <RollForward>Major</RollForward>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <StartupObject>T3.Editor.Program</StartupObject>
+        <ApplicationIcon>..\EditorResources\images\t3.ico</ApplicationIcon>
+        <RootNamespace>T3.Editor</RootNamespace>
+        <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+        <RuntimeIdentifiers>win-x64;linux-x64;osx-x64</RuntimeIdentifiers>
+        <EnableUnsafeBinaryFormatterSerialization>true</EnableUnsafeBinaryFormatterSerialization>
+        <Deterministic>true</Deterministic>
+        <Configurations>Debug;Release</Configurations>
+        <Platforms>AnyCPU</Platforms>
+        <AssemblyName>TiXL</AssemblyName>
+        <Title>TiXL</Title>
+        <Authors>TiXL Community</Authors>
+        <Description>Open source Motion GFX</Description>
+        <Copyright>2012-2025 TiXL Community</Copyright>
+        <PackageProjectUrl>https://tixl.app</PackageProjectUrl>
+        <PackageLicenseUrl>https://github.com/tixl3d/tixl?tab=MIT-1-ov-file#readme</PackageLicenseUrl>
+        <RepositoryUrl>https://github.com/tixl3d/tixl</RepositoryUrl>
+        <RepositoryType>Git</RepositoryType>
+        <!-- Ensure there's a git commit hash in the version field for the about dialog -->
+        <IncludeSourceRevisionInInformationalVersion>true</IncludeSourceRevisionInInformationalVersion>
+        <NoWarn>$(NoWarn);NU1900;NU1701;CS8632</NoWarn>
+        <!-- <Authors>TiXL</Authors>
+    <Owners>TiXL</Owners>
+    <Company>TiXL</Company>
+    <Copyright>Copyright (c) 2013-2025 TiXL</Copyright>
+    <NeutralLanguage>en-US</NeutralLanguage>
+    <DefaultLanguage>en-US</DefaultLanguage> -->
+
+        <!-- <PackageIconUrl>https://tixl.app/images/T3-logo.png</PackageIconUrl>
+    <PackageLicenseUrl>https://github.com/tixl3d/tixl?tab=MIT-1-ov-file#readme</PackageLicenseUrl>
+    <PackageProjectUrl>http://www.tixl.app</PackageProjectUrl>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <PackageTags>TiXL</PackageTags>
+    <PackageOutputPath>$(SolutionDir)packages\$(Configuration)</PackageOutputPath> -->
+    </PropertyGroup>
+
+    <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
+        <DefineConstants>TRACE</DefineConstants>
+        <DebugType>full</DebugType>
+    </PropertyGroup>
+
+    <!-- ======================= Nuget References =========================== -->
+    <ItemGroup>
+        <PackageReference Include="ImGui.NET" Version="1.91.6.1" />
+        <PackageReference Include="Microsoft.Build" Version="18.8.2" />
+        <PackageReference Include="Microsoft.CodeAnalysis.Common" Version="5.6.0" />
+        <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.6.0" />
+        <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="5.6.0" />
+        <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.Common" Version="5.6.0" />
+        <PackageReference Include="MSDF-Sharp" Version="1.0.2" />
+        <PackageReference Include="Rug.Osc" Version="1.2.5">
+            <NoWarn>NU1701</NoWarn>
+        </PackageReference>
+        <PackageReference Include="Sentry" Version="6.8.0" />
+        <PackageReference Include="SharpDX.Desktop" Version="4.2.0">
+            <NoWarn>NU1701</NoWarn>
+        </PackageReference>
+        <PackageReference Include="System.Management" Version="10.0.10" />
+        <PackageReference Include="System.Runtime.Serialization.Formatters" Version="10.0.10" />
+    </ItemGroup>
+    <!-- ===============================//======================================= -->
+
+    <!-- ======================= Project References =========================== -->
+    <ItemGroup>
+        <ProjectReference Include="..\Core\Core.csproj" />
+        <ProjectReference Include="..\IoServices\IoServices.csproj" />
+        <ProjectReference Include="..\Logging\Logging.csproj" />
+        <ProjectReference Include="..\MsForms\MsForms.csproj" />
+        <ProjectReference Include="..\SilkWindows\SilkWindows.csproj" />
+    </ItemGroup>
+    <!-- ===============================//======================================= -->
+
+
+    <!-- ======================= Native Dependencies =========================== -->
+    <!--This
+    copies all files in the `dependencies` folder *directly* into the output directory-->
+    <ItemGroup>
+        <Content Include="../Dependencies/**/*" Visible="false">
+            <Link>%(RecursiveDir)%(Filename)%(Extension)</Link>
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </Content>
+    </ItemGroup>
+    <!-- =================================//===================================== -->
+
+
+    <!-- ======================= Defaults =========================== -->
+    <!--This
+    copies all files in the `.Defaults` folder into the output/.tixl folder-->
+    <ItemGroup>
+        <DefaultUserConfigs Include="../.Defaults/**/*" />
+    </ItemGroup>
+
+    <Target Name="CopyDefaults" AfterTargets="AfterBuild">
+        <Copy SourceFiles="@(DefaultUserConfigs)" SkipUnchangedFiles="true" UseHardlinksIfPossible="true" DestinationFiles="@(DefaultUserConfigs->'$(OutputPath)/.tixl/%(RecursiveDir)%(Filename)%(Extension)')" />
+    </Target>
+    <!-- ==========================//================================ -->
+
+    <!-- ======================= Resources =========================== -->
+    <!-- This copies t3/Resources into the output directory -->
+    <ItemGroup>
+        <EditorResources Include="../EditorResources/**/*" Visible="false" />
+    </ItemGroup>
+
+    <Target Name="CopyResources" AfterTargets="AfterBuild">
+        <Copy SourceFiles="@(EditorResources)" SkipUnchangedFiles="true" UseHardlinksIfPossible="true" DestinationFiles="@(EditorResources->'$(OutputPath)/EditorResources/%(RecursiveDir)%(Filename)%(Extension)')" />
+    </Target>
+    <!-- ===========================//=============================== -->
+
+    <!-- ===================== Shipped markdown content ===================== -->
+    <!-- Copies the markdown that ships with the editor (embedded help, release notes, guided test
+         sets) next to the binaries so ShippedContent finds it in a packaged release. In a dev
+         checkout the loaders prefer the repo source, so these copies are only the release fallback. -->
+    <ItemGroup>
+        <EmbeddedHelp Include="../.help/embedded/**/*" Visible="false" />
+        <ReleaseNotes Include="../.help/release-notes/**/*" Visible="false" />
+        <HelpIndices Include="../.help/references/indices/**/*" Visible="false" />
+        <HelpTopicDocs Include="../.help/references/topics/ui/**/*" Visible="false" />
+        <HelpThumbs Include="../.help/references/thumbs/**/*" Visible="false" />
+        <TestSets Include="../.tests-manual/**/*" Visible="false" />
+    </ItemGroup>
+
+    <Target Name="CopyEmbeddedHelp" AfterTargets="AfterBuild">
+        <Copy SourceFiles="@(EmbeddedHelp)" SkipUnchangedFiles="true" UseHardlinksIfPossible="true" DestinationFiles="@(EmbeddedHelp->'$(OutputPath)/.help/embedded/%(RecursiveDir)%(Filename)%(Extension)')" />
+        <Copy SourceFiles="@(ReleaseNotes)" SkipUnchangedFiles="true" UseHardlinksIfPossible="true" DestinationFiles="@(ReleaseNotes->'$(OutputPath)/.help/release-notes/%(RecursiveDir)%(Filename)%(Extension)')" />
+        <Copy SourceFiles="@(HelpIndices)" SkipUnchangedFiles="true" UseHardlinksIfPossible="true" DestinationFiles="@(HelpIndices->'$(OutputPath)/.help/references/indices/%(RecursiveDir)%(Filename)%(Extension)')" />
+        <Copy SourceFiles="@(HelpTopicDocs)" SkipUnchangedFiles="true" UseHardlinksIfPossible="true" DestinationFiles="@(HelpTopicDocs->'$(OutputPath)/.help/references/topics/ui/%(RecursiveDir)%(Filename)%(Extension)')" />
+        <Copy SourceFiles="@(HelpThumbs)" SkipUnchangedFiles="true" UseHardlinksIfPossible="true" DestinationFiles="@(HelpThumbs->'$(OutputPath)/.help/references/thumbs/%(RecursiveDir)%(Filename)%(Extension)')" />
+        <Copy SourceFiles="@(TestSets)" SkipUnchangedFiles="true" UseHardlinksIfPossible="true" DestinationFiles="@(TestSets->'$(OutputPath)/.tests-manual/%(RecursiveDir)%(Filename)%(Extension)')" />
+    </Target>
+    <!-- ===========================//=============================== -->
+
+    <!-- ===================== Define build output paths ==================== -->
+    <!-- This creates a local variable for us to target the right build version based on the default
+    paths associated with Debug/Release builds, -->
+    <!-- along with the target framework (e.g. net8.0-windows, net8.0, etc) -->
+    <PropertyGroup>
+        <RelativeBuildFolder>bin/$(Configuration)/$(TargetFramework)</RelativeBuildFolder>
+    </PropertyGroup>
+    <!-- ===============================//================================== -->
+
+    <!-- ====================== Player ============================ -->
+
+    <!-- This copies the Player build into the output directory -->
+    <!-- Notice the similarities (and differences) between this and the CopyLibs target below -->
+    <ItemGroup>
+        <!-- <RelativeBuildFolder>..\PublishedPlayer</RelativeBuildFolder> -->
+        <Player Include="../Player/bin/ReleasePublished/**/*" Visible="false" />
+    </ItemGroup>
+    <Target Name="CopyPlayer" AfterTargets="AfterBuild">
+        <Copy SourceFiles="@(Player)" SkipUnchangedFiles="true" UseHardlinksIfPossible="true" DestinationFiles="@(Player->'$(OutputPath)/Player/%(RecursiveDir)%(Filename)%(Extension)')" />
+    </Target>
+    <!-- =========================//=============================== -->
+
+    <!-- ======================== Operator Packages ========================== -->
+
+    <!-- Specify the operator packages in the Operators directory to be included in Release builds - 
+    their csproj file name should match their directory name -->
+    <ItemGroup>
+        <PackageNames Include="lib" />
+        <PackageNames Include="examples" />
+        <PackageNames Include="TypeOperators" />
+        <!-- <PackageNames Include="pixtur"/>-->
+        <PackageNames Include="unsplash" />
+        <PackageNames Include="skills" />
+        <PackageNames Include="spout" />
+        <PackageNames Include="ndi" />
+        <PackageNames Include="Video" />
+        <PackageNames Include="Io" />
+        <PackageNames Include="Mediapipe">
+            <Name>t3.mediapipe</Name>
+        </PackageNames>
+        <!-- Add more as needed -->
+    </ItemGroup>
+    <PropertyGroup>
+        <OperatorDirectoryName>Operators</OperatorDirectoryName>
+    </PropertyGroup>
+
+    <!-- =========================//================================ -->
+
+    <!-- ======================== Copy Selected Packages ========================== -->
+    <!-- This copies built-in operator projects into the output directory -->
+
+    <!-- This is a "function" that finds the package's build files and does the copy. 
+    It is not invoked without another target "calling" it. 
+    Specifically, it parses the csproj file for a version and finds the appropriate build folder to
+    copy from. -->
+    <Target Name="CopyTixlOpProject">
+        <PropertyGroup>
+            <SourceDir>$(SolutionDir)$(ParentFolder)/$(PackageName)</SourceDir>
+            <DestinationDir>$(OutputPath)/$(OperatorDirectoryName)</DestinationDir>
+        </PropertyGroup>
+
+        <Message Importance="high" Text="Attempting to copy $(PackageName)..." />
+
+        <!-- Use XmlPeek to extract the version from the csproj file of the package -->
+        <!-- Left here as an example in case we need to use it for extracting the target framework
+        in the future -->
+        <!-- <XmlPeek XmlInputPath="$(SourceDir)/$(PackageName).csproj"
+        Query="//VersionPrefix/text()">
+             <Output TaskParameter="Result" ItemName="projVersion"/>
+         </XmlPeek>
+        <Message Importance="high" Text="Found version for $(PackageName): @(projVersion)"/>-->
+
+        <!-- Define the package build directory based on the version found
+            This should match the OutputPath defined by the project -->
+        <PropertyGroup>
+            <PackageBuildDirectory>$(SourceDir)/bin/$(Configuration)/$(TixlNetFrameworkVersion)</PackageBuildDirectory>
+        </PropertyGroup>
+
+        <Message Importance="high" Text="Path for $(PackageName): $(PackageBuildDirectory)" />
+
+        <ItemGroup>
+            <ProjectFiles Include="$(PackageBuildDirectory)/**" />
+        </ItemGroup>
+
+        <!-- Clear previous files in the export folder (redundant, so commented for example -->
+        <!--<RemoveDir
+        Directories="$(DestinationDir)/$(PackageName)/"/>-->
+
+        <!-- Copy the files from the project directory to the export folder -->
+        <Copy SourceFiles="@(ProjectFiles)" DestinationFolder="$(DestinationDir)/$(PackageName)/%(RecursiveDir)" UseHardlinksIfPossible="true" />
+    </Target>
+
+    <!-- Invokes the above target for all of the packages defined by the PackageNames property -->
+    <Target Name="CopyTixlOperators" AfterTargets="AfterBuild" Condition="'$(Configuration)' == 'Release'">
+        <MSBuild Projects="$(MSBuildProjectFullPath)" Targets="CopyTixlOpProject" Properties="PackageName=%(PackageNames.Identity);ParentFolder=$(OperatorDirectoryName)" />
+
+        <!-- special case for pixtur project being nested under Operators/user/ -->
+        <MSBuild Projects="$(MSBuildProjectFullPath)" Targets="CopyTixlOpProject" Properties="PackageName=pixtur;ParentFolder=$(OperatorDirectoryName)/user" />
+    </Target>
+
+
+    <Target Name="ClearBuildOutput" BeforeTargets="BeforeBuild">
+        <!-- Clear previous files in the export folder -->
+        <RemoveDir Directories="bin/$(Configuration)" />
+    </Target>
+
+    <!-- =========================//================================ -->
+</Project>

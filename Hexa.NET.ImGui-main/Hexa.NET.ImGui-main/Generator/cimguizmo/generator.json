@@ -1,0 +1,15 @@
+{
+  "BaseConfig": {
+    "Url": "file://config.base.json"
+  },
+  "Namespace": "Hexa.NET.ImGuizmo",
+  "ApiName": "ImGuizmo",
+  "LibName": "cimguizmo",
+  "IgnoredParts": [ "ImGuizmo" ],
+  "TypeMappings": {
+    "OPERATION": "ImGuizmoOperation",
+    "MODE": "ImGuizmoMode",
+    "COLOR": "ImGuizmoColor"
+  },
+  "Usings": [ "Hexa.NET.ImGui" ]
+}

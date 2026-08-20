@@ -1,0 +1,103 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+#pragma once
+
+//= INCLUDES ===============
+#include <mutex>
+#include <vector>
+#include <functional>
+#include "../math/Vector3.h"
+//==========================
+
+namespace physx
+{
+    class PxRigidActor;
+}
+
+namespace spartan
+{
+    class Entity;
+
+    // word2 tags used by the simulation filter shader
+    constexpr uint32_t physics_collision_character  = 1;
+    constexpr uint32_t physics_collision_vehicle    = 2;
+    constexpr uint32_t physics_collision_pedestrian = 3;
+    constexpr uint32_t physics_collision_ragdoll    = 4;
+
+    struct PhysicsRaycastHit
+    {
+        math::Vector3 position = math::Vector3::Zero;
+        math::Vector3 normal = math::Vector3::Up;
+        Entity* entity = nullptr;
+        float distance = 0.0f;
+    };
+
+    struct PhysicsContact
+    {
+        Entity* entity_a = nullptr;
+        Entity* entity_b = nullptr;
+        math::Vector3 position = math::Vector3::Zero;
+        math::Vector3 normal = math::Vector3::Up;
+        math::Vector3 impulse = math::Vector3::Zero;
+    };
+
+    class PhysicsWorld
+    {
+    public:
+        static void Initialize();
+        static void Shutdown();
+        static void Tick();
+        static void DrawDebugVisualization();
+
+        static void AddActor(physx::PxRigidActor* actor);
+        static void RemoveActor(physx::PxRigidActor* actor);
+
+        static math::Vector3 GetGravity();
+        static void* GetScene();
+        static void* GetPhysics();
+        
+        // interpolation alpha for smooth rendering between fixed physics steps
+        // 0 = at previous physics state, 1 = at current physics state
+        static float GetInterpolationAlpha();
+        static float GetFixedTimeStep();
+
+        // vehicle force model hooks, invoked once per fixed simulation step before scene simulation
+        static void RegisterVehicleStepCallback(const void* owner, const std::function<void(float)>& callback);
+        static void UnregisterVehicleStepCallback(const void* owner);
+
+        // contacts from the last physics ticks, valid until the next physics tick
+        static const std::vector<PhysicsContact>& GetFrameContacts();
+        static std::vector<PhysicsContact> ConsumeContacts();
+
+        // cast a ray against static geometry and return the closest hit position
+        static bool RaycastStatic(const math::Vector3& origin, const math::Vector3& direction, float max_distance, math::Vector3& hit_position);
+
+        // cast a ray against static geometry and return the closest hit position + the entity that was hit
+        static bool RaycastStatic(const math::Vector3& origin, const math::Vector3& direction, float max_distance, math::Vector3& hit_position, Entity*& hit_entity);
+        static bool RaycastStatic(const math::Vector3& origin, const math::Vector3& direction, float max_distance, PhysicsRaycastHit& hit, Entity* ignored_entity = nullptr);
+
+        static bool SphereCast(const math::Vector3& origin, const math::Vector3& direction, float radius, float max_distance, uint32_t ignored_collision_group, math::Vector3& hit_position, float& hit_distance, Entity*& hit_entity);
+
+        // serializes every PxScene, PxRigidActor and PxShape access, recursive so nested helpers can re-enter
+        static std::recursive_mutex& GetMutex();
+    };
+}

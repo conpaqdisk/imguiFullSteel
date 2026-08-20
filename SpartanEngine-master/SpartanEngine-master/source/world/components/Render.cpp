@@ -1,0 +1,1031 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES ================================
+#include "pch.h"
+#include <sstream>
+#include "Render.h"
+#include "Camera.h"
+#include "../Entity.h"
+#include "../rhi/RHI_Buffer.h"
+#include "../rhi/RHI_Device.h"
+#include "../rhi/RHI_AccelerationStructure.h"
+#include "../../file_system/FileSystem.h"
+#include "../../resource/ResourceCache.h"
+#include "../../rendering/Renderer.h"
+#include "../../rendering/Material.h"
+#include "../../rendering/GeometryBuffer.h"
+#include "../../geometry/Mesh.h"
+SP_WARNINGS_OFF
+#include <sol/sol.hpp>
+#include "../io/pugixml.hpp"
+SP_WARNINGS_ON
+//===========================================
+
+//= NAMESPACES ===============
+using namespace std;
+using namespace spartan::math;
+//============================
+
+namespace spartan
+{
+    namespace
+    {
+        const MeshLod* get_mesh_lod(Mesh* mesh, uint32_t sub_mesh_index, uint32_t lod)
+        {
+            if (!mesh || sub_mesh_index >= mesh->GetSubMeshCount())
+            {
+                return nullptr;
+            }
+
+            const SubMesh& sub_mesh = mesh->GetSubMesh(sub_mesh_index);
+            if (lod >= sub_mesh.lods.size())
+            {
+                return nullptr;
+            }
+
+            return &sub_mesh.lods[lod];
+        }
+    }
+
+    Render::Render(Entity* entity) : Component(entity)
+    {
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_material_default, bool);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_material, Material*);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_flags, uint32_t);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_mesh, Mesh*);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_bounding_box, BoundingBox);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_bounding_box_mesh, BoundingBox);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_sub_mesh_index, uint32_t);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_bounding_box_dirty, bool);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_instances, vector<Instance>);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_transform_previous, Matrix);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_max_distance_render, float);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_max_distance_shadow, float);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_distance_squared, float);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_is_visible, bool);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_lod_index, uint32_t);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_previous_lights, uint64_t);
+    }
+
+    Render::~Render()
+    {
+        m_mesh = nullptr;
+    }
+
+    void Render::Save(pugi::xml_node& node)
+    {
+        // mesh, skip procedural meshes as they are not in the resource cache, their owning component regenerates them after load
+        const bool is_standard_mesh = m_mesh && m_mesh->GetObjectName().rfind("standard_", 0) == 0;
+        const bool is_procedural    = m_mesh && m_mesh->GetObjectName() == "ocean";
+        const bool is_resolvable    = m_mesh && !is_procedural && (is_standard_mesh || ResourceCache::GetByName<Mesh>(m_mesh->GetObjectName()) != nullptr);
+        node.append_attribute("mesh_name")      = is_resolvable ? m_mesh->GetObjectName().c_str() : "";
+        node.append_attribute("mesh_path")      = is_resolvable && !is_standard_mesh ? m_mesh->GetResourceFilePath().c_str() : "";
+        node.append_attribute("sub_mesh_index") = m_sub_mesh_index;
+
+        // material
+        node.append_attribute("material_name")    = m_material && !m_material_default ? m_material->GetObjectName().c_str() : "";
+        node.append_attribute("material_path")    = m_material && !m_material_default ? m_material->GetResourceFilePath().c_str() : "";
+        node.append_attribute("material_default") = m_material_default;
+
+        // per-render material overrides, only set fields are written so unset ones keep inheriting from the material
+        auto save_override = [&node](const char* name, float v)
+        {
+            if (MaterialOverride::is_set(v))
+            {
+                node.append_attribute(name) = v;
+            }
+        };
+        save_override("ovr_uv_tiling_x",    m_material_override.uv_tiling_x);
+        save_override("ovr_uv_tiling_y",    m_material_override.uv_tiling_y);
+        save_override("ovr_uv_offset_x",    m_material_override.uv_offset_x);
+        save_override("ovr_uv_offset_y",    m_material_override.uv_offset_y);
+        save_override("ovr_uv_rotation",    m_material_override.uv_rotation);
+        save_override("ovr_uv_invert_x",    m_material_override.uv_invert_x);
+        save_override("ovr_uv_invert_y",    m_material_override.uv_invert_y);
+        save_override("ovr_uv_world_space", m_material_override.uv_world_space);
+
+        // flags
+        node.append_attribute("flags") = m_flags;
+
+        // distances
+        node.append_attribute("max_render_distance") = m_max_distance_render;
+        node.append_attribute("max_shadow_distance") = m_max_distance_shadow;
+
+        // instances
+        if (!m_instances.empty())
+        {
+            pugi::xml_node instances_node = node.append_child("Instances");
+            for (const auto& instance : m_instances)
+            {
+                pugi::xml_node t_node = instances_node.append_child("Transform");
+                math::Matrix matrix = instance.GetMatrix();
+                std::stringstream ss;
+                ss << matrix.m00 << " " << matrix.m01 << " " << matrix.m02 << " " << matrix.m03 << " "
+                   << matrix.m10 << " " << matrix.m11 << " " << matrix.m12 << " " << matrix.m13 << " "
+                   << matrix.m20 << " " << matrix.m21 << " " << matrix.m22 << " " << matrix.m23 << " "
+                   << matrix.m30 << " " << matrix.m31 << " " << matrix.m32 << " " << matrix.m33;
+                t_node.append_attribute("matrix") = ss.str().c_str();
+            }
+        }
+    }
+
+    void Render::Load(pugi::xml_node& node)
+    {
+        // mesh
+        const string mesh_name = node.attribute("mesh_name").as_string();
+        const string mesh_path = node.attribute("mesh_path").as_string();
+        m_sub_mesh_index       = node.attribute("sub_mesh_index").as_uint();
+        if (!mesh_name.empty())
+        {
+            // check for standard meshes first (owned by Renderer, not ResourceCache)
+            if (mesh_name == "standard_cube")
+            {
+                m_mesh = Renderer::GetStandardMesh(MeshType::Cube).get();
+            }
+            else if (mesh_name == "standard_quad")
+            {
+                m_mesh = Renderer::GetStandardMesh(MeshType::Quad).get();
+            }
+            else if (mesh_name == "standard_sphere")
+            {
+                m_mesh = Renderer::GetStandardMesh(MeshType::Sphere).get();
+            }
+            else if (mesh_name == "standard_cylinder")
+            {
+                m_mesh = Renderer::GetStandardMesh(MeshType::Cylinder).get();
+            }
+            else if (mesh_name == "standard_cone")
+            {
+                m_mesh = Renderer::GetStandardMesh(MeshType::Cone).get();
+            }
+            else if (mesh_name == "ocean")
+            {
+                // procedural clipmap owned by water, rebuilt in water::initialize
+            }
+            else
+            {
+                shared_ptr<Mesh> mesh;
+                if (!mesh_path.empty())
+                {
+                    mesh = ResourceCache::GetByPath<Mesh>(mesh_path);
+                    if (!mesh && FileSystem::IsFile(mesh_path))
+                    {
+                        mesh = ResourceCache::Load<Mesh>(mesh_path);
+                    }
+                }
+                if (!mesh)
+                {
+                    mesh = ResourceCache::GetByName<Mesh>(mesh_name);
+                }
+                if (mesh)
+                {
+                    m_mesh = mesh.get();
+                }
+                else
+                {
+                    SP_LOG_WARNING("Render::Load - mesh '%s' not found in cache", mesh_name.c_str());
+                }
+            }
+        }
+
+        // material
+        m_material_default         = node.attribute("material_default").as_bool(true);
+        const string material_name = node.attribute("material_name").as_string();
+        const string material_path = node.attribute("material_path").as_string();
+        if (!material_name.empty() && !m_material_default)
+        {
+            shared_ptr<Material> material;
+            if (!material_path.empty())
+            {
+                material = ResourceCache::GetByPath<Material>(
+                    material_path
+                );
+                if (!material && FileSystem::IsFile(material_path))
+                {
+                    material = ResourceCache::Load<Material>(
+                        material_path
+                    );
+                }
+            }
+            if (!material)
+            {
+                material = ResourceCache::GetByName<Material>(
+                    material_name
+                );
+            }
+            if (material)
+            {
+                SetMaterial(material);
+            }
+        }
+        else if (m_material_default)
+        {
+            // defer default material assignment - renderer may not be ready during load
+            m_needs_default_material = true;
+        }
+
+        // flags
+        m_flags = node.attribute("flags").as_uint();
+
+        // distances
+        m_max_distance_render = node.attribute("max_render_distance").as_float(FLT_MAX);
+        m_max_distance_shadow = node.attribute("max_shadow_distance").as_float(FLT_MAX);
+
+        // per-render material overrides, missing attributes keep the nan default which means inherit
+        auto load_override = [&node](const char* name, float& target)
+        {
+            if (auto attr = node.attribute(name))
+            {
+                target = attr.as_float();
+            }
+        };
+        load_override("ovr_uv_tiling_x",    m_material_override.uv_tiling_x);
+        load_override("ovr_uv_tiling_y",    m_material_override.uv_tiling_y);
+        load_override("ovr_uv_offset_x",    m_material_override.uv_offset_x);
+        load_override("ovr_uv_offset_y",    m_material_override.uv_offset_y);
+        load_override("ovr_uv_rotation",    m_material_override.uv_rotation);
+        load_override("ovr_uv_invert_x",    m_material_override.uv_invert_x);
+        load_override("ovr_uv_invert_y",    m_material_override.uv_invert_y);
+        load_override("ovr_uv_world_space", m_material_override.uv_world_space);
+
+        // instances
+        m_instances.clear();
+        pugi::xml_node instances_node = node.child("Instances");
+        if (instances_node)
+        {
+            for (pugi::xml_node t_node : instances_node.children("Transform"))
+            {
+                std::stringstream ss(t_node.attribute("matrix").as_string());
+                math::Matrix matrix;
+                float m[16];
+                for (int i = 0; i < 16; ++i)
+                {
+                    ss >> m[i];
+                }
+                if (!ss.fail())
+                {
+                    matrix = math::Matrix(m[0], m[1], m[2], m[3],
+                        m[4], m[5], m[6], m[7],
+                        m[8], m[9], m[10], m[11],
+                        m[12], m[13], m[14], m[15]);
+                    Instance instance;
+                    instance.SetMatrix(matrix);
+                    m_instances.emplace_back(instance);
+                }
+            }
+        }
+
+        // use the mesh lod aabb, copying every vertex here used to dominate entity load time
+        if (m_mesh && GetLodCount() > 0)
+        {
+            m_bounding_box_mesh = GetLodAabb(0);
+        }
+
+        // update instance buffer and bounding boxes
+        if (!m_instances.empty())
+        {
+            SetInstances(m_instances);
+        }
+        else if (m_mesh)
+        {
+            Tick();
+        }
+    }
+
+    void Render::Tick()
+    {
+        // deferred default material assignment (renderer may not be ready during load)
+        if (m_needs_default_material)
+        {
+            if (Renderer::GetStandardMaterial())
+            {
+                SetDefaultMaterial();
+                m_needs_default_material = false;
+            }
+        }
+
+        UpdateAabb();
+        UpdateFrustumAndDistanceCulling();
+
+        // lod only matters for visible geometry, off-screen props skip the coverage math
+        if (m_is_visible)
+        {
+            UpdateLodIndices();
+        }
+    }
+
+    void Render::UpdateFrustumAndDistanceCulling()
+    {
+        Camera* camera = World::GetCamera();
+        if (!camera)
+        {
+            m_distance_squared = 0.0f;
+            m_is_visible       = true;
+            return;
+        }
+
+        const BoundingBox& bounding_box = GetBoundingBox();
+        const Vector3 center  = bounding_box.GetCenter();
+        const Vector3 extents = bounding_box.GetExtents();
+
+        // a non finite bbox would crash the frustum culler assert, treat it as invisible
+        if (center.IsNaN() || extents.IsNaN())
+        {
+            SP_LOG_WARNING("non finite bbox on '%s', marking invisible", GetEntity() ? GetEntity()->GetObjectName().c_str() : "?");
+            m_is_visible       = false;
+            m_distance_squared = 0.0f;
+            return;
+        }
+
+        const Vector3 camera_position = camera->GetEntity()->GetPosition();
+        const float max_distance = m_max_distance_render;
+        const float max_distance_sq = max_distance * max_distance;
+
+        // distance-culled static props stay culled until the camera moves a few meters
+        if (!m_is_visible && m_distance_squared > max_distance_sq)
+        {
+            const float cam_move_sq = Vector3::DistanceSquared(camera_position, m_cull_camera_position);
+            if (cam_move_sq < 4.0f)
+            {
+                return;
+            }
+        }
+        m_cull_camera_position = camera_position;
+
+        // cheap reject before the 6-plane frustum test, center farther than max range plus radius cannot be visible
+        const float radius = max(extents.x, max(extents.y, extents.z)) * 1.7320508f;
+        const float reject_distance = max_distance + radius;
+        const float center_distance_sq = Vector3::DistanceSquared(camera_position, center);
+        if (center_distance_sq > reject_distance * reject_distance)
+        {
+            m_is_visible       = false;
+            m_distance_squared = center_distance_sq;
+            return;
+        }
+
+        if (!camera->IsInViewFrustum(bounding_box))
+        {
+            m_is_visible = false;
+            m_distance_squared = center_distance_sq;
+            return;
+        }
+
+        m_distance_squared = Vector3::DistanceSquared(camera_position, bounding_box.GetClosestPoint(camera_position));
+        m_is_visible       = m_distance_squared <= max_distance_sq;
+    }
+
+    void Render::RegisterForScripting(sol::state_view State)
+    {
+        State.new_enum("MeshType",
+            "Cube",     MeshType::Cube,
+            "Quad",     MeshType::Quad,
+            "Sphere",   MeshType::Sphere,
+            "Cylinder", MeshType::Cylinder,
+            "Cone",     MeshType::Cone,
+            "Max",      MeshType::Max
+        );
+
+        State.new_enum("RenderFlags",
+            "CastsShadows",          RenderFlags::CastsShadows,
+            "ExcludeFromRayTracing", RenderFlags::ExcludeFromRayTracing
+        );
+
+        State.new_usertype<Render>("Render",
+            sol::base_classes,              sol::bases<Component>(),
+            "GetMaterialName",              &Render::GetMaterialName,
+            "GetBoundingBox",               &Render::GetBoundingBox,
+            "GetMaterial",                  &Render::GetMaterial,
+            "SetMesh", sol::overload(
+                [](Render& self, Mesh* mesh)                          { self.SetMesh(mesh); },
+                [](Render& self, Mesh* mesh, uint32_t sub_mesh_index) { self.SetMesh(mesh, sub_mesh_index); },
+                [](Render& self, MeshType type)                       { self.SetMesh(type); }
+            ),
+            "SetMaterial", sol::overload(
+                [](Render& self, std::shared_ptr<Material> material)
+                {
+                    if (material)
+                    {
+                        self.SetMaterial(material);
+                    }
+                },
+                [](Render& self, Material* material)
+                {
+                    // accepts the raw pointer that GetMaterial returns by resolving the cached shared_ptr
+                    if (material)
+                    {
+                        if (std::shared_ptr<Material> cached = ResourceCache::GetByName<Material>(material->GetObjectName()))
+                        {
+                            self.SetMaterial(cached);
+                        }
+                    }
+                },
+                [](Render& self, const std::string& file_path)
+                {
+                    self.SetMaterial(file_path);
+                }
+            ),
+            "SetDefaultMaterial",           &Render::SetDefaultMaterial,
+            "SetMaxRenderDistance",         &Render::SetMaxRenderDistance,
+            "SetMaxShadowDistance",         &Render::SetMaxShadowDistance,
+            "SetFlag", [](Render& self, RenderFlags flag, bool enable) { self.SetFlag(flag, enable); }
+        );
+    }
+
+    sol::reference Render::AsLua(sol::state_view state)
+    {
+        return sol::make_reference(state, this);
+    }
+
+    void Render::SetMesh(Mesh* mesh, const uint32_t sub_mesh_index)
+    {
+        if (!mesh)
+        {
+            SP_LOG_WARNING("Render::SetMesh called with null mesh");
+            return;
+        }
+
+        // set mesh
+        m_mesh           = mesh;
+        m_sub_mesh_index = sub_mesh_index;
+
+        // compute and set bounding box (GetGeometry validates bounds internally)
+        vector<RHI_Vertex_PosTexNorTan> vertices;
+        mesh->GetGeometry(sub_mesh_index, nullptr, &vertices);
+        if (!vertices.empty())
+        {
+            m_bounding_box_mesh = BoundingBox(vertices.data(), static_cast<uint32_t>(vertices.size()));
+            m_bounding_box_dirty = true;
+        }
+
+        Tick(); // update bounding boxes, frustum and distance culling
+    }
+
+    void Render::SetMesh(const MeshType type)
+    {
+        SetMesh(Renderer::GetStandardMesh(type).get());
+    }
+
+    void Render::ClearMesh()
+    {
+        m_mesh              = nullptr;
+        m_sub_mesh_index    = 0;
+        m_bounding_box_mesh = BoundingBox::Unit;
+        m_bounding_box_dirty = true;
+        m_lod_index          = 0;
+    }
+
+    void Render::GetGeometry(vector<uint32_t>* indices, vector<RHI_Vertex_PosTexNorTan>* vertices) const
+    {
+        // a null mesh is a valid transient state, procedural meshes like roads are generated after load
+        if (!m_mesh)
+        {
+            return;
+        }
+        m_mesh->GetGeometry(m_sub_mesh_index, indices, vertices);
+    }
+
+    float Render::ResolveUvTilingX() const
+    {
+        if (MaterialOverride::is_set(m_material_override.uv_tiling_x))
+        {
+            return m_material_override.uv_tiling_x;
+        }
+
+        return m_material ? m_material->GetProperty(MaterialProperty::TextureTilingX) : 1.0f;
+    }
+
+    float Render::ResolveUvTilingY() const
+    {
+        if (MaterialOverride::is_set(m_material_override.uv_tiling_y))
+        {
+            return m_material_override.uv_tiling_y;
+        }
+
+        return m_material ? m_material->GetProperty(MaterialProperty::TextureTilingY) : 1.0f;
+    }
+
+    float Render::ResolveUvOffsetX() const
+    {
+        if (MaterialOverride::is_set(m_material_override.uv_offset_x))
+        {
+            return m_material_override.uv_offset_x;
+        }
+
+        return m_material ? m_material->GetProperty(MaterialProperty::TextureOffsetX) : 0.0f;
+    }
+
+    float Render::ResolveUvOffsetY() const
+    {
+        if (MaterialOverride::is_set(m_material_override.uv_offset_y))
+        {
+            return m_material_override.uv_offset_y;
+        }
+
+        return m_material ? m_material->GetProperty(MaterialProperty::TextureOffsetY) : 0.0f;
+    }
+
+    float Render::ResolveUvRotation() const
+    {
+        if (MaterialOverride::is_set(m_material_override.uv_rotation))
+        {
+            return m_material_override.uv_rotation;
+        }
+
+        return m_material ? m_material->GetProperty(MaterialProperty::TextureRotation) : 0.0f;
+    }
+
+    float Render::ResolveUvInvertX() const
+    {
+        if (MaterialOverride::is_set(m_material_override.uv_invert_x))
+        {
+            return m_material_override.uv_invert_x;
+        }
+
+        return m_material ? m_material->GetProperty(MaterialProperty::TextureInvertX) : 0.0f;
+    }
+
+    float Render::ResolveUvInvertY() const
+    {
+        if (MaterialOverride::is_set(m_material_override.uv_invert_y))
+        {
+            return m_material_override.uv_invert_y;
+        }
+
+        return m_material ? m_material->GetProperty(MaterialProperty::TextureInvertY) : 0.0f;
+    }
+
+    float Render::ResolveUvWorldSpace() const
+    {
+        if (MaterialOverride::is_set(m_material_override.uv_world_space))
+        {
+            return m_material_override.uv_world_space;
+        }
+
+        return m_material ? m_material->GetProperty(MaterialProperty::WorldSpaceUv) : 0.0f;
+    }
+
+    void Render::SetMaterial(const shared_ptr<Material>& material)
+    {
+        SP_ASSERT(material != nullptr);
+
+        m_material_default = false;
+
+        // cache it so it can be serialized/deserialized
+        m_material = ResourceCache::Cache(material).get();
+        if (m_material == nullptr)
+        {
+            SP_LOG_ERROR("Material was unable to be cached, and failed to be set.")
+            return;
+        }
+
+        // pack textures, generate mips, compress, upload to GPU
+        if (m_material->GetResourceState() == ResourceState::Max)
+        {
+            m_material->PrepareForGpu();
+        }
+
+        // use the cached mesh bounds, copying vertices dominates large prefab loads
+        if (m_mesh && GetLodCount() > 0)
+        {
+            const Vector3 size = GetLodAabb(0).GetSize();
+            material->SetProperty(
+                MaterialProperty::WorldWidth,
+                size.x
+            );
+            material->SetProperty(
+                MaterialProperty::WorldHeight,
+                size.y
+            );
+        }
+    }
+
+    void Render::SetMaterial(const string& file_path)
+    {
+        auto material = make_shared<Material>();
+
+        material->LoadFromFile(file_path);
+
+        SetMaterial(material);
+    }
+
+    void Render::SetDefaultMaterial()
+    {
+        SetMaterial(Renderer::GetStandardMaterial());
+        m_material_default = true;
+    }
+
+    string Render::GetMaterialName() const
+    {
+        return m_material ? m_material->GetObjectName() : "";
+    }
+
+    uint32_t Render::GetIndexOffset(const uint32_t lod) const
+    {
+        if (const MeshLod* mesh_lod = get_mesh_lod(m_mesh, m_sub_mesh_index, lod))
+        {
+            return m_mesh->GetGlobalIndexOffset() + mesh_lod->index_offset;
+        }
+
+        return 0;
+    }
+
+    uint32_t Render::GetIndexCount(const uint32_t lod) const
+    {
+        if (const MeshLod* mesh_lod = get_mesh_lod(m_mesh, m_sub_mesh_index, lod))
+        {
+            return mesh_lod->index_count;
+        }
+
+        return 0;
+    }
+
+    uint32_t Render::GetVertexOffset(const uint32_t lod) const
+    {
+        if (const MeshLod* mesh_lod = get_mesh_lod(m_mesh, m_sub_mesh_index, lod))
+        {
+            return m_mesh->GetGlobalVertexOffset() + mesh_lod->vertex_offset;
+        }
+
+        return 0;
+    }
+
+    uint32_t Render::GetVertexCount(const uint32_t lod) const
+    {
+        if (const MeshLod* mesh_lod = get_mesh_lod(m_mesh, m_sub_mesh_index, lod))
+        {
+            return mesh_lod->vertex_count;
+        }
+
+        return 0;
+    }
+
+    uint32_t Render::GetMeshletOffset(const uint32_t lod) const
+    {
+        if (const MeshLod* mesh_lod = get_mesh_lod(m_mesh, m_sub_mesh_index, lod))
+        {
+            return mesh_lod->meshlet_offset;
+        }
+
+        return 0;
+    }
+
+    uint32_t Render::GetMeshletCount(const uint32_t lod) const
+    {
+        if (const MeshLod* mesh_lod = get_mesh_lod(m_mesh, m_sub_mesh_index, lod))
+        {
+            return mesh_lod->meshlet_count;
+        }
+
+        return 0;
+    }
+
+    uint32_t Render::GetGlobalMeshletOffset() const
+    {
+        return m_mesh ? m_mesh->GetGlobalMeshletOffset() : 0;
+    }
+
+    const BoundingBox& Render::GetLodAabb(const uint32_t lod) const
+    {
+        if (const MeshLod* mesh_lod = get_mesh_lod(m_mesh, m_sub_mesh_index, lod))
+        {
+            return mesh_lod->aabb;
+        }
+
+        return BoundingBox::Unit;
+    }
+
+    RHI_Buffer* Render::GetIndexBuffer() const
+	{
+        if (!m_mesh)
+        {
+            return nullptr;
+        }
+
+        return m_mesh->GetIndexBuffer();
+	}
+
+    RHI_Buffer* Render::GetVertexBuffer() const
+    {
+        if (!m_mesh)
+        {
+            return nullptr;
+        }
+
+        return m_mesh->GetVertexBuffer();
+    }
+
+    const string& Render::GetMeshName() const
+    {
+        static string no_mesh = "N/A";
+        if (!m_mesh)
+        {
+            return no_mesh;
+        }
+
+        return m_mesh->GetObjectName();
+    }
+
+    void Render::BuildAccelerationStructure()
+    {
+        if (!m_mesh)
+        {
+            return;
+        }
+
+        m_mesh->BuildAccelerationStructure(m_allow_blas_update);
+    }
+
+    void Render::RefitAccelerationStructure()
+    {
+        if (!m_mesh)
+        {
+            return;
+        }
+
+        m_mesh->RefitBlas(m_sub_mesh_index);
+    }
+
+    bool Render::HasAccelerationStructure() const
+    {
+        if (!m_mesh)
+        {
+            return false;
+        }
+
+        return m_mesh->HasBlas(m_sub_mesh_index);
+    }
+
+    void Render::InvalidateAccelerationStructure()
+    {
+        if (m_mesh)
+        {
+            m_mesh->InvalidateBlas(m_sub_mesh_index);
+        }
+    }
+
+    uint64_t Render::GetAccelerationStructureDeviceAddress() const
+    {
+        if (!m_mesh)
+        {
+            return 0;
+        }
+
+        RHI_AccelerationStructure* blas = m_mesh->GetBlas(m_sub_mesh_index);
+        if (!blas)
+        {
+            return 0;
+        }
+
+        return blas->GetDeviceAddress();
+    }
+
+    Matrix Render::GetInstance(const uint32_t index, const bool to_world)
+    {
+        return to_world ? m_instances[index].GetMatrix() * GetEntity()->GetMatrix() : m_instances[index].GetMatrix();
+    }
+
+    void Render::SetInstances(const vector<Instance>& instances)
+    {
+        if (instances.empty())
+        {
+            m_instances.clear();
+            m_global_instance_offset = 0;
+            m_bounding_box_dirty     = true;
+            return;
+        }
+
+        m_instances = instances;
+
+        // append into the global instance pool so the indirect path can read instance attrs by offset + sv_instanceid
+        m_global_instance_offset = GeometryBuffer::AppendInstances(m_instances.data(), static_cast<uint32_t>(m_instances.size()));
+
+        m_bounding_box_dirty = true;
+        Tick(); // update bounding boxes, frustum and distance culling
+    }
+
+    void Render::SetInstances(const vector<Matrix>& transforms)
+    {
+        if (transforms.empty())
+        {
+            SetInstances(vector<Instance>{});
+            return;
+        }
+
+        // convert matrices to instances
+        vector<Instance> instances;
+        instances.reserve(transforms.size());
+        for (const auto& transform : transforms)
+        {
+            Instance instance;
+            instance.SetMatrix(transform);
+            instances.emplace_back(instance);
+        }
+
+        // call instance overload
+        SetInstances(instances);
+    }
+
+    uint32_t Render::GetLodCount() const
+    {
+        if (!m_mesh)
+        {
+            return 0;
+        }
+
+        // bounds checked, shutdown can clear submeshes while a dangling raw pointer still looks non null
+        return m_mesh->GetLodCount(m_sub_mesh_index);
+    }
+
+    void Render::SetFlag(const RenderFlags flag, const bool enable /*= true*/)
+    {
+        bool enabled      = false;
+        bool disabled     = false;
+        bool flag_present = m_flags & flag;
+
+        if (enable && !flag_present)
+        {
+            m_flags |= static_cast<uint32_t>(flag);
+            enabled  = true;
+
+        }
+        else if (!enable && flag_present)
+        {
+            m_flags  &= ~static_cast<uint32_t>(flag);
+            disabled  = true;
+        }
+    }
+
+    void Render::SetBoundingBoxOverride(const BoundingBox& world_box)
+    {
+        m_bounding_box = world_box;
+        m_bounding_box_override = true;
+        m_bounding_box_dirty = false;
+        UpdateFrustumAndDistanceCulling();
+        UpdateLodIndices();
+    }
+
+    void Render::ClearBoundingBoxOverride()
+    {
+        if (!m_bounding_box_override)
+        {
+            return;
+        }
+
+        m_bounding_box_override = false;
+        m_bounding_box_dirty = true;
+        UpdateAabb();
+        UpdateFrustumAndDistanceCulling();
+        UpdateLodIndices();
+    }
+
+    void Render::UpdateAabb()
+    {
+        if (m_bounding_box_override)
+        {
+            return;
+        }
+
+        const Matrix transform = (GetEntity() && GetEntity()->GetActive()) ? GetEntity()->GetMatrix() : Matrix::Identity;
+
+        // refuse to fold a non finite transform into the world bbox, doing so would
+        // poison m_bounding_box with NaN and trip the frustum culler assert downstream
+        if (!transform.IsFinite())
+        {
+            SP_LOG_WARNING("non finite world matrix on '%s', keeping last bbox", GetEntity() ? GetEntity()->GetObjectName().c_str() : "?");
+            return;
+        }
+
+        if (m_bounding_box_dirty || m_transform_previous != transform)
+        {
+            if (m_instances.empty()) // non-instanced
+            {
+                m_bounding_box = m_bounding_box_mesh * transform;
+            }
+            else // instanced
+            {
+                m_bounding_box = BoundingBox(Vector3::Infinity, Vector3::InfinityNeg);
+                for (const Instance& instance : m_instances)
+                {
+                    Matrix world_instance = instance.GetMatrix() * transform;
+                    m_bounding_box.Merge(m_bounding_box_mesh * world_instance);
+                }
+            }
+            m_transform_previous = transform;
+            m_bounding_box_dirty = false;
+        }
+    }
+
+    void Render::UpdateLodIndices()
+    {
+        // screen coverage handles distance, object size and fov uniformly with no per-type special cases
+
+        const uint32_t lod_count = GetLodCount();
+        if (lod_count == 0)
+        {
+            m_lod_index = 0;
+            return;
+        }
+
+        Camera* camera = World::GetCamera();
+        if (!camera)
+        {
+            m_lod_index = lod_count - 1;
+            return;
+        }
+
+        const BoundingBox& box        = GetBoundingBox();
+        const Vector3 camera_position = camera->GetEntity()->GetPosition();
+
+        // camera inside bounding box = maximum detail
+        if (box.Contains(camera_position))
+        {
+            m_lod_index = 0;
+            return;
+        }
+
+        // distance from camera to closest point on bounding box
+        Vector3 closest_point = box.GetClosestPoint(camera_position);
+        float distance        = max((closest_point - camera_position).Length(), 0.001f);
+
+        // an instanced renderable's box spans every instance it carries, so a tile of trees measures
+        // hundreds of metres across and scores full coverage from any distance, which pins the whole
+        // tile at lod 0 forever, the coverage has to come from the size of one instance while the box
+        // keeps supplying the distance
+        Vector3 measured_extents = box.GetExtents();
+        if (HasInstancing())
+        {
+            const Vector3 scale        = GetEntity()->GetScale();
+            const Vector3 mesh_extents = GetLodAabb(0).GetExtents();
+            measured_extents           = Vector3(
+                mesh_extents.x * abs(scale.x),
+                mesh_extents.y * abs(scale.y),
+                mesh_extents.z * abs(scale.z)
+            );
+        }
+
+        // compute screen-space coverage: fraction of vertical screen space the object covers
+        // screen_fraction = (object_diameter) / (visible_height_at_distance)
+        // visible_height_at_distance = 2 * distance * tan(fov_v / 2)
+        float bounding_diameter = measured_extents.Length() * 2.0f;
+        float tan_half_fov      = tan(camera->GetFovVerticalRad() * 0.5f);
+        float screen_fraction   = bounding_diameter / (2.0f * distance * tan_half_fov);
+
+        // screen height coverage each lod requires, calibrated so the transitions stay imperceptible
+        static constexpr array<float, 5> screen_thresholds =
+        {
+            0.05f,   // lod0: object covers >= 5% of screen height
+            0.025f,  // lod1: object covers >= 2.5% of screen height
+            0.012f,  // lod2: object covers >= 1.2% of screen height
+            0.006f,  // lod3: object covers >= 0.6% of screen height
+            0.003f   // lod4: object covers >= 0.3% of screen height
+        };
+
+        // hysteresis against lod popping, a change requires passing the threshold by 10 percent in either direction
+        constexpr float hysteresis = 1.1f;
+
+        uint32_t new_lod = lod_count - 1;
+        for (uint32_t i = 0; i < min(lod_count, static_cast<uint32_t>(screen_thresholds.size())); i++)
+        {
+            float threshold = screen_thresholds[i];
+
+            // apply hysteresis based on relationship to current lod
+            if (i < m_lod_index)
+            {
+                // upgrading to higher detail: raise the bar
+                threshold *= hysteresis;
+            }
+            else if (i == m_lod_index)
+            {
+                // staying at current lod: lower the bar (easier to stay)
+                threshold /= hysteresis;
+            }
+
+            if (screen_fraction >= threshold)
+            {
+                new_lod = i;
+                break;
+            }
+        }
+
+        m_lod_index = clamp(new_lod, 0u, lod_count - 1);
+    }
+}

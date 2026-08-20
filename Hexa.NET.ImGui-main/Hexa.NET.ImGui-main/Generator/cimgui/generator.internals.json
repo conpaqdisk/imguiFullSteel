@@ -1,0 +1,15 @@
+{
+  "BaseConfig": {
+    "Url": "file://config.base.json"
+  },
+  "Namespace": "Hexa.NET.ImGui",
+  "ApiName": "ImGuiP",
+  "LibName": "cimgui",
+  "GenerateConstants": false,
+  "GenerateEnums": false,
+  "GenerateExtensions": false,
+  "GenerateFunctions": true,
+  "GenerateTypes": false,
+  "GenerateHandles": false,
+  "GenerateDelegates": false
+}

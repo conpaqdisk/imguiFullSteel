@@ -1,0 +1,109 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES ===============
+#include "pch.h"
+#include "MemoryOverrides.h"
+#include "Allocator.h"
+//==========================
+
+void* operator new(size_t size)
+{
+    void* ptr = spartan::Allocator::Allocate(size);
+    if (!ptr)
+    {
+        throw std::bad_alloc();
+    }
+    return ptr;
+}
+
+void operator delete(void* ptr) noexcept
+{
+    spartan::Allocator::Free(ptr);
+}
+
+void* operator new[](size_t size)
+{
+    void* ptr = spartan::Allocator::Allocate(size);
+    if (!ptr)
+    {
+        throw std::bad_alloc();
+    }
+    return ptr;
+}
+
+void operator delete[](void* ptr) noexcept
+{
+    spartan::Allocator::Free(ptr);
+}
+
+// sized delete (C++14+)
+void operator delete(void* ptr, size_t) noexcept
+{
+    spartan::Allocator::Free(ptr);
+}
+
+void operator delete[](void* ptr, size_t) noexcept
+{
+    spartan::Allocator::Free(ptr);
+}
+
+// aligned new/delete (C++17+)
+void* operator new(size_t size, std::align_val_t alignment)
+{
+    void* ptr = spartan::Allocator::Allocate(size, static_cast<size_t>(alignment));
+    if (!ptr)
+    {
+        throw std::bad_alloc();
+    }
+    return ptr;
+}
+
+void operator delete(void* ptr, std::align_val_t) noexcept
+{
+    spartan::Allocator::Free(ptr);
+}
+
+void* operator new[](size_t size, std::align_val_t alignment)
+{
+    void* ptr = spartan::Allocator::Allocate(size, static_cast<size_t>(alignment));
+    if (!ptr)
+    {
+        throw std::bad_alloc();
+    }
+    return ptr;
+}
+
+void operator delete[](void* ptr, std::align_val_t) noexcept
+{
+    spartan::Allocator::Free(ptr);
+}
+
+// sized + aligned delete (C++17+)
+void operator delete(void* ptr, size_t, std::align_val_t) noexcept
+{
+    spartan::Allocator::Free(ptr);
+}
+
+void operator delete[](void* ptr, size_t, std::align_val_t) noexcept
+{
+    spartan::Allocator::Free(ptr);
+}

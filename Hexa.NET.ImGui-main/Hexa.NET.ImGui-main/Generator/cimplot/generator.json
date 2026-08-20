@@ -1,0 +1,35 @@
+{
+  "BaseConfig": {
+    "Url": "file://config.base.json"
+  },
+  "Namespace": "Hexa.NET.ImPlot",
+  "ApiName": "ImPlot",
+  "LibName": "cimplot",
+  "GenerateAdditionalOverloads": false,
+  "TypeMappings": {
+    "time_t": "long"
+  },
+  "KnownEnumValueNames": {
+    "ImGuiCond_None": "0",
+    "ImGuiCond_Always": "1",
+    "ImGuiCond_Once": "2"
+  },
+  "KnownDefaultValueNames": {
+    "sizeof(ImS8)": "sizeof(sbyte)",
+    "sizeof(ImU8)": "sizeof(byte)",
+    "sizeof(ImS16)": "sizeof(short)",
+    "sizeof(ImU16)": "sizeof(ushort)",
+    "sizeof(ImS32)": "sizeof(int)",
+    "sizeof(ImU32)": "sizeof(uint)",
+    "sizeof(ImS64)": "sizeof(long)",
+    "sizeof(ImU64)": "sizeof(ulong)",
+    "ImPlotBin_Sturges": "(int)ImPlotBin.Sturges",
+    "ImPlotPoint(1,1)": "*ImPlotPointNative(1,1)",
+    "ImPlotPoint(0,0)": "*ImPlotPointNative(0,0)",
+    "ImPlotRect()": "*ImPlotRectNative()",
+    "ImPlotRange()": "*ImPlotRangeNative()",
+    "ImPlotCond_Once": "ImPlotCond.Once"
+  },
+  "IgnoredParts": [ "ImPlot" ],
+  "Usings": [ "Hexa.NET.ImGui" ]
+}

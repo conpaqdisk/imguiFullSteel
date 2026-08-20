@@ -1,0 +1,10 @@
+{
+  "BaseConfig": {
+    "Url": "file://config.base.json"
+  },
+  "Namespace": "Hexa.NET.ImGuiNodeEditor",
+  "ApiName": "ImGuiNodeEditor",
+  "LibName": "ImGuiNodeEditor",
+  "Usings": [ "Hexa.NET.ImGui" ],
+  "SystemIncludeFolders": [ "C:/dev/imgui" ]
+}

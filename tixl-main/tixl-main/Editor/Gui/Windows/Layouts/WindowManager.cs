@@ -1,0 +1,193 @@
+#nullable enable
+using ImGuiNET;
+using T3.Core.Compilation;
+using T3.Editor.Gui.Dialog;
+using T3.Editor.Gui.Window;
+using T3.Editor.Gui.Interaction;
+using T3.Editor.Gui.Interaction.Keyboard;
+using T3.Editor.Gui.UiHelpers;
+using T3.Editor.Gui.Windows.Analyze;
+using T3.Editor.Gui.Windows.AssetLib;
+using T3.Editor.Gui.Windows.Exploration;
+using T3.Editor.Gui.Windows.Output;
+using T3.Editor.Gui.Windows.RenderExport;
+using T3.Editor.Gui.Windows.TestRunner;
+using T3.Editor.Gui.Windows.TimeLine;
+using T3.Editor.Gui.Windows.SymbolLib;
+using T3.Editor.Gui.Windows.Variations;
+
+namespace T3.Editor.Gui.Windows.Layouts;
+
+internal static partial class WindowManager
+{
+    internal static void Draw()
+    {
+        TryToInitialize(); // We have to keep initializing until window sizes are initialized
+        if (!_hasBeenInitialized)
+            return;
+            
+        LayoutHandling.ProcessKeyboardShortcuts();
+
+        if (UserActions.ToggleVariationsWindow.Triggered())
+        {
+            ToggleWindowTypeVisibility<VariationsWindow>();
+        }
+
+        if (UserActions.ToggleManualTestWindow.Triggered())
+        {
+            GuidedFeatureTestsWindow.Config.Visible = !GuidedFeatureTestsWindow.Config.Visible;
+        }
+
+        if (UserActions.ToggleConsoleLogWindow.Triggered())
+        {
+            ToggleWindowTypeVisibility<ConsoleLogWindow>();
+        }
+
+        UpdateAppWindowSize();
+
+        foreach (var windowType in _windows)
+        {
+            windowType.Draw();
+        }
+
+        // Draw SNiXL window separately (easter egg - not in main windows list)
+        SnixlWindow.Draw();
+
+        if (DemoWindowVisible)
+            ImGui.ShowDemoWindow(ref DemoWindowVisible);
+
+        if (MetricsWindowVisible)
+            ImGui.ShowMetricsWindow(ref MetricsWindowVisible);
+    }
+
+    internal static readonly SymbolLibrary SymbolLibrary = new();
+    internal static readonly SettingsWindow SettingsWindow = new();
+    internal static readonly ProjectSettingsWindow ProjectSettingsWindow = new();
+    internal static readonly UtilitiesWindow UtilitiesWindow = new();
+    internal static readonly ScreenManagerWindow ScreenManagerWindow = new();
+    internal static readonly SnixlWindow SnixlWindow = new();
+    internal static readonly GuidedFeatureTestsWindow GuidedFeatureTestsWindow = new();
+
+    /// <summary>The version-welcome window matching the running build — only the "alpha" suffix gets the import/testing variant.</summary>
+    internal static readonly WelcomeWindowBase WelcomeWindow = RuntimeAssemblies.IsAlpha
+                                                                   ? new WelcomeAlphaWindow()
+                                                                   : new WelcomeWindow();
+
+    internal static readonly HelpWindow HelpWindow = new();
+
+
+    private static void TryToInitialize()
+    {
+        // Wait first frame for ImGUI to initialize
+        var frameCount = ImGui.GetFrameCount();
+        if (frameCount < 2 || _hasBeenInitialized)
+            return;
+        
+        _windows =
+            [
+                new VariationsWindow(),
+                new OutputWindow(),
+                new GraphWindow(),
+                new ParameterWindow(),
+                SymbolLibrary,
+                new AssetLibrary(),
+                new ExplorationWindow(),
+                new RenderWindow(),
+                new IoViewWindow(),
+                new PerformanceWindow(),
+                HelpWindow, // item shown in Help menu
+                Program.ConsoleLogWindow,
+                UtilitiesWindow,    // item shown in TiXL > Development menu
+                GuidedFeatureTestsWindow,
+                SettingsWindow, // item shown in TiXL menu
+                ProjectSettingsWindow, // item shown in TiXL menu
+                ScreenManagerWindow,
+                WelcomeWindow, // opened from Help → Welcome / the version-welcome trigger
+            ];
+
+
+        ReApplyLayout();
+        _appWindowSize = ImGui.GetIO().DisplaySize;
+        _hasBeenInitialized = true;
+    }
+
+    private static void ReApplyLayout()
+    {
+        LayoutHandling.LoadAndApplyLayoutOrFocusMode((LayoutHandling.Layouts)UserSettings.Config.WindowLayoutIndex);
+    }
+
+    internal static IEnumerable<Window> GetAllWindows()
+    {
+        foreach (var window in _windows)
+        {
+            if (window.AllowMultipleInstances)
+            {
+                foreach (var windowInstance in window.GetInstances())
+                {
+                    yield return windowInstance;
+                }
+            }
+            else
+            {
+                yield return window;
+            }
+        }
+
+        foreach (var window in GraphWindow.GraphWindowInstances)
+            yield return window;
+    }
+
+    public static bool IsAnyInstanceVisible<T>() where T : Window
+    {
+        return GetAllWindows().OfType<T>().Any(w => w.Config.Visible);
+    }
+        
+    public static void ToggleInstanceVisibility<T>() where T : Window
+    {
+        var foundFirst = false;
+        var newVisibility = false;
+        foreach (var w in GetAllWindows().OfType<T>())
+        {
+            if (!foundFirst)
+            {
+                newVisibility = !w.Config.Visible;
+                foundFirst = true;
+            }
+
+            w.Config.Visible = newVisibility;
+        }
+    }
+
+    private static void UpdateAppWindowSize()
+    {
+        var newSize = ImGui.GetIO().DisplaySize;
+        if (newSize == _appWindowSize)
+            return;
+
+        _appWindowSize = newSize;
+
+        LayoutHandling.UpdateAfterResize(newSize);
+    }
+
+    public static void ToggleWindowTypeVisibility<T>() where T : Window
+    {
+        var instances = GetAllWindows().OfType<T>().ToList();
+        if (instances.Count != 1)
+            return;
+
+        instances[0].Config.Visible = !instances[0].Config.Visible;
+    }
+
+    internal static bool DemoWindowVisible;
+    internal static bool MetricsWindowVisible;
+    
+    private static Vector2 _appWindowSize;
+    
+    /// <summary>
+    /// Contains all possible window types and used for updating and layout management
+    /// </summary>
+    private static List<Window> _windows = [];
+    
+    public static bool ShowSecondaryRenderWindow { get; set; }
+    private static bool _hasBeenInitialized;
+}

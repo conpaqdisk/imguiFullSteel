@@ -1,0 +1,736 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES =====================
+#include "pch.h"
+#include "Window.h"
+#include "../RHI_Device.h"
+#include "../RHI_SwapChain.h"
+#include "../RHI_Implementation.h"
+#include "../RHI_SyncPrimitive.h"
+#include "../RHI_Queue.h"
+#include "../display/Display.h"
+#include "../rendering/Renderer.h"
+#include "../../profiling/Profiler.h"
+#ifdef _WIN32
+#include <tlhelp32.h>
+#endif
+SP_WARNINGS_OFF
+#include <SDL3/SDL_vulkan.h>
+SP_WARNINGS_ON
+//================================
+
+//= NAMESPACES ===============
+using namespace std;
+using namespace spartan::math;
+//============================
+
+namespace spartan
+{
+    namespace
+    {
+        VkColorSpaceKHR get_color_space(const RHI_Format format)
+        {
+            VkColorSpaceKHR color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;                                                       // SDR
+            color_space                 = format == RHI_Format::R10G10B10A2_Unorm ? VK_COLOR_SPACE_HDR10_ST2084_EXT : color_space; // HDR
+
+            return color_space;
+        }
+
+        void set_hdr_metadata(const VkSwapchainKHR& swapchain)
+        {
+            VkHdrMetadataEXT hdr_metadata          = {};
+            hdr_metadata.sType                     = VK_STRUCTURE_TYPE_HDR_METADATA_EXT;
+            hdr_metadata.displayPrimaryRed.x       = 0.708f;
+            hdr_metadata.displayPrimaryRed.y       = 0.292f;
+            hdr_metadata.displayPrimaryGreen.x     = 0.170f;
+            hdr_metadata.displayPrimaryGreen.y     = 0.797f;
+            hdr_metadata.displayPrimaryBlue.x      = 0.131f;
+            hdr_metadata.displayPrimaryBlue.y      = 0.046f;
+            hdr_metadata.whitePoint.x              = 0.3127f;
+            hdr_metadata.whitePoint.y              = 0.3290f;
+            const float nits_to_lumin              = 10000.0f;
+            hdr_metadata.maxLuminance              = Display::GetLuminanceMax() * nits_to_lumin;
+            hdr_metadata.minLuminance              = 0.001f * nits_to_lumin;
+            hdr_metadata.maxContentLightLevel      = 2000.0f;
+            hdr_metadata.maxFrameAverageLightLevel = 500.0f;
+
+            PFN_vkSetHdrMetadataEXT pfnVkSetHdrMetadataEXT = (PFN_vkSetHdrMetadataEXT)vkGetDeviceProcAddr(RHI_Context::device , "vkSetHdrMetadataEXT");
+            SP_ASSERT(pfnVkSetHdrMetadataEXT != nullptr);
+            pfnVkSetHdrMetadataEXT(RHI_Context::device, 1, &swapchain, &hdr_metadata);
+        }
+
+        VkSurfaceCapabilitiesKHR get_surface_capabilities(const VkSurfaceKHR surface)
+        {
+            VkSurfaceCapabilitiesKHR surface_capabilities;
+            vkGetPhysicalDeviceSurfaceCapabilitiesKHR(RHI_Context::device_physical, surface, &surface_capabilities);
+            return surface_capabilities;
+        }
+
+        vector<VkPresentModeKHR> get_supported_present_modes(const VkSurfaceKHR surface)
+        {
+            uint32_t present_mode_count;
+            vkGetPhysicalDeviceSurfacePresentModesKHR(RHI_Context::device_physical, surface, &present_mode_count, nullptr);
+
+            vector<VkPresentModeKHR> surface_present_modes(present_mode_count);
+            vkGetPhysicalDeviceSurfacePresentModesKHR(RHI_Context::device_physical, surface, &present_mode_count, &surface_present_modes[0]);
+            return surface_present_modes;
+        }
+
+        VkPresentModeKHR get_present_mode(const VkSurfaceKHR surface, const RHI_Present_Mode present_mode)
+        {
+            VkPresentModeKHR vk_present_mode = VK_PRESENT_MODE_FIFO_KHR;
+            if (present_mode == RHI_Present_Mode::Immediate)
+            {
+                vk_present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+            }
+            else if (present_mode == RHI_Present_Mode::Mailbox)
+            {
+                vk_present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
+            }
+
+            // return the present mode as is if the surface supports it
+            vector<VkPresentModeKHR> surface_present_modes = get_supported_present_modes(surface);
+            for (const VkPresentModeKHR supported_present_mode : surface_present_modes)
+            {
+                if (vk_present_mode == supported_present_mode)
+                {
+                    return vk_present_mode;
+                }
+            }
+
+            // At this point we call back to VK_PRESENT_MODE_FIFO_KHR, which as per spec is always present
+            SP_LOG_WARNING("Requested present mode is not supported. Falling back to VK_PRESENT_MODE_FIFO_KHR");
+            return VK_PRESENT_MODE_FIFO_KHR;
+        }
+
+        vector<VkSurfaceFormatKHR> get_supported_surface_formats(const VkSurfaceKHR surface)
+        {
+            uint32_t format_count;
+            SP_ASSERT_VK(vkGetPhysicalDeviceSurfaceFormatsKHR(RHI_Context::device_physical, surface, &format_count, nullptr));
+
+            vector<VkSurfaceFormatKHR> surface_formats(format_count);
+            SP_ASSERT_VK(vkGetPhysicalDeviceSurfaceFormatsKHR(RHI_Context::device_physical, surface, &format_count, &surface_formats[0]));
+
+            return surface_formats;
+        }
+
+        bool is_format_and_color_space_supported(const VkSurfaceKHR surface, RHI_Format* format, VkColorSpaceKHR color_space)
+        {
+            vector<VkSurfaceFormatKHR> supported_formats = get_supported_surface_formats(surface);
+
+            // NV supports RHI_Format::B8R8G8A8_Unorm instead of RHI_Format::R8G8B8A8_Unorm
+            if ((*format) == RHI_Format::R8G8B8A8_Unorm && RHI_Device::GetPrimaryPhysicalDevice()->IsNvidia())
+            {
+                (*format) = RHI_Format::B8R8G8A8_Unorm;
+            }
+
+            for (const VkSurfaceFormatKHR& supported_format : supported_formats)
+            {
+                bool support_format      = supported_format.format == vulkan_format[rhi_format_to_index(*format)];
+                bool support_color_space = supported_format.colorSpace == color_space;
+
+                if (support_format && support_color_space)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        VkCompositeAlphaFlagBitsKHR get_supported_composite_alpha_format(const VkSurfaceKHR surface)
+        {
+            vector<VkCompositeAlphaFlagBitsKHR> composite_alpha_flags =
+            {
+                VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+                VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
+                VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR,
+                VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
+            };
+
+            // get physical device surface capabilities
+            VkSurfaceCapabilitiesKHR surface_capabilities;
+            SP_ASSERT_VK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(RHI_Context::device_physical, surface, &surface_capabilities));
+
+            // simply select the first composite alpha format available
+            for (VkCompositeAlphaFlagBitsKHR& composite_alpha : composite_alpha_flags)
+            {
+                if (surface_capabilities.supportedCompositeAlpha & composite_alpha)
+                {
+                    return composite_alpha;
+                };
+            }
+
+            return VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+        }
+
+        bool is_process_running(const char* process_name)
+        {
+        #ifdef _WIN32
+            HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snapshot == INVALID_HANDLE_VALUE)
+            {
+                return false;
+            }
+        
+            PROCESSENTRY32W pe32 = {0}; // Use PROCESSENTRY32W for Unicode
+            pe32.dwSize = sizeof(PROCESSENTRY32W);
+        
+            if (!Process32FirstW(snapshot, &pe32)) { // Use Process32FirstW for Unicode
+                CloseHandle(snapshot);
+                return false; // Failed to get first process
+            }
+        
+            // Convert processName to wide-character string for comparison
+            size_t converted_chars = 0;
+            wchar_t wProcessName[MAX_PATH];
+            mbstowcs_s(&converted_chars, wProcessName, process_name, strlen(process_name) + 1);
+        
+            // Iterate through all processes
+            do {
+                if (_wcsicmp(pe32.szExeFile, wProcessName) == 0) { // Case-insensitive wide-character comparison
+                    CloseHandle(snapshot);
+                    return true; // Process found
+                }
+            } while (Process32NextW(snapshot, &pe32)); // Use Process32NextW for Unicode
+        
+            CloseHandle(snapshot);
+            return false; // Process not found
+        
+        #elif defined(__linux__)
+            // Linux implementation
+            DIR* dir = opendir("/proc");
+            if (!dir) {
+                return false; // Failed to open /proc directory
+            }
+        
+            struct dirent* entry;
+            while ((entry = readdir(dir)) != NULL) {
+                // Check if the directory is a PID (starts with a digit)
+                if (entry->d_type == DT_DIR && isdigit(entry->d_name[0])) {
+                    char comm_path[256];
+                    snprintf(comm_path, sizeof(comm_path), "/proc/%s/comm", entry->d_name);
+        
+                    FILE* comm_file = fopen(comm_path, "r");
+                    if (comm_file) {
+                        char comm[256];
+                        if (fgets(comm, sizeof(comm), comm_file)) {
+                            comm[strcspn(comm, "\n")] = 0; // Remove newline
+                            if (strcmp(comm, processName) == 0) { // Case-sensitive comparison
+                                fclose(comm_file);
+                                closedir(dir);
+                                return true; // Process found
+                            }
+                        }
+                        fclose(comm_file);
+                    }
+                }
+            }
+        
+            closedir(dir);
+            return false; // Process not found
+        
+        #else
+            // Unsupported platform
+            return false;
+        #endif
+        }
+    }
+
+    RHI_SwapChain::RHI_SwapChain(
+        void* sdl_window,
+        const uint32_t width,
+        const uint32_t height,
+        const RHI_Present_Mode present_mode,
+        const uint32_t buffer_count,
+        const bool hdr,
+        const char* name
+    )
+    {
+        SP_ASSERT_MSG(RHI_Device::IsValidResolution(width, height), "Invalid resolution");
+        SP_ASSERT_MSG(buffer_count >= 2, "Buffer count can't be less than 2");
+    
+        m_format       = hdr ? format_hdr : format_sdr;
+        m_buffer_count = buffer_count;
+        m_width        = width;
+        m_height       = height;
+        m_sdl_window   = sdl_window;
+        m_object_name  = name;
+        m_present_mode = present_mode;
+        m_rhi_rt.resize(m_buffer_count, nullptr);
+        m_rhi_rtv.resize(m_buffer_count, nullptr);
+        m_image_acquired_semaphore.resize(
+            max(
+                static_cast<uint32_t>(
+                    acquire_semaphore_count
+                ),
+                m_buffer_count + 1
+            )
+        );
+        m_rendering_complete_semaphore.resize(
+            m_buffer_count
+        );
+    
+        // create surface once
+        {
+            SP_ASSERT_MSG(SDL_Vulkan_CreateSurface(static_cast<SDL_Window*>(m_sdl_window), RHI_Context::instance, nullptr, reinterpret_cast<VkSurfaceKHR*>(&m_rhi_surface)), "Failed to create window surface");
+
+            VkBool32 present_support = false;
+            SP_ASSERT_VK(vkGetPhysicalDeviceSurfaceSupportKHR(
+                RHI_Context::device_physical,
+                RHI_Device::GetQueueIndex(RHI_Queue_Type::Present),
+                static_cast<VkSurfaceKHR>(m_rhi_surface),
+                &present_support
+            ));
+            SP_ASSERT_MSG(present_support, "Present queue does not support presentation to this surface");
+        }
+
+        Create();
+
+        // only the main window swapchain tracks os resize, imgui child swapchains are resized via their own platform callbacks
+        if (m_sdl_window == Window::GetHandleSDL())
+        {
+            m_window_resize_event_handle = SP_SUBSCRIBE_TO_EVENT(EventType::WindowResized, SP_EVENT_HANDLER(ResizeToWindowSize));
+        }
+    }
+
+    RHI_SwapChain::~RHI_SwapChain()
+    {
+        SP_UNSUBSCRIBE_FROM_EVENT(EventType::WindowResized, m_window_resize_event_handle);
+        m_window_resize_event_handle = 0;
+
+        for (void*& image_view : m_rhi_rtv)
+        {
+            if (image_view)
+            {
+                RHI_Device::DeletionQueueAdd(RHI_Resource_Type::ImageView, image_view);
+                image_view = nullptr;
+            }
+        }
+
+        if (m_rhi_swapchain)
+        {
+            vkDestroySwapchainKHR(RHI_Context::device, static_cast<VkSwapchainKHR>(m_rhi_swapchain), nullptr);
+            m_rhi_swapchain = nullptr;
+        }
+
+        if (m_rhi_surface)
+        {
+            vkDestroySurfaceKHR(RHI_Context::instance, static_cast<VkSurfaceKHR>(m_rhi_surface), nullptr);
+            m_rhi_surface = nullptr;
+        }
+    }
+
+    RHI_SyncPrimitive* RHI_SwapChain::GetImageAcquiredSemaphore() const
+    {
+        // only return the semaphore if we actually acquired an image
+        return
+            m_image_acquired
+                ? m_image_acquired_semaphore[
+                    m_acquired_semaphore_index
+                ].get()
+                : nullptr;
+    }
+
+    RHI_SyncPrimitive* RHI_SwapChain::GetRenderingCompleteSemaphore() const
+    {
+        // use per-image semaphores to avoid reusing a semaphore that's still in use by presentation
+        // when image N is re-acquired, it means any previous presentation of image N has completed
+        return m_image_acquired ? m_rendering_complete_semaphore[m_image_index].get() : nullptr;
+    }
+
+    void RHI_SwapChain::Create()
+    {
+        SP_ASSERT(m_sdl_window != nullptr);
+        SP_ASSERT(m_rhi_surface != nullptr);
+
+        // apply pending format change now that we're actually recreating the swapchain
+        if (m_format_pending != RHI_Format::Max)
+        {
+            m_format         = m_format_pending;
+            m_format_pending = RHI_Format::Max;
+        }
+
+        // get surface capabilities
+        VkSurfaceCapabilitiesKHR capabilities = get_surface_capabilities(static_cast<VkSurfaceKHR>(m_rhi_surface));
+    
+        // skip if window is minimized
+        if (capabilities.currentExtent.width == 0 || capabilities.currentExtent.height == 0)
+        {
+            SP_LOG_WARNING("Window is minimized, swapchain creation skipped");
+            return;
+        }
+    
+        // check surface supports the requested format and color space, fall back to SDR if not supported
+        VkColorSpaceKHR color_space = get_color_space(m_format);
+        if (!is_format_and_color_space_supported(static_cast<VkSurfaceKHR>(m_rhi_surface), &m_format, color_space))
+        {
+            SP_LOG_WARNING("HDR format (%s, %d) not supported by surface. Falling back to SDR."
+                           "On NVIDIA Optimus laptops, switch to 'High-performance NVIDIA processor' in NVIDIA Control Panel or Windows Graphics Settings,"
+                           "or update to NVIDIA driver 551.xx+ for Vulkan HDR support.", rhi_format_to_string(m_format), color_space);
+
+            ConsoleRegistry::Get().SetValueFromString("r.hdr", "0");
+            m_format    = format_sdr; 
+            color_space = get_color_space(m_format); 
+        }
+
+        // only wait when replacing an in-flight swapchain, initial create has nothing to sync and
+        // queuewaitall here is what freezes the editor for a frame when undocking a viewport
+        if (m_rhi_swapchain)
+        {
+            RHI_Device::QueueWaitAll();
+        }
+
+        for (void*& image_view : m_rhi_rtv)
+        {
+            if (image_view)
+            {
+                vkDestroyImageView(
+                    RHI_Context::device,
+                    static_cast<VkImageView>(image_view),
+                    nullptr
+                );
+                image_view = nullptr;
+            }
+        }
+
+        // match the surface extent when the platform locks it, using logical sdl size here causes vk_suboptimal_khr recreate loops under dpi scaling
+        if (capabilities.currentExtent.width != UINT32_MAX)
+        {
+            m_width  = capabilities.currentExtent.width;
+            m_height = capabilities.currentExtent.height;
+        }
+        else
+        {
+            m_width  = clamp(m_width,  capabilities.minImageExtent.width, capabilities.maxImageExtent.width);
+            m_height = clamp(m_height, capabilities.minImageExtent.height, capabilities.maxImageExtent.height);
+        }
+    
+        // create new swapchain
+        VkSwapchainCreateInfoKHR create_info = {};
+        create_info.sType                    = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+        create_info.surface                  = static_cast<VkSurfaceKHR>(m_rhi_surface);
+        create_info.minImageCount            =
+            max(
+                m_buffer_count,
+                capabilities.minImageCount
+            );
+        if (capabilities.maxImageCount > 0)
+        {
+            create_info.minImageCount =
+                min(
+                    create_info.minImageCount,
+                    capabilities.maxImageCount
+                );
+        }
+        create_info.imageFormat              = vulkan_format[rhi_format_to_index(m_format)];
+        create_info.imageColorSpace          = color_space;
+        create_info.imageExtent              = { m_width, m_height };
+        create_info.imageArrayLayers         = 1;
+        create_info.imageUsage               = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        create_info.imageSharingMode         = VK_SHARING_MODE_EXCLUSIVE;
+        create_info.preTransform             = capabilities.currentTransform;
+        create_info.compositeAlpha           = get_supported_composite_alpha_format(static_cast<VkSurfaceKHR>(m_rhi_surface));
+        create_info.presentMode              = get_present_mode(static_cast<VkSurfaceKHR>(m_rhi_surface), m_present_mode);
+        create_info.clipped                  = VK_TRUE;
+        create_info.oldSwapchain             = static_cast<VkSwapchainKHR>(m_rhi_swapchain);
+
+        // check for RivaTuner overlay interference, it adds bit flags without checking for compatibility with existing ones (so it can break stuff)
+        if (is_process_running("RTSS.exe"))
+        {
+            SP_ERROR_WINDOW("RivaTuner is running and may crash the engine. Please close RivaTuner and restart the engine.");
+        }
+
+        SP_ASSERT_VK(vkCreateSwapchainKHR(RHI_Context::device, &create_info, nullptr, reinterpret_cast<VkSwapchainKHR*>(&m_rhi_swapchain)));
+   
+        // destroy old swapchain if it existed
+        if (create_info.oldSwapchain != VK_NULL_HANDLE)
+        {
+            vkDestroySwapchainKHR(RHI_Context::device, create_info.oldSwapchain, nullptr);
+        }
+    
+        // get new images
+        uint32_t image_count = 0;
+        SP_ASSERT_VK(vkGetSwapchainImagesKHR(RHI_Context::device, static_cast<VkSwapchainKHR>(m_rhi_swapchain), &image_count, nullptr));
+        m_buffer_count = image_count;
+        m_rhi_rt.assign(m_buffer_count, nullptr);
+        m_rhi_rtv.assign(m_buffer_count, nullptr);
+        m_image_acquired_semaphore.resize(
+            max(
+                static_cast<uint32_t>(
+                    acquire_semaphore_count
+                ),
+                m_buffer_count + 1
+            )
+        );
+        m_rendering_complete_semaphore.resize(
+            m_buffer_count
+        );
+        semaphore_index = 0;
+        SP_ASSERT_VK(vkGetSwapchainImagesKHR(RHI_Context::device, static_cast<VkSwapchainKHR>(m_rhi_swapchain), &image_count, reinterpret_cast<VkImage*>(m_rhi_rt.data())));
+    
+        // create new image views
+        for (uint32_t i = 0; i < m_buffer_count; i++)
+        {
+            VkImageViewCreateInfo view_info = {};
+            view_info.sType                 = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            view_info.image                 = static_cast<VkImage>(m_rhi_rt[i]);
+            view_info.viewType              = VK_IMAGE_VIEW_TYPE_2D;
+            view_info.format                = vulkan_format[rhi_format_to_index(m_format)];
+            view_info.subresourceRange      = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            view_info.components            = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
+            SP_ASSERT_VK(vkCreateImageView(RHI_Context::device, &view_info, nullptr, reinterpret_cast<VkImageView*>(&m_rhi_rtv[i])));
+        }
+    
+        // acquire semaphores rotate independently to avoid in flight reuse
+        for (uint32_t i = 0; i < static_cast<uint32_t>(m_image_acquired_semaphore.size()); i++)
+        {
+            m_image_acquired_semaphore[i] =
+                make_shared<RHI_SyncPrimitive>(
+                    RHI_SyncPrimitive_Type::Semaphore,
+                    (
+                        "swapchain_acquire_" +
+                        to_string(i)
+                    ).c_str()
+                );
+        }
+
+        for (uint32_t i = 0; i < static_cast<uint32_t>(m_rendering_complete_semaphore.size()); i++)
+        {
+            m_rendering_complete_semaphore[i] =
+                make_shared<RHI_SyncPrimitive>(
+                    RHI_SyncPrimitive_Type::Semaphore,
+                    (
+                        "swapchain_present_" +
+                        to_string(i)
+                    ).c_str()
+                );
+        }
+    
+        // set HDR metadata only if HDR is enabled
+        if (m_format == format_hdr)
+        {
+            set_hdr_metadata(static_cast<VkSwapchainKHR>(m_rhi_swapchain));
+        }
+
+         SP_LOG_INFO(
+            "Swapchain created with resolution: %dx%d, HDR: %s (%s), VSync: %s",
+            m_width,
+            m_height,
+            m_format == format_hdr ? "enabled" : "disabled",
+            rhi_format_to_string(m_format),
+            m_present_mode == RHI_Present_Mode::Fifo ? "enabled" : "disabled"
+        );
+
+        // reset state after swapchain recreation
+        m_image_index               = 0;
+        semaphore_index             = 0;
+        m_acquired_semaphore_index  = 0;
+        m_image_acquired            = false;
+    }
+
+    void RHI_SwapChain::Resize(const uint32_t width, const uint32_t height)
+    {
+        SP_ASSERT(RHI_Device::IsValidResolution(width, height));
+
+        if (m_width == width && m_height == height)
+        {
+            return;
+        }
+
+        m_width  = width;
+        m_height = height;
+
+        Create();
+
+        SP_LOG_INFO("Resolution has been set to %dx%d", width, height);
+    }
+
+    void RHI_SwapChain::ResizeToWindowSize()
+    {
+        Resize(Window::GetWidthInPixels(), Window::GetHeightInPixels());
+    }
+
+    void RHI_SwapChain::AcquireNextImage()
+    {
+        // reset acquisition state
+        m_image_acquired = false;
+
+        // when the window is minimized acquisition will fail and it's not necessary either
+        if (Window::IsMinimized())
+        {
+            return;
+        }
+
+        // ensure swapchain is valid
+        if (!m_rhi_swapchain)
+        {
+            return;
+        }
+
+        // try to acquire, with retry after swapchain recreation
+        for (uint32_t attempt = 0; attempt < 2; attempt++)
+        {
+            // rotate acquire semaphores independently from swapchain images
+            RHI_SyncPrimitive* signal_semaphore = m_image_acquired_semaphore[semaphore_index].get();
+
+            // ensure the semaphore is free; wait for any command list that used this semaphore
+            if (RHI_CommandList* cmd_list = signal_semaphore->GetUserCmdList())
+            {
+                if (cmd_list->GetState() == RHI_CommandListState::Submitted)
+                {
+                    ScopedTimeBlock time_block(
+                        "acquire_semaphore_wait"
+                    );
+                    cmd_list->WaitForExecution();
+                }
+                signal_semaphore->SetUserCmdList(nullptr);
+            }
+
+            // acquire with a reasonable timeout
+            VkResult result;
+            {
+                ScopedTimeBlock time_block(
+                    "acquire_image_wait"
+                );
+                result = vkAcquireNextImageKHR(
+                    RHI_Context::device,
+                    static_cast<VkSwapchainKHR>(
+                        m_rhi_swapchain
+                    ),
+                    100000000,
+                    static_cast<VkSemaphore>(
+                        signal_semaphore->
+                            GetRhiResource()
+                    ),
+                    nullptr,
+                    &m_image_index
+                );
+            }
+
+            if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)
+            {
+                m_acquired_semaphore_index =
+                    semaphore_index;
+                semaphore_index =
+                    (
+                        semaphore_index +
+                        1
+                    ) %
+                    m_image_acquired_semaphore.size();
+                m_image_acquired = true;
+                return;
+            }
+            else if (result == VK_ERROR_OUT_OF_DATE_KHR)
+            {
+                // swapchain needs recreation, then try to acquire again
+                Create();
+                if (!m_rhi_swapchain)
+                {
+                    return;
+                }
+                // continue to retry acquisition
+            }
+            else if (result == VK_TIMEOUT || result == VK_NOT_READY)
+            {
+                // window is likely minimized or transitioning - this is normal
+                return;
+            }
+            else
+            {
+                SP_ASSERT_VK(result);
+                return;
+            }
+        }
+    }
+    
+    void RHI_SwapChain::Present(RHI_CommandList* cmd_list_frame)
+    {
+        (void)cmd_list_frame;
+
+        // only present if we successfully acquired an image
+        if (!m_image_acquired)
+        {
+            return;
+        }
+
+        // use per-image semaphore to avoid reuse conflicts - when this image is re-acquired,
+        // we know the previous presentation completed, so the semaphore is safe to signal again
+        RHI_SyncPrimitive* rendering_complete_semaphore = m_rendering_complete_semaphore[m_image_index].get();
+        bool success = RHI_Device::GetQueue(RHI_Queue_Type::Present)->Present(m_rhi_swapchain, m_image_index, rendering_complete_semaphore);
+
+        // clear acquisition state after presentation
+        m_image_acquired = false;
+
+        // if present failed (swapchain out of date), mark for recreation
+        if (!success)
+        {
+            m_is_dirty = true;
+        }
+
+        // recreate the swapchain if needed - we do it here so that no semaphores are being destroyed while they are being waited for
+        if (m_is_dirty)
+        {
+            Create();
+            m_is_dirty = false;
+        }
+    }
+
+    void RHI_SwapChain::SetHdr(const bool enabled)
+    {
+        if (enabled)
+        {
+            SP_ASSERT_MSG(Display::GetHdr(), "This display doesn't support HDR");
+        }
+    
+        RHI_Format new_format = enabled ? format_hdr : format_sdr;
+    
+        // nvidia supports B8R8G8A8_Unorm instead of R8G8B8A8_Unorm
+        if (new_format == RHI_Format::R8G8B8A8_Unorm && RHI_Device::GetPrimaryPhysicalDevice()->IsNvidia())
+        {
+            new_format = RHI_Format::B8R8G8A8_Unorm;
+        }
+    
+        // the format is applied in Create, updating it here would mismatch pipelines rendering between SetHdr and Create
+        if (new_format != m_format)
+        {
+            m_format_pending = new_format;
+            m_is_dirty       = true;
+        }
+    }
+
+    void RHI_SwapChain::SetVsync(const bool enabled)
+    {
+        if ((m_present_mode == RHI_Present_Mode::Fifo) != enabled)
+        {
+            m_present_mode = enabled ? RHI_Present_Mode::Fifo : RHI_Present_Mode::Immediate;
+            m_is_dirty     = true;
+            Timer::OnVsyncToggled(enabled);
+        }
+    }
+    
+    bool RHI_SwapChain::GetVsync()
+    {
+        // for v-sync, we could Mailbox for lower latency, but fifo is always supported, so we'll assume that
+        return m_present_mode == RHI_Present_Mode::Fifo;
+    }
+}

@@ -1,0 +1,275 @@
+#pragma once
+
+#include "mvItemRegistry.h"
+
+// check_drop_event() implements the typical contents of Dear ImGui's drop target
+// (ImGui::BeginDragDropTarget()) tied to DearPyGui's drop callback.  You usually
+// don't need to call it directly, but it can be used need to implement custom
+// drag'n'drop mechanics.
+// To implement drag'n'drop in an arbitrary ImGui item, use `apply_drag_drop()` -
+// it both implements the entire drop target and renders the drag payload.
+void check_drop_event(mvAppItem* item);
+// During drag'n'drop, renders drag payload and checks whether it's time to call
+// the drop callback.
+void apply_drag_drop(mvAppItem* item);
+void apply_drag_drop_nodraw(mvAppItem* item);
+
+struct mvChildWindowConfig;
+struct mvTreeNodeConfig;
+struct mvGroupConfig;
+struct mvDragPayloadConfig;
+struct mvCollapsingHeaderConfig;
+struct mvTabBarConfig;
+struct mvWindowAppItemConfig;
+struct mvMenuConfig;
+struct mvTabConfig;
+
+namespace DearPyGui
+{
+    // specific part of `get_item_configuration(...)`
+    void fill_configuration_dict(const mvMenuConfig& inConfig, PyObject* outDict, mvAppItem& item);
+    void fill_configuration_dict(const mvTabConfig& inConfig, PyObject* outDict);
+    void fill_configuration_dict(const mvChildWindowConfig& inConfig, PyObject* outDict);
+    void fill_configuration_dict(const mvGroupConfig& inConfig, PyObject* outDict);
+    void fill_configuration_dict(const mvDragPayloadConfig& inConfig, PyObject* outDict);
+    void fill_configuration_dict(const mvTreeNodeConfig& inConfig, PyObject* outDict);
+    void fill_configuration_dict(const mvTabBarConfig& inConfig, PyObject* outDict);
+    void fill_configuration_dict(const mvCollapsingHeaderConfig& inConfig, PyObject* outDict);
+    void fill_configuration_dict(const mvWindowAppItemConfig& inConfig, PyObject* outDict);
+
+    // specific part of `configure_item(...)`
+    void set_configuration(PyObject* inDict, mvMenuConfig& outConfig, mvAppItem& item);
+    void set_configuration(PyObject* inDict, mvTabConfig& outConfig);
+    void set_configuration(PyObject* inDict, mvChildWindowConfig& outConfig);
+    void set_configuration(PyObject* inDict, mvGroupConfig& outConfig);
+    void set_configuration(PyObject* inDict, mvDragPayloadConfig& outConfig);
+    void set_configuration(PyObject* inDict, mvTreeNodeConfig& outConfig);
+    void set_configuration(PyObject* inDict, mvTabBarConfig& outConfig);
+    void set_configuration(PyObject* inDict, mvCollapsingHeaderConfig& outConfig);
+    void set_configuration(PyObject* inDict, mvAppItem& item, mvWindowAppItemConfig& outConfig);
+
+    // positional args TODO: combine with above
+    //void set_required_configuration(PyObject* inDict, mvMenuConfig& outConfig);
+
+    // positional args TODO: combine with above
+    //void set_positional_configuration(PyObject* inDict, mvMenuConfig& outConfig);
+
+    // data source handling
+    void set_data_source(mvAppItem& item, mvUUID dataSource, mvMenuConfig& outConfig);
+    void set_data_source(mvAppItem& item, mvUUID dataSource, mvTabConfig& outConfig);
+    void set_data_source(mvAppItem& item, mvUUID dataSource, mvTreeNodeConfig& outConfig);
+    void set_data_source(mvAppItem& item, mvUUID dataSource, mvTabBarConfig& outConfig);
+    void set_data_source(mvAppItem& item, mvUUID dataSource, mvCollapsingHeaderConfig& outConfig);
+
+    // draw commands
+    void draw_menu(ImDrawList* drawlist, mvAppItem& item, mvMenuConfig& config);
+    void draw_tab(ImDrawList* drawlist, mvAppItem& item, mvTabConfig& config);
+    void draw_child_window(ImDrawList* drawlist, mvAppItem& item, mvChildWindowConfig& config);
+    void draw_group(ImDrawList* drawlist, mvAppItem& item, mvGroupConfig& config);
+    void draw_drag_payload(ImDrawList* drawlist, mvAppItem& item, mvDragPayloadConfig& config);
+    void draw_tree_node(ImDrawList* drawlist, mvAppItem& item, mvTreeNodeConfig& config);
+    void draw_tab_bar(ImDrawList* drawlist, mvAppItem& item, mvTabBarConfig& config);
+    void draw_collapsing_header(ImDrawList* drawlist, mvAppItem& item, mvCollapsingHeaderConfig& config);
+    void draw_window(ImDrawList* drawlist, mvAppItem& item, mvWindowAppItemConfig& config);
+}
+
+struct mvMenuConfig
+{
+    std::shared_ptr<bool> value = std::make_shared<bool>(false);
+    bool        _disabled_value = false;
+};
+
+struct mvTabConfig
+{
+    std::shared_ptr<bool>       value = std::make_shared<bool>(false);
+    bool              closable = false;
+    bool              _disabled_value = false;
+    ImGuiTabItemFlags _flags = ImGuiTabItemFlags_None;
+};
+
+enum class TabOrdering {
+    mvTabOrder_Reorderable = 0L,
+    mvTabOrder_Fixed,
+    mvTabOrder_Leading,
+    mvTabOrder_Trailing
+};
+
+struct mvChildWindowConfig
+{
+    ImGuiChildFlags  childFlags = ImGuiChildFlags_Borders|ImGuiChildFlags_NavFlattened;
+    bool             autosize_x = false;
+    bool             autosize_y = false;
+    ImGuiWindowFlags windowflags = ImGuiWindowFlags_NoSavedSettings;
+};
+
+struct mvTreeNodeConfig
+{
+    std::shared_ptr<bool>        value = std::make_shared<bool>(false);
+    bool               disabled_value = false;
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_None;
+    bool               selectable = false;
+};
+
+struct mvGroupConfig
+{
+    bool  horizontal = false;
+    float hspacing = -1.0f;
+    float xoffset = 0.0f;
+};
+
+struct mvDragPayloadConfig
+{
+    std::string payloadType = "$$DPG_PAYLOAD";
+    std::shared_ptr<mvPyObject> dragData = std::make_shared<mvPyObject>(nullptr);
+    std::shared_ptr<mvPyObject> dropData = std::make_shared<mvPyObject>(nullptr);
+};
+
+struct mvCollapsingHeaderConfig
+{
+    std::shared_ptr<bool>        value = std::make_shared<bool>(false);
+    bool               disabled_value = false;
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_None;
+    bool               closable = false;
+};
+
+struct mvTabBarConfig
+{
+    std::shared_ptr<mvUUID>    value = std::make_shared<mvUUID>(0);
+    mvUUID           disabled_value = 0;
+    ImGuiTabBarFlags flags = ImGuiTabBarFlags_None;
+    mvUUID           uiValue = 0; // value suggested from UI
+    mvUUID           _lastValue = 0;
+};
+
+struct mvWindowAppItemConfig
+{
+    ImGuiWindowFlags windowflags = ImGuiWindowFlags_None;
+    bool             mainWindow = false;
+    bool             resized = false;
+    bool             modal = false;
+    bool             popup = false;
+    bool             no_close = false;
+    bool             collapsed = false;
+    bool             no_open_over_existing_popup = true;
+    bool             copy_contents_shortcut = false;
+    mvPyObject       on_close = nullptr;
+    mvVec2           min_size = { 100.0f, 100.0f };
+    mvVec2           max_size = { 30000.0f, 30000.0f };
+    bool             _collapsedDirty = true;
+    float            _oldxpos = 200;
+    float            _oldypos = 200;
+    int              _oldWidth = 200;
+    int              _oldHeight = 200;
+};
+
+//-----------------------------------------------------------------------------
+// Old Classes, in the process of removing OOP crap
+//-----------------------------------------------------------------------------
+
+class mvMenu : public mvAppItem
+{
+public:
+    mvMenuConfig configData{};
+    explicit mvMenu(mvUUID uuid) : mvAppItem(uuid) {}
+    void draw(ImDrawList* drawlist, float x, float y) override { DearPyGui::draw_menu(drawlist, *this, configData); }
+    void handleSpecificKeywordArgs(PyObject* dict) override { DearPyGui::set_configuration(dict, configData, *this); }
+    void getSpecificConfiguration(PyObject* dict) override { DearPyGui::fill_configuration_dict(configData, dict, *this); }
+    void setDataSource(mvUUID dataSource) override { DearPyGui::set_data_source(*this, uuid, configData);}
+    PyObject* getPyValue() override { return ToPyBool(*configData.value); }
+    void setPyValue(PyObject* value) override {*configData.value = ToBool(value);}
+};
+
+class mvTab : public mvAppItem
+{
+public:
+    mvTabConfig configData{};
+    explicit mvTab(mvUUID uuid) : mvAppItem(uuid) {}
+    void draw(ImDrawList* drawlist, float x, float y) override { DearPyGui::draw_tab(drawlist, *this, configData); }
+    void handleSpecificKeywordArgs(PyObject* dict) override { DearPyGui::set_configuration(dict, configData); }
+    void getSpecificConfiguration(PyObject* dict) override { DearPyGui::fill_configuration_dict(configData, dict); }
+    void setDataSource(mvUUID dataSource) override { DearPyGui::set_data_source(*this, uuid, configData); }
+    PyObject* getPyValue() override { return ToPyBool(*configData.value); }
+    void setPyValue(PyObject* value) override { *configData.value = ToBool(value); }
+};
+
+class mvChildWindow : public mvAppItem
+{
+public:
+    mvChildWindowConfig configData{};
+    explicit mvChildWindow(mvUUID uuid) : mvAppItem(uuid) {}
+    void draw(ImDrawList* drawlist, float x, float y) override { DearPyGui::draw_child_window(drawlist, *this, configData); }
+    void handleSpecificKeywordArgs(PyObject* dict) override { DearPyGui::set_configuration(dict, configData); }
+    void getSpecificConfiguration(PyObject* dict) override { DearPyGui::fill_configuration_dict(configData, dict); }
+};
+
+class mvGroup : public mvAppItem
+{
+public:
+    mvGroupConfig configData{};
+    explicit mvGroup(mvUUID uuid) : mvAppItem(uuid) {}
+    void draw(ImDrawList* drawlist, float x, float y) override { DearPyGui::draw_group(drawlist, *this, configData); }
+    void handleSpecificKeywordArgs(PyObject* dict) override { DearPyGui::set_configuration(dict, configData); }
+    void getSpecificConfiguration(PyObject* dict) override { DearPyGui::fill_configuration_dict(configData, dict); }
+};
+
+class mvDragPayload : public mvAppItem
+{
+
+public:
+    mvDragPayloadConfig configData{};
+    explicit mvDragPayload(mvUUID uuid) : mvAppItem(uuid) {}
+    void draw(ImDrawList* drawlist, float x, float y) override { DearPyGui::draw_drag_payload(drawlist, *this, configData); }
+    void handleSpecificKeywordArgs(PyObject* dict) override { DearPyGui::set_configuration(dict, configData); }
+    void getSpecificConfiguration(PyObject* dict) override { DearPyGui::fill_configuration_dict(configData, dict); }
+};
+
+class mvTreeNode : public mvAppItem
+{
+public:
+    mvTreeNodeConfig configData{};
+    explicit mvTreeNode(mvUUID uuid) : mvAppItem(uuid) {}
+    void draw(ImDrawList* drawlist, float x, float y) override { DearPyGui::draw_tree_node(drawlist, *this, configData); }
+    void handleSpecificKeywordArgs(PyObject* dict) override { DearPyGui::set_configuration(dict, configData); }
+    void getSpecificConfiguration(PyObject* dict) override { DearPyGui::fill_configuration_dict(configData, dict); }
+    void setDataSource(mvUUID dataSource) override { DearPyGui::set_data_source(*this, uuid, configData); }
+    PyObject* getPyValue() override { return ToPyBool(*configData.value); }
+    void setPyValue(PyObject* value) override { *configData.value = ToBool(value); }
+};
+
+class mvTabBar : public mvAppItem
+{
+public:
+    mvTabBarConfig configData{};
+    explicit mvTabBar(mvUUID uuid) : mvAppItem(uuid) {}
+    void draw(ImDrawList* drawlist, float x, float y) override { DearPyGui::draw_tab_bar(drawlist, *this, configData); }
+    void handleSpecificKeywordArgs(PyObject* dict) override { DearPyGui::set_configuration(dict, configData); }
+    void getSpecificConfiguration(PyObject* dict) override { DearPyGui::fill_configuration_dict(configData, dict); }
+    void setDataSource(mvUUID dataSource) override { DearPyGui::set_data_source(*this, uuid, configData); }
+    PyObject* getPyValue() override{ return PyUUIDFromItem(*configData.value); }
+    void setPyValue(PyObject* value) override{ *configData.value = ToUUID(value); }
+    mvUUID getSpecificValue() { return configData.uiValue; }
+    void setValue(mvUUID value) { configData.uiValue = value; }
+};
+
+class mvCollapsingHeader : public mvAppItem
+{
+public:
+    mvCollapsingHeaderConfig configData{};
+    explicit mvCollapsingHeader(mvUUID uuid) : mvAppItem(uuid) {}
+    void draw(ImDrawList* drawlist, float x, float y) override { DearPyGui::draw_collapsing_header(drawlist, *this, configData); }
+    void handleSpecificKeywordArgs(PyObject* dict) override { DearPyGui::set_configuration(dict, configData); }
+    void getSpecificConfiguration(PyObject* dict) override { DearPyGui::fill_configuration_dict(configData, dict); }
+    void setDataSource(mvUUID dataSource) override { DearPyGui::set_data_source(*this, uuid, configData); }
+    PyObject* getPyValue() override { return ToPyBool(*configData.value); }
+    void setPyValue(PyObject* value) override { *configData.value = ToBool(value); }
+};
+
+class mvWindowAppItem : public mvAppItem
+{
+public:
+    mvWindowAppItemConfig configData{};
+    explicit mvWindowAppItem(mvUUID uuid) : mvAppItem(uuid) { config.width = config.height = 500; info.dirty_size = true; }
+    void draw(ImDrawList* drawlist, float x, float y) override { DearPyGui::draw_window(drawlist, *this, configData); }
+    void handleSpecificKeywordArgs(PyObject* dict) override { DearPyGui::set_configuration(dict, *this, configData); }
+    void getSpecificConfiguration(PyObject* dict) override { DearPyGui::fill_configuration_dict(configData, dict); }
+};

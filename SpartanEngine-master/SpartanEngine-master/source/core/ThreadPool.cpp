@@ -1,0 +1,297 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES =================
+#include "pch.h"
+#include "ThreadPool.h"
+#include <thread>
+#include <condition_variable>
+#include <deque>
+//============================
+
+//= NAMESPACES =====
+using namespace std;
+//==================
+
+namespace spartan
+{
+    namespace
+    {
+        uint32_t thread_count           = 0;
+        atomic<uint32_t> working_count  = 0;
+        atomic<uint32_t> pending_count  = 0;
+        bool stopping                   = false;
+
+        mutex task_mutex;
+        condition_variable task_cv;      // signaled when tasks are added or stopping
+        condition_variable idle_cv;      // signaled when a task completes
+
+        vector<thread> threads;
+        deque<Task> tasks;
+
+        thread_local bool is_worker_thread = false;
+        // nested ParallelLoop from inside a pool task must run inline, otherwise workers
+        // wait on futures that can only run on the same exhausted pool and the load freezes
+        thread_local uint32_t parallel_depth = 0;
+
+        bool execute_queued_task()
+        {
+            Task task;
+            {
+                lock_guard<mutex> lock(task_mutex);
+                if (tasks.empty())
+                {
+                    return false;
+                }
+
+                task = std::move(tasks.front());
+                tasks.pop_front();
+                // count work before releasing the mutex so flush cannot see empty+idle in the pop gap
+                working_count.fetch_add(1, memory_order_relaxed);
+            }
+
+            task();
+            working_count.fetch_sub(1, memory_order_relaxed);
+            pending_count.fetch_sub(1, memory_order_relaxed);
+            idle_cv.notify_all();
+            return true;
+        }
+    }
+
+    static void thread_loop()
+    {
+        is_worker_thread = true;
+
+        while (true)
+        {
+            Task task;
+            {
+                unique_lock<mutex> lock(task_mutex);
+
+                task_cv.wait(lock, [] { return !tasks.empty() || stopping; });
+
+                if (stopping && tasks.empty())
+                {
+                    return;
+                }
+
+                task = std::move(tasks.front());
+                tasks.pop_front();
+                // count work before releasing the mutex so flush cannot see empty+idle in the pop gap
+                working_count.fetch_add(1, memory_order_relaxed);
+            }
+
+            // execute task - exceptions are handled by packaged_task if one is used
+            task();
+
+            working_count.fetch_sub(1, memory_order_relaxed);
+            pending_count.fetch_sub(1, memory_order_relaxed);
+
+            // wake up any thread waiting in flush()
+            idle_cv.notify_all();
+        }
+    }
+
+    void ThreadPool::Initialize()
+    {
+        stopping = false;
+
+        uint32_t hw_threads = thread::hardware_concurrency();
+        if (hw_threads == 0)
+        {
+            hw_threads = 4;
+        }
+
+        // assume half are physical cores, then scale for mixed workloads
+        uint32_t core_count = max(1u, hw_threads / 2);
+        thread_count        = min(core_count * 2, core_count + 4);
+
+        threads.reserve(thread_count);
+        for (uint32_t i = 0; i < thread_count; i++)
+        {
+            threads.emplace_back(thread_loop);
+        }
+
+        SP_LOG_INFO("%d threads have been created", thread_count);
+    }
+
+    void ThreadPool::Shutdown()
+    {
+        Flush(true);
+
+        {
+            lock_guard<mutex> lock(task_mutex);
+            stopping = true;
+        }
+
+        task_cv.notify_all();
+
+        for (thread& t : threads)
+        {
+            if (t.joinable())
+            {
+                t.join();
+            }
+        }
+
+        threads.clear();
+        working_count.store(0, memory_order_relaxed);
+        pending_count.store(0, memory_order_relaxed);
+        thread_count = 0;
+    }
+
+    future<void> ThreadPool::AddTask(Task&& task)
+    {
+        auto packaged = make_shared<packaged_task<void()>>(std::forward<Task>(task));
+        future<void> result = packaged->get_future();
+
+        {
+            lock_guard<mutex> lock(task_mutex);
+
+            if (stopping)
+            {
+                SP_LOG_WARNING("ThreadPool::AddTask() called while pool is stopping");
+                return result;
+            }
+
+            pending_count.fetch_add(1, memory_order_relaxed);
+            tasks.emplace_back([packaged]() { (*packaged)(); });
+        }
+
+        task_cv.notify_one();
+        return result;
+    }
+
+    void ThreadPool::ParallelLoop(function<void(uint32_t, uint32_t)>&& work_fn, const uint32_t work_total)
+    {
+        SP_ASSERT_MSG(work_total > 0, "parallel loop requires work_total > 0");
+
+        // no threads available - run on calling thread
+        if (threads.empty())
+        {
+            work_fn(0, work_total);
+            return;
+        }
+
+        // nested ParallelLoop from inside a chunk must run inline, scheduling more pool
+        // tasks while every worker waits on futures freezes world load (dreamcore at ~89%)
+        if (parallel_depth > 0)
+        {
+            work_fn(0, work_total);
+            return;
+        }
+
+        struct depth_scope
+        {
+            depth_scope()  { parallel_depth++; }
+            ~depth_scope() { parallel_depth--; }
+        };
+
+        uint32_t workers   = min(thread_count, work_total);
+        uint32_t base_work = work_total / workers;
+        uint32_t remainder = work_total % workers;
+
+        // one shared copy so every chunk invokes the same callable
+        // alias keeps msvc from treating the comma in void(uint32_t, uint32_t) as template args
+        using parallel_fn = function<void(uint32_t, uint32_t)>;
+        const shared_ptr<parallel_fn> shared_fn = make_shared<parallel_fn>(std::move(work_fn));
+
+        vector<future<void>> futures;
+        futures.reserve(workers);
+
+        depth_scope caller_depth;
+
+        uint32_t work_index = 0;
+        for (uint32_t i = 0; i < workers; ++i)
+        {
+            uint32_t work_count = base_work + (i < remainder ? 1u : 0u);
+            uint32_t start      = work_index;
+            uint32_t end        = work_index + work_count;
+
+            // chunks inherit nesting depth so ParallelLoop inside them stays inline
+            futures.emplace_back(AddTask([shared_fn, start, end]()
+            {
+                depth_scope chunk_depth;
+                (*shared_fn)(start, end);
+            }));
+            work_index = end;
+        }
+
+        for (future<void>& f : futures)
+        {
+            while (
+                is_worker_thread &&
+                f.wait_for(chrono::seconds(0)) != future_status::ready
+            )
+            {
+                if (!execute_queued_task())
+                {
+                    unique_lock<mutex> lock(task_mutex);
+                    // wait on task_cv so AddTask wakes us, idle_cv only signals completions
+                    task_cv.wait_for(
+                        lock,
+                        chrono::microseconds(100),
+                        [] { return !tasks.empty() || stopping; }
+                    );
+                }
+            }
+            f.get();
+        }
+    }
+
+    void ThreadPool::Flush(bool remove_queued)
+    {
+        if (remove_queued)
+        {
+            lock_guard<mutex> lock(task_mutex);
+            uint32_t removed = static_cast<uint32_t>(tasks.size());
+            tasks.clear();
+            pending_count.fetch_sub(removed, memory_order_relaxed);
+        }
+
+        // wait for all in-flight work to complete using condition variable (no spin)
+        unique_lock<mutex> lock(task_mutex);
+        idle_cv.wait(lock, [] {
+            return tasks.empty() && working_count.load(memory_order_relaxed) == 0;
+        });
+    }
+
+    uint32_t ThreadPool::GetThreadCount()
+    {
+        return thread_count;
+    }
+
+    uint32_t ThreadPool::GetWorkingThreadCount()
+    {
+        return working_count.load(memory_order_relaxed);
+    }
+
+    uint32_t ThreadPool::GetIdleThreadCount()
+    {
+        uint32_t working = working_count.load(memory_order_relaxed);
+        return (thread_count > working) ? (thread_count - working) : 0;
+    }
+
+    bool ThreadPool::AreTasksRunning()
+    {
+        return pending_count.load(memory_order_relaxed) > 0;
+    }
+}

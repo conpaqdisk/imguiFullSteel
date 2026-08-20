@@ -1,0 +1,191 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES ========
+#include "pch.h"
+#include "Input.h"
+SP_WARNINGS_OFF
+#include <SDL3/SDL.h>
+SP_WARNINGS_ON
+//===================
+
+//= NAMESPACES ===============
+using namespace std;
+using namespace spartan::math;
+//============================
+
+namespace spartan
+{
+    namespace
+    { 
+        Controller gamepad;
+        math::Vector2 controller_thumb_left  = math::Vector2::Zero;
+        math::Vector2 controller_thumb_right = math::Vector2::Zero;
+        float controller_trigger_left        = 0.0f;
+        float controller_trigger_right       = 0.0f;
+
+        float get_normalized_axis_value(const Controller& controller, uint32_t axis)
+        {
+            // initialize result
+            float normalized = 0.0f;
+        
+            // check if controller is a gamepad
+            if (controller.type == ControllerType::Gamepad && controller.sdl_pointer)
+            {
+                // get raw axis value
+                int16_t value = SDL_GetGamepadAxis(static_cast<SDL_Gamepad*>(controller.sdl_pointer), static_cast<SDL_GamepadAxis>(axis));
+        
+                // account for deadzone
+                static const uint16_t deadzone = 8000; // a good default as per sdl_gamepad.h
+                if (abs(value) < deadzone)
+                {
+                    value = 0;
+                }
+                else
+                {
+                    value -= (value > 0) ? deadzone : -deadzone;
+                }
+        
+                // compute range
+                const float range_negative = 32768.0f;
+                const float range_positive = 32767.0f;
+                float range = (value < 0) ? range_negative : range_positive;
+        
+                // normalize to [-1.0, 1.0]
+                normalized = static_cast<float>(value) / (range - deadzone);
+            }
+        
+            return normalized;
+        }
+    }
+
+    void Input::PollGamepad()
+    {
+        if (!gamepad.is_connected)
+        {
+            return;
+        }
+    
+        SDL_Gamepad* sdl_gamepad = static_cast<SDL_Gamepad*>(gamepad.sdl_pointer);
+    
+        // analog inputs
+        controller_trigger_left  = get_normalized_axis_value(gamepad, SDL_GamepadAxis::SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
+        controller_trigger_right = get_normalized_axis_value(gamepad, SDL_GamepadAxis::SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
+        controller_thumb_left.x  = get_normalized_axis_value(gamepad, SDL_GamepadAxis::SDL_GAMEPAD_AXIS_LEFTX);
+        controller_thumb_left.y  = get_normalized_axis_value(gamepad, SDL_GamepadAxis::SDL_GAMEPAD_AXIS_LEFTY);
+        controller_thumb_right.x = get_normalized_axis_value(gamepad, SDL_GamepadAxis::SDL_GAMEPAD_AXIS_RIGHTX);
+        controller_thumb_right.y = get_normalized_axis_value(gamepad, SDL_GamepadAxis::SDL_GAMEPAD_AXIS_RIGHTY);
+    
+        //button states
+        m_keys[key_index_gamepad]      = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_DPAD_UP);
+        m_keys[key_index_gamepad + 1]  = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
+        m_keys[key_index_gamepad + 2]  = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_DPAD_LEFT);
+        m_keys[key_index_gamepad + 3]  = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_DPAD_RIGHT);
+        m_keys[key_index_gamepad + 4]  = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_SOUTH);
+        m_keys[key_index_gamepad + 5]  = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_EAST);
+        m_keys[key_index_gamepad + 6]  = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_WEST);
+        m_keys[key_index_gamepad + 7]  = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_NORTH);
+        m_keys[key_index_gamepad + 8]  = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_BACK);
+        m_keys[key_index_gamepad + 9]  = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_GUIDE);
+        m_keys[key_index_gamepad + 10] = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_START);
+        m_keys[key_index_gamepad + 11] = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_LEFT_STICK);
+        m_keys[key_index_gamepad + 12] = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_RIGHT_STICK);
+        m_keys[key_index_gamepad + 13] = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER);
+        m_keys[key_index_gamepad + 14] = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER);
+        m_keys[key_index_gamepad + 15] = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_MISC1);
+        m_keys[key_index_gamepad + 16] = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1);
+        m_keys[key_index_gamepad + 17] = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_LEFT_PADDLE1);
+        m_keys[key_index_gamepad + 18] = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2);
+        m_keys[key_index_gamepad + 19] = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_LEFT_PADDLE2);
+        m_keys[key_index_gamepad + 20] = SDL_GetGamepadButton(sdl_gamepad, SDL_GAMEPAD_BUTTON_TOUCHPAD);
+    }
+
+    void Input::OnEventGamepad(void* event)
+    {
+        gamepad.type = ControllerType::Gamepad;
+        CheckDeviceState(event, &gamepad);
+    }
+
+    bool Input::GamepadVibrate(const float left_motor_speed, const float right_motor_speed)
+    {
+        if (!gamepad.is_connected)
+        {
+            return false;
+        }
+
+        Uint16 low_frequency_rumble  = static_cast<uint16_t>(clamp(left_motor_speed, 0.0f, 1.0f) * 65535);  // convert [0, 1] to [0, 65535]
+        Uint16 high_frequency_rumble = static_cast<uint16_t>(clamp(right_motor_speed, 0.0f, 1.0f) * 65535); // convert [0, 1] to [0, 65535]
+        Uint32 duration_ms           = 0xFFFFFFFF;
+
+        if (!SDL_RumbleGamepad(static_cast<SDL_Gamepad*>(gamepad.sdl_pointer), low_frequency_rumble, high_frequency_rumble, duration_ms))
+        {
+            SP_LOG_ERROR("Failed to vibrate controller");
+            return false;
+        }
+
+        return true;
+    }
+
+    bool Input::IsGamepadConnected()
+    {
+        return gamepad.is_connected;
+    }
+
+    const Vector2& Input::GetGamepadThumbStickLeft()
+    {
+        if (Input::IsBlockedByUi())
+        {
+            return Vector2::Zero;
+        }
+
+        return controller_thumb_left;
+    }
+
+    const Vector2& Input::GetGamepadThumbStickRight()
+    {
+        if (Input::IsBlockedByUi())
+        {
+            return Vector2::Zero;
+        }
+
+        return controller_thumb_right;
+    }
+
+    float Input::GetGamepadTriggerLeft()
+    {
+        if (Input::IsBlockedByUi())
+        {
+            return 0.0f;
+        }
+
+        return controller_trigger_left;
+    }
+
+    float Input::GetGamepadTriggerRight()
+    {
+        if (Input::IsBlockedByUi())
+        {
+            return 0.0f;
+        }
+
+        return controller_trigger_right;
+    }
+}

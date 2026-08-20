@@ -1,0 +1,1053 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES ================================
+#include "pch.h"
+#include <fstream>
+#include "RHI_Texture.h"
+#include "RHI_Buffer.h"
+#include "RHI_Device.h"
+#include "RHI_Shader.h"
+#include "RHI_CommandList.h"
+#include "RHI_Implementation.h"
+#include "ThreadPool.h"
+#include "../rendering/Renderer.h"
+#include "../rendering/Renderer_Buffers.h"
+#include "../resource/import/ImageImporter.h"
+#include "../core/ProgressTracker.h"
+#include "../profiling/Breadcrumbs.h"
+//===========================================
+
+//= NAMESPACES =====
+using namespace std;
+//==================
+
+namespace spartan
+{
+    namespace gpu_compression
+    {
+        static mutex compress_mutex;
+
+        // transient buffers pooled across compress calls, per texture vmaCreateBuffer churn thrashes device memory
+        namespace pool
+        {
+            // device local input buffer for compressed shaders to read from fast vram
+            static shared_ptr<RHI_Buffer> input;
+            // device local output, one buffer per shader struct stride so d3d12 uav stride matches
+            static shared_ptr<RHI_Buffer> output;
+            static shared_ptr<RHI_Buffer> output_bc1;
+            // host visible readback buffer mapped into cpu memory
+            static shared_ptr<RHI_Buffer> readback;
+            // host visible staging buffer used to upload pixel data to input
+            static shared_ptr<RHI_Buffer> staging;
+
+            static uint32_t input_capacity_pixels      = 0;
+            static uint32_t staging_capacity_pixels    = 0;
+            static uint32_t output_capacity_blocks     = 0;
+            static uint32_t output_bc1_capacity_blocks = 0;
+            static uint32_t readback_capacity_blocks   = 0;
+
+            constexpr uint32_t output_stride_bytes     = sizeof(uint32_t) * 4;
+            constexpr uint32_t output_bc1_stride_bytes = sizeof(uint32_t) * 2;
+
+            void release()
+            {
+                input.reset();
+                output.reset();
+                output_bc1.reset();
+                readback.reset();
+                staging.reset();
+                input_capacity_pixels      = 0;
+                staging_capacity_pixels    = 0;
+                output_capacity_blocks     = 0;
+                output_bc1_capacity_blocks = 0;
+                readback_capacity_blocks   = 0;
+            }
+        }
+
+        // grow each pool buffer with a 1.5x headroom factor so consecutive larger textures
+        // don't trigger a fresh allocation per texture
+        static uint32_t grow_capacity(uint32_t current, uint32_t needed)
+        {
+            uint32_t headroom = current + (current >> 1);
+            return max(needed, headroom);
+        }
+
+        static bool ensure_pool_capacity(uint32_t input_pixels, uint32_t output_blocks, uint32_t output_stride)
+        {
+            auto fail = [](const char* name, const bool has_resource, const bool has_mapped, const uint64_t size) -> bool
+            {
+                SP_LOG_ERROR("gpu compression pool '%s' failed (resource=%s, mapped=%s, size=%llu)",
+                    name,
+                    has_resource ? "ok" : "null",
+                    has_mapped ? "ok" : "null",
+                    size);
+                return false;
+            };
+
+            if (!pool::input || pool::input_capacity_pixels < input_pixels)
+            {
+                uint32_t new_cap = grow_capacity(pool::input_capacity_pixels, input_pixels);
+                pool::input = make_shared<RHI_Buffer>(
+                    RHI_Buffer_Type::Storage,
+                    static_cast<uint32_t>(sizeof(uint32_t)),
+                    new_cap,
+                    nullptr, false,
+                    "compress_input"
+                );
+                if (!pool::input->GetRhiResource())
+                {
+                    const uint64_t size = pool::input->GetObjectSize();
+                    pool::input.reset();
+                    pool::input_capacity_pixels = 0;
+                    return fail("compress_input", false, false, size);
+                }
+                pool::input_capacity_pixels = new_cap;
+            }
+
+            if (!pool::staging || pool::staging_capacity_pixels < input_pixels)
+            {
+                uint32_t new_cap = grow_capacity(pool::staging_capacity_pixels, input_pixels);
+                pool::staging = make_shared<RHI_Buffer>(
+                    RHI_Buffer_Type::Upload,
+                    static_cast<uint32_t>(sizeof(uint32_t)),
+                    new_cap,
+                    nullptr, true,
+                    "compress_staging"
+                );
+                if (!pool::staging->GetRhiResource() || !pool::staging->GetMappedData())
+                {
+                    const bool has_resource = pool::staging->GetRhiResource() != nullptr;
+                    const bool has_mapped   = pool::staging->GetMappedData() != nullptr;
+                    const uint64_t size     = pool::staging->GetObjectSize();
+                    pool::staging.reset();
+                    pool::staging_capacity_pixels = 0;
+                    return fail("compress_staging", has_resource, has_mapped, size);
+                }
+                pool::staging_capacity_pixels = new_cap;
+            }
+
+            const bool is_bc1 = output_stride == pool::output_bc1_stride_bytes;
+            shared_ptr<RHI_Buffer>& output_buffer = is_bc1 ? pool::output_bc1 : pool::output;
+            uint32_t& output_capacity             = is_bc1 ? pool::output_bc1_capacity_blocks : pool::output_capacity_blocks;
+            const char* output_name               = is_bc1 ? "compress_output_bc1" : "compress_output";
+            if (!output_buffer || output_capacity < output_blocks)
+            {
+                uint32_t new_cap = grow_capacity(output_capacity, output_blocks);
+                output_buffer = make_shared<RHI_Buffer>(
+                    RHI_Buffer_Type::Storage,
+                    output_stride,
+                    new_cap,
+                    nullptr, false,
+                    output_name
+                );
+                if (!output_buffer->GetRhiResource())
+                {
+                    const uint64_t size = output_buffer->GetObjectSize();
+                    output_buffer.reset();
+                    output_capacity = 0;
+                    return fail(output_name, false, false, size);
+                }
+                output_capacity = new_cap;
+            }
+
+            if (!pool::readback || pool::readback_capacity_blocks < output_blocks)
+            {
+                uint32_t new_cap = grow_capacity(pool::readback_capacity_blocks, output_blocks);
+                pool::readback = make_shared<RHI_Buffer>(
+                    RHI_Buffer_Type::Readback,
+                    pool::output_stride_bytes,
+                    new_cap,
+                    nullptr, true,
+                    "compress_readback"
+                );
+                if (!pool::readback->GetRhiResource() || !pool::readback->GetMappedData())
+                {
+                    const bool has_resource = pool::readback->GetRhiResource() != nullptr;
+                    const bool has_mapped   = pool::readback->GetMappedData() != nullptr;
+                    const uint64_t size     = pool::readback->GetObjectSize();
+                    pool::readback.reset();
+                    pool::readback_capacity_blocks = 0;
+                    return fail("compress_readback", has_resource, has_mapped, size);
+                }
+                pool::readback_capacity_blocks = new_cap;
+            }
+
+            return true;
+        }
+
+        void shutdown()
+        {
+            lock_guard<mutex> lock(compress_mutex);
+            pool::release();
+        }
+
+        bool compress(RHI_Texture* texture, RHI_Format target_format)
+        {
+            SP_ASSERT(texture != nullptr);
+
+            if (RHI_Device::IsDeviceLost())
+            {
+                return false;
+            }
+
+            // select shader based on target format
+            Renderer_Shader shader_type;
+            uint32_t output_element_size = 0; // bytes per compressed block in the output buffer
+            uint32_t block_bytes         = 0; // bytes per compressed block on disk
+            const char* pso_name         = nullptr;
+            switch (target_format)
+            {
+                case RHI_Format::BC1_Unorm:
+                    shader_type         = Renderer_Shader::texture_compress_bc1_c;
+                    output_element_size = sizeof(uint32_t) * 2; // uint2
+                    block_bytes         = 8;
+                    pso_name            = "texture_compress_bc1";
+                    break;
+                case RHI_Format::BC3_Unorm:
+                    shader_type         = Renderer_Shader::texture_compress_bc3_c;
+                    output_element_size = sizeof(uint32_t) * 4; // uint4
+                    block_bytes         = 16;
+                    pso_name            = "texture_compress_bc3";
+                    break;
+                case RHI_Format::BC5_Unorm:
+                    shader_type         = Renderer_Shader::texture_compress_bc5_c;
+                    output_element_size = sizeof(uint32_t) * 4; // uint4
+                    block_bytes         = 16;
+                    pso_name            = "texture_compress_bc5";
+                    break;
+                default:
+                    return false;
+            }
+
+            RHI_Shader* shader = Renderer::GetShader(shader_type);
+            if (!shader || !shader->IsCompiled())
+            {
+                return false;
+            }
+
+            lock_guard<mutex> lock(compress_mutex);
+
+            char marker[128];
+            snprintf(marker, sizeof(marker), "texture_compress_gpu: %s", texture->GetObjectName().c_str());
+            Breadcrumbs::BeginMarker(marker);
+
+            const uint32_t width     = texture->GetWidth();
+            const uint32_t height    = texture->GetHeight();
+            const uint32_t mip_count = texture->GetMipCount();
+
+            uint32_t total_blocks       = 0;
+            uint32_t total_input_pixels = 0;
+            vector<uint32_t> mip_output_offsets(mip_count);
+            vector<uint32_t> mip_input_offsets(mip_count);
+            vector<uint32_t> mip_widths(mip_count);
+            vector<uint32_t> mip_blocks_x(mip_count);
+            vector<uint32_t> mip_block_counts(mip_count);
+            for (uint32_t mip = 0; mip < mip_count; mip++)
+            {
+                uint32_t mip_w = max(1u, width >> mip);
+                uint32_t mip_h = max(1u, height >> mip);
+
+                mip_output_offsets[mip] = total_blocks;
+                mip_input_offsets[mip]  = total_input_pixels;
+                mip_widths[mip]         = mip_w;
+                mip_blocks_x[mip]       = max(1u, (mip_w + 3) / 4);
+                uint32_t blocks_y       = max(1u, (mip_h + 3) / 4);
+                mip_block_counts[mip]   = mip_blocks_x[mip] * blocks_y;
+                total_blocks           += mip_block_counts[mip];
+                total_input_pixels     += mip_w * mip_h;
+            }
+
+            if (total_blocks == 0)
+            {
+                Breadcrumbs::EndMarker(); // compress_gpu
+                return false;
+            }
+
+            // the spec only guarantees 65535 groups per axis, bail when even a 2d dispatch cannot cover the work
+            {
+                constexpr uint32_t max_groups_per_axis = 65535;
+                uint32_t max_dispatch_groups = (mip_block_counts[0] + 3) / 4;
+                if (max_dispatch_groups > static_cast<uint64_t>(max_groups_per_axis) * max_groups_per_axis)
+                {
+                    Breadcrumbs::EndMarker(); // compress_gpu
+                    return false;
+                }
+            }
+
+            // bail out if we don't have enough vram headroom, accounts for the worst case
+            // pool grow that would happen this call (input + staging + output + readback)
+            {
+                const bool is_bc1 = output_element_size == pool::output_bc1_stride_bytes;
+                uint32_t& output_capacity = is_bc1 ? pool::output_bc1_capacity_blocks : pool::output_capacity_blocks;
+                uint32_t input_grow    = (pool::input_capacity_pixels    < total_input_pixels) ? grow_capacity(pool::input_capacity_pixels,    total_input_pixels) - pool::input_capacity_pixels    : 0;
+                uint32_t staging_grow  = (pool::staging_capacity_pixels  < total_input_pixels) ? grow_capacity(pool::staging_capacity_pixels,  total_input_pixels) - pool::staging_capacity_pixels  : 0;
+                uint32_t output_grow   = (output_capacity                < total_blocks)       ? grow_capacity(output_capacity,                total_blocks)       - output_capacity                : 0;
+                uint32_t readback_grow = (pool::readback_capacity_blocks < total_blocks)       ? grow_capacity(pool::readback_capacity_blocks, total_blocks)       - pool::readback_capacity_blocks : 0;
+
+                uint64_t additional_bytes = static_cast<uint64_t>(input_grow + staging_grow) * sizeof(uint32_t)
+                                          + static_cast<uint64_t>(output_grow) * output_element_size
+                                          + static_cast<uint64_t>(readback_grow) * pool::output_stride_bytes;
+                uint64_t required_mb      = additional_bytes / (1024 * 1024);
+                if (required_mb > 0 && RHI_Device::MemoryGetAvailableMb() < required_mb + 256)
+                {
+                    Breadcrumbs::EndMarker(); // compress_gpu
+                    return false;
+                }
+            }
+
+            Breadcrumbs::BeginMarker("texture_compress_gpu_buffer_create");
+
+            if (!ensure_pool_capacity(total_input_pixels, total_blocks, output_element_size))
+            {
+                SP_LOG_ERROR("failed to acquire gpu compression pool buffers");
+                Breadcrumbs::EndMarker(); // buffer_create
+                Breadcrumbs::EndMarker(); // compress_gpu
+                return false;
+            }
+
+            // pack all mip pixel data into the staging buffer at the offsets the shader expects
+            uint64_t staging_size = static_cast<uint64_t>(total_input_pixels) * sizeof(uint32_t);
+            uint32_t* staging_dst = static_cast<uint32_t*>(pool::staging->GetMappedData());
+            for (uint32_t mip = 0; mip < mip_count; mip++)
+            {
+                RHI_Texture_Mip* mip_data = texture->GetMip(0, mip);
+                if (!mip_data || mip_data->bytes.empty())
+                {
+                    Breadcrumbs::EndMarker(); // buffer_create
+                    Breadcrumbs::EndMarker(); // compress_gpu
+                    return false;
+                }
+
+                uint32_t mip_w       = mip_widths[mip];
+                uint32_t mip_h       = max(1u, height >> mip);
+                uint32_t pixel_count = mip_w * mip_h;
+                memcpy(staging_dst + mip_input_offsets[mip], mip_data->bytes.data(), pixel_count * sizeof(uint32_t));
+            }
+
+            Breadcrumbs::EndMarker(); // buffer_create
+
+            auto uint_as_float = [](uint32_t val) -> float
+            {
+                float f;
+                memcpy(&f, &val, sizeof(float));
+                return f;
+            };
+
+            // one cmd list for the copy, every mip dispatch and the readback, each mip writes a disjoint slice so only the boundaries need barriers
+            Breadcrumbs::BeginMarker("texture_compress_gpu_dispatch");
+            {
+                RHI_CommandList* cmd_list = RHI_CommandList::ImmediateExecutionBegin(RHI_Queue_Type::Compute);
+                if (!cmd_list)
+                {
+                    Breadcrumbs::EndMarker(); // dispatch
+                    Breadcrumbs::EndMarker(); // compress_gpu
+                    return false;
+                }
+
+                RHI_CommandList::CopyBufferToBuffer(cmd_list, pool::staging.get(), pool::input.get(), staging_size);
+                RHI_CommandList::PrepareBufferForCompute(cmd_list, pool::input.get());
+
+                RHI_PipelineState pso;
+                pso.name = pso_name;
+                pso.shaders[static_cast<uint32_t>(RHI_Shader_Type::Compute)] = shader;
+                RHI_CommandList::SetPipelineState(cmd_list, pso);
+
+                RHI_CommandList::SetBuffer(cmd_list, 40, pool::input.get());
+                const bool is_bc1 = target_format == RHI_Format::BC1_Unorm;
+                const uint32_t output_binding = is_bc1 ? 42u : 41u;
+                RHI_Buffer* output_buffer = is_bc1 ? pool::output_bc1.get() : pool::output.get();
+                RHI_CommandList::SetBuffer(cmd_list, output_binding, output_buffer);
+
+                // dispatch from smallest to largest mip so the shader pipeline is warm by the
+                // time the heaviest dispatch runs
+                for (int mip = static_cast<int>(mip_count) - 1; mip >= 0; mip--)
+                {
+                    uint32_t mip_h = max(1u, height >> mip);
+
+                    Pcb_Pass pass = {};
+                    pass.v[0]     = uint_as_float(mip_blocks_x[mip]);
+                    pass.v[1]     = uint_as_float(mip_block_counts[mip]);
+                    pass.v[2]     = 0.6f;
+                    pass.v[3]     = uint_as_float(mip_input_offsets[mip]);
+                    pass.v[4]     = uint_as_float(mip_output_offsets[mip]);
+                    pass.v[5]     = uint_as_float(mip_widths[mip]);
+                    pass.v[6]     = uint_as_float(mip_h);
+
+                    constexpr uint32_t max_groups = 65535;
+                    uint32_t total_groups         = (mip_block_counts[mip] + 3) / 4;
+                    uint32_t dispatch_x           = min(total_groups, max_groups);
+                    uint32_t dispatch_y           = (total_groups + dispatch_x - 1) / dispatch_x;
+                    pass.v[7]                     = uint_as_float(dispatch_x);
+
+                    RHI_CommandList::PushConstants(cmd_list, pass);
+                    RHI_CommandList::Dispatch(cmd_list, dispatch_x, dispatch_y, 1);
+                }
+
+                RHI_CommandList::PrepareBufferForReadback(cmd_list, output_buffer);
+
+                uint64_t copy_size = static_cast<uint64_t>(total_blocks) * output_element_size;
+                RHI_CommandList::CopyBufferToBuffer(cmd_list, output_buffer, pool::readback.get(), copy_size);
+
+                RHI_CommandList::ImmediateExecutionEnd(cmd_list);
+            }
+            Breadcrumbs::EndMarker(); // dispatch
+
+            if (RHI_Device::IsDeviceLost())
+            {
+                Breadcrumbs::EndMarker(); // compress_gpu
+                return false;
+            }
+
+            Breadcrumbs::BeginMarker("texture_compress_gpu_readback");
+
+            void* mapped = pool::readback->GetMappedData();
+            if (!mapped)
+            {
+                SP_LOG_ERROR("gpu compression readback buffer has no mapped data");
+                Breadcrumbs::EndMarker(); // readback
+                Breadcrumbs::EndMarker(); // compress_gpu
+                return false;
+            }
+
+            for (uint32_t mip = 0; mip < mip_count; mip++)
+            {
+                uint32_t mip_size_bytes = mip_block_counts[mip] * block_bytes;
+                uint8_t* src            = reinterpret_cast<uint8_t*>(mapped) + mip_output_offsets[mip] * output_element_size;
+
+                RHI_Texture_Mip* mip_data = texture->GetMip(0, mip);
+                if (mip_data)
+                {
+                    mip_data->bytes.resize(mip_size_bytes);
+                    memcpy(mip_data->bytes.data(), src, mip_size_bytes);
+                }
+            }
+            Breadcrumbs::EndMarker(); // readback
+
+            texture->SetFormat(target_format);
+
+            Breadcrumbs::EndMarker(); // compress_gpu
+            return true;
+        }
+    }
+
+    namespace mips
+    {
+        void downsample_bilinear(const vector<std::byte>& input, vector<std::byte>& output, uint32_t width, uint32_t height)
+        {
+            constexpr uint32_t channels = 4; // RGBA32 - engine standard
+  
+            // calculate new dimensions (halving both width and height)
+            uint32_t new_width  = width  >> 1;
+            uint32_t new_height = height >> 1;
+            
+            // ensure minimum size
+            if (new_width < 1)
+            {
+                new_width = 1;
+            }
+            if (new_height < 1)
+            {
+                new_height = 1;
+            }
+            
+            // bilinear downsample, rows are independent so parallelize across rows
+            // small mips are too cheap to parallelize, fall back to sequential
+            auto process_rows = [&](uint32_t y_start, uint32_t y_end)
+            {
+                for (uint32_t y = y_start; y < y_end; y++)
+                {
+                    for (uint32_t x = 0; x < new_width; x++)
+                    {
+                        uint32_t src_idx              = (y * 2 * width + x * 2) * channels;
+                        uint32_t src_idx_right        = src_idx + channels;
+                        uint32_t src_idx_bottom       = src_idx + (width * channels);
+                        uint32_t src_idx_bottom_right = src_idx + (width * channels) + channels;
+                        uint32_t dst_idx              = (y * new_width + x) * channels;
+
+                        for (uint32_t c = 0; c < channels; c++)
+                        {
+                            uint32_t sum   = to_integer<uint32_t>(input[src_idx + c]);
+                            uint32_t count = 1;
+
+                            if (x * 2 + 1 < width)
+                            {
+                                sum += to_integer<uint32_t>(input[src_idx_right + c]);
+                                count++;
+                            }
+
+                            if (y * 2 + 1 < height)
+                            {
+                                sum += to_integer<uint32_t>(input[src_idx_bottom + c]);
+                                count++;
+                            }
+
+                            if ((x * 2 + 1 < width) && (y * 2 + 1 < height))
+                            {
+                                sum += to_integer<uint32_t>(input[src_idx_bottom_right + c]);
+                                count++;
+                            }
+
+                            output[dst_idx + c] = std::byte(sum / count);
+                        }
+                    }
+                }
+            };
+
+            constexpr uint32_t parallel_threshold_rows = 64;
+            if (new_height >= parallel_threshold_rows)
+            {
+                ThreadPool::ParallelLoop([&](uint32_t start, uint32_t end) { process_rows(start, end); }, new_height);
+            }
+            else
+            {
+                process_rows(0, new_height);
+            }
+        }
+
+        uint32_t compute_count(uint32_t width, uint32_t height)
+        {
+            uint32_t mip_count = 1; // base level counts
+            while (width > 1 || height > 1)
+            {
+                width  = max(1u, width >> 1);
+                height = max(1u, height >> 1);
+                mip_count++;
+            }
+            return mip_count;
+        }
+    }
+
+    namespace binary_format
+    {
+        struct header
+        {
+            uint32_t type;
+            uint32_t format;
+            uint32_t width;
+            uint32_t height;
+            uint32_t depth;
+            uint32_t mip_count;
+            uint32_t flags;
+            char     name[128];
+        };
+
+        bool write_all(ofstream& ofs, const void* data, size_t size)
+        {
+            ofs.write(reinterpret_cast<const char*>(data), static_cast<streamsize>(size));
+            return ofs.good();
+        }
+
+        bool read_all(ifstream& ifs, void* data, size_t size)
+        {
+            ifs.read(reinterpret_cast<char*>(data), static_cast<streamsize>(size));
+            return ifs.good();
+        }
+    }
+
+    RHI_Texture::RHI_Texture() : IResource(ResourceType::Texture)
+    {
+        m_layouts.fill(RHI_Image_Layout::Max);
+    }
+
+    RHI_Texture::RHI_Texture(
+        const RHI_Texture_Type type,
+        const uint32_t width,
+        const uint32_t height,
+        const uint32_t depth,
+        const uint32_t mip_count,
+        const RHI_Format format,
+        const uint32_t flags,
+        const char* name,
+        vector<RHI_Texture_Slice> slices
+    ) : IResource(ResourceType::Texture)
+    {
+        m_type             = type;
+        m_width            = width;
+        m_height           = height;
+        m_depth            = depth;
+        m_mip_count        = mip_count;
+        m_format           = format;
+        m_flags            = flags;
+        m_object_name      = name;
+        m_slices           = move(slices);
+        m_viewport         = RHI_Viewport(0, 0, static_cast<float>(width), static_cast<float>(height));
+        m_channel_count    = rhi_to_format_channel_count(format);
+        m_bits_per_channel = rhi_format_to_bits_per_channel(m_format);
+        m_layouts.fill(RHI_Image_Layout::Max);
+
+        // render targets need gpu resource immediately even without cpu data
+        // other textures with empty slices will have data filled later
+        bool is_render_target = m_flags & (RHI_Texture_Rtv | RHI_Texture_Uav);
+        bool will_fill_data_later = m_slices.empty() && !is_render_target;
+        if (!will_fill_data_later)
+        {
+            PrepareForGpu();
+        }
+
+    }
+
+    RHI_Texture::RHI_Texture(const string& file_path) : IResource(ResourceType::Texture)
+    {
+        m_layouts.fill(RHI_Image_Layout::Max);
+        LoadFromFile(file_path);
+    }
+
+    RHI_Texture::~RHI_Texture()
+    {
+        RHI_DestroyResource();
+    }
+
+    bool RHI_Texture::CanSaveToFile() const
+    {
+        // requires cpu bytes and compressed format
+        bool has_data   = !m_slices.empty() && !m_slices[0].mips.empty() && !m_slices[0].mips[0].bytes.empty();
+        bool compressed = IsCompressedFormat(m_format);
+        return has_data && compressed;
+    }
+
+    void spartan::RHI_Texture::SaveToFile(const string& file_path)
+    {
+        // require cpu bytes
+        if (m_slices.empty() || m_slices[0].mips.empty())
+        {
+            SP_LOG_WARNING("SaveToFile skipped for %s - no CPU-side data (will re-import from source)", file_path.c_str());
+            return;
+        }
+    
+        // require compressed native format
+        if (!IsCompressedFormat(m_format))
+        {
+            SP_LOG_WARNING("SaveToFile skipped for %s - not compressed (will re-import from source)", file_path.c_str());
+            return;
+        }
+    
+        binary_format::header hdr = {};
+        hdr.type                  = static_cast<uint32_t>(m_type);
+        hdr.format                = static_cast<uint32_t>(m_format);
+        hdr.width                 = m_width;
+        hdr.height                = m_height;
+        hdr.depth                 = m_depth;
+        hdr.mip_count             = m_mip_count;
+        hdr.flags                 = m_flags;
+        memset(hdr.name, 0, sizeof(hdr.name));
+        {
+            string n = m_object_name.empty() ? FileSystem::GetFileNameFromFilePath(file_path) : m_object_name;
+            size_t count = min(n.size(), sizeof(hdr.name) - 1);
+            copy_n(n.c_str(), count, hdr.name);
+            hdr.name[count] = '\0';
+        }
+    
+        ofstream ofs(file_path, ios::binary);
+        if (!ofs.is_open())
+        {
+            SP_LOG_ERROR("SaveToFile failed to open %s", file_path.c_str());
+            return;
+        }
+    
+        if (!binary_format::write_all(ofs, &hdr, sizeof(hdr)))
+        {
+            SP_LOG_ERROR("SaveToFile failed to write header for %s", file_path.c_str());
+            return;
+        }
+    
+        // write layout: for each slice, for each mip, write uint64 size then bytes
+        for (uint32_t array_index = 0; array_index < m_depth; array_index++)
+        {
+            const RHI_Texture_Slice& slice = m_slices[array_index];
+            if (slice.mips.size() != m_mip_count)
+            {
+                SP_LOG_ERROR("SaveToFile mip count mismatch on slice %u", array_index);
+                return;
+            }
+    
+            for (uint32_t mip_index = 0; mip_index < m_mip_count; mip_index++)
+            {
+                const auto& mip = slice.mips[mip_index];
+                const uint64_t byte_count = static_cast<uint64_t>(mip.bytes.size());
+                if (!binary_format::write_all(ofs, &byte_count, sizeof(byte_count)) || !binary_format::write_all(ofs, mip.bytes.data(), mip.bytes.size()))
+                {
+                    SP_LOG_ERROR("SaveToFile failed while writing slice %u mip %u", array_index, mip_index);
+                    return;
+                }
+            }
+        }
+    
+        ofs.flush();
+        if (!ofs.good())
+        {
+            SP_LOG_ERROR("SaveToFile finalise failed for %s", file_path.c_str());
+            return;
+        }
+    
+        // record path for cache
+        SetResourceFilePath(file_path);
+        SP_LOG_INFO("Saved native compressed texture to %s", file_path.c_str());
+    }
+
+    void RHI_Texture::LoadFromFile(const string& file_path)
+    {
+        ProgressTracker::SetGlobalLoadingState(true);
+        ClearData();
+
+        {
+            char marker[128];
+            snprintf(marker, sizeof(marker), "texture_load: %s", FileSystem::GetFileNameFromFilePath(file_path).c_str());
+            Breadcrumbs::BeginMarker(marker);
+        }
+
+        // load foreign format
+        if (FileSystem::IsSupportedImageFile(file_path))
+        {
+            m_type            = RHI_Texture_Type::Type2D;
+            m_depth           = 1;
+            m_flags          |= RHI_Texture_Srv;
+            m_object_name     = FileSystem::GetFileNameFromFilePath(file_path);
+            m_resource_state  = ResourceState::LoadingFromDrive;
+
+            ImageImporter::Load(file_path, 0, this);
+        }
+        // load native compressed bytes
+        else if (FileSystem::IsEngineTextureFile(file_path))
+        {
+            ifstream ifs(file_path, ios::binary);
+            if (!ifs.is_open())
+            {
+                SP_LOG_ERROR("Failed to open native texture %s", file_path.c_str());
+                Breadcrumbs::EndMarker(); // texture_load
+                ProgressTracker::SetGlobalLoadingState(false);
+                return;
+            }
+
+            binary_format::header hdr{};
+            if (!binary_format::read_all(ifs, &hdr, sizeof(hdr)))
+            {
+                SP_LOG_ERROR("Failed to read header for %s", file_path.c_str());
+                Breadcrumbs::EndMarker(); // texture_load
+                ProgressTracker::SetGlobalLoadingState(false);
+                return;
+            }
+
+            // initialise texture fields
+            m_type            = static_cast<RHI_Texture_Type>(hdr.type);
+            m_format          = static_cast<RHI_Format>(hdr.format);
+            m_width           = hdr.width;
+            m_height          = hdr.height;
+            m_depth           = hdr.depth;
+            m_mip_count       = hdr.mip_count;
+            m_flags           = hdr.flags | RHI_Texture_Srv;
+            m_object_name     = hdr.name[0] ? string(hdr.name) : FileSystem::GetFileNameFromFilePath(file_path);
+            m_viewport        = RHI_Viewport(0, 0, static_cast<float>(m_width), static_cast<float>(m_height));
+            m_channel_count   = rhi_to_format_channel_count(m_format);
+            m_bits_per_channel= rhi_format_to_bits_per_channel(m_format);
+
+            // allocate slices and load mips
+            m_slices.resize(m_depth);
+            for (uint32_t array_index = 0; array_index < m_depth; array_index++)
+            {
+                RHI_Texture_Slice& slice = m_slices[array_index];
+                slice.mips.resize(m_mip_count);
+
+                for (uint32_t mip_index = 0; mip_index < m_mip_count; mip_index++)
+                {
+                    uint64_t byte_count = 0;
+                    if (!binary_format::read_all(ifs, &byte_count, sizeof(byte_count)) || byte_count == 0)
+                    {
+                        SP_LOG_ERROR("Failed to read size for slice %u mip %u in %s", array_index, mip_index, file_path.c_str());
+                        Breadcrumbs::EndMarker(); // texture_load
+                        ProgressTracker::SetGlobalLoadingState(false);
+                        return;
+                    }
+
+                    RHI_Texture_Mip& mip = slice.mips[mip_index];
+                    mip.bytes.resize(static_cast<size_t>(byte_count));
+                    if (!binary_format::read_all(ifs, mip.bytes.data(), static_cast<size_t>(byte_count)))
+                    {
+                        SP_LOG_ERROR("Failed to read data for slice %u mip %u in %s", array_index, mip_index, file_path.c_str());
+                        Breadcrumbs::EndMarker(); // texture_load
+                        ProgressTracker::SetGlobalLoadingState(false);
+                        return;
+                    }
+                }
+            }
+
+            SP_LOG_INFO("Loaded native texture %s", file_path.c_str());
+        }
+        else
+        {
+            SP_LOG_ERROR("Failed to load texture %s: format not supported", file_path.c_str());
+        }
+
+        SetResourceFilePath(file_path); // set resource file path so it can be used by the resource cache.
+        ComputeMemoryUsage();
+        m_resource_state = ResourceState::Max;
+
+        Breadcrumbs::EndMarker(); // texture_load
+
+        // automatically prepare the texture for gpu use,
+        // skipped when RHI_Texture_DeferUpload is set, which is used by source material textures that still need to be modified by Material::pack_textures
+        // (alpha mask merging into color.a is the canonical case, an early upload would freeze the pre-merge bytes on the gpu)
+        if (!(m_flags & RHI_Texture_DeferUpload))
+        {
+            PrepareForGpu();
+        }
+
+        ProgressTracker::SetGlobalLoadingState(false);
+    }
+
+    RHI_Texture_Mip* RHI_Texture::GetMip(const uint32_t array_index, const uint32_t mip_index)
+    {
+        if (array_index >= m_slices.size())
+        {
+            return nullptr;
+        }
+
+        if (mip_index >= m_slices[array_index].mips.size())
+        {
+            return nullptr;
+        }
+
+        return &m_slices[array_index].mips[mip_index];
+    }
+
+    RHI_Texture_Slice* RHI_Texture::GetSlice(const uint32_t array_index)
+    {
+        if (array_index >= m_slices.size())
+        {
+            return nullptr;
+        }
+
+        return &m_slices[array_index];
+    }
+
+    void RHI_Texture::AllocateMip(uint32_t slice_index /*= 0*/)
+    {
+        // ensure slices exist up to the requested index
+        while (m_slices.size() <= slice_index)
+        { 
+            m_slices.emplace_back();
+        }
+
+        RHI_Texture_Mip& mip = m_slices[slice_index].mips.emplace_back();
+        m_depth              = static_cast<uint32_t>(m_slices.size());
+        m_mip_count          = static_cast<uint32_t>(m_slices[slice_index].mips.size());
+        uint32_t mip_index   = static_cast<uint32_t>(m_slices[slice_index].mips.size()) - 1;
+        uint32_t width       = max(1u, m_width >> mip_index);
+        uint32_t height      = max(1u, m_height >> mip_index);
+        uint32_t depth       = (GetType() == RHI_Texture_Type::Type3D) ? (m_depth >> mip_index) : 1;
+        size_t size_bytes    = CalculateMipSize(width, height, depth, m_format, m_bits_per_channel, m_channel_count);
+        mip.bytes.resize(size_bytes);
+    }
+
+    void RHI_Texture::ComputeMemoryUsage()
+    {
+        m_object_size = 0;
+
+        uint32_t array_length = (m_type == RHI_Texture_Type::Type3D) ? 1 : m_depth;
+        for (uint32_t array_index = 0; array_index < array_length; array_index++)
+        {
+            for (uint32_t mip_index = 0; mip_index < m_mip_count; mip_index++)
+            {
+                const uint32_t mip_width  = max(1u, m_width >> mip_index);
+                const uint32_t mip_height = max(1u, m_height >> mip_index);
+                const uint32_t mip_depth  = (m_type == RHI_Texture_Type::Type3D) ? max(1u, m_depth >> mip_index) : 1;
+
+                m_object_size += CalculateMipSize(mip_width, mip_height, mip_depth, m_format, m_bits_per_channel, m_channel_count);
+            }
+        }
+    }
+
+    void RHI_Texture::SetLayout(const RHI_Image_Layout new_layout, RHI_CommandList* cmd_list, uint32_t mip_index /*= all_mips*/, uint32_t mip_range /*= 0*/)
+    {
+        if (mip_index != rhi_all_mips)
+        {
+            SP_ASSERT(HasPerMipViews());
+            SP_ASSERT(mip_range != 0);
+            SP_ASSERT(mip_index + mip_range <= m_mip_count);
+        }
+
+        cmd_list->InsertBarrier(this, RHI_Image_Layout::General, mip_index, mip_range);
+        (void)new_layout;
+    }
+
+    void RHI_Texture::SetLayoutDirect(uint32_t mip_index, uint32_t mip_range, RHI_Image_Layout layout)
+    {
+        SP_ASSERT(mip_index < rhi_max_mip_count);
+        SP_ASSERT(mip_index + mip_range <= rhi_max_mip_count);
+
+        uint32_t mip_end = min(mip_index + mip_range, rhi_max_mip_count);
+        for (uint32_t i = mip_index; i < mip_end; ++i)
+        {
+            m_layouts[i] = layout;
+        }
+    }
+
+    void RHI_Texture::ClearLayouts()
+    {
+        m_layouts.fill(RHI_Image_Layout::Max);
+    }
+
+    void RHI_Texture::ClearData()
+    {
+         m_slices.clear();
+         m_slices.shrink_to_fit();
+    }
+
+    void RHI_Texture::ShutdownCompressionPool()
+    {
+        gpu_compression::shutdown();
+    }
+
+    void RHI_Texture::PrepareForGpu()
+    {
+        // atomically transition from idle to preparing so only one thread can enter
+        ResourceState expected = ResourceState::Max;
+        if (!m_resource_state.compare_exchange_strong(expected, ResourceState::PreparingForGpu))
+        {
+            return;
+        }
+
+        // skip textures with invalid dimensions (failed to load)
+        if (m_width == 0 || m_height == 0)
+        {
+            SP_LOG_ERROR("Texture '%s' has invalid dimensions (%dx%d), skipping preparation", m_object_name.c_str(), m_width, m_height);
+            m_resource_state = ResourceState::Max;
+            return;
+        }
+
+        {
+            char marker[128];
+            snprintf(marker, sizeof(marker), "texture_prepare_gpu: %s", m_object_name.c_str());
+            Breadcrumbs::BeginMarker(marker);
+        }
+
+        bool is_not_compressed   = !IsCompressedFormat();                    // the bistro world loads pre-compressed textures
+        bool is_material_texture = IsMaterialTexture() && !m_slices.empty(); // render targets or textures which are written to in compute passes, don't need mip and compression
+
+        if (is_not_compressed && is_material_texture)
+        {
+            // generate mip chain for all slices
+            Breadcrumbs::BeginMarker("texture_mip_generation");
+            uint32_t mip_count = mips::compute_count(m_width, m_height);
+            for (uint32_t slice_index = 0; slice_index < static_cast<uint32_t>(m_slices.size()); slice_index++)
+            {
+                for (uint32_t mip_index = 1; mip_index < mip_count; mip_index++)
+                {
+                    AllocateMip(slice_index);
+
+                    mips::downsample_bilinear(
+                        m_slices[slice_index].mips[mip_index - 1].bytes, // larger
+                        m_slices[slice_index].mips[mip_index].bytes,     // smaller
+                        max(1u, m_width  >> (mip_index - 1)),            // larger width
+                        max(1u, m_height >> (mip_index - 1))             // larger height
+                    );
+                }
+            }
+            Breadcrumbs::EndMarker(); // mip_generation
+
+            // compress - format is chosen per-texture (bc3 for packed, bc1 for color, bc5 for normal, etc.)
+            bool compress       = m_flags & RHI_Texture_Compress;
+            bool not_compressed = !IsCompressedFormat();
+            if (compress && not_compressed)
+            {
+                RHI_Format target = m_compression_format != RHI_Format::Max ? m_compression_format : RHI_Format::BC3_Unorm;
+
+                if (!gpu_compression::compress(this, target))
+                {
+                    SP_LOG_WARNING("GPU compression skipped for '%s', texture will remain uncompressed", m_object_name.c_str());
+                }
+            }
+        }
+        
+        // upload to gpu
+        if (!RHI_Device::IsDeviceLost())
+        {
+            Breadcrumbs::BeginMarker("texture_create_resource");
+            SP_ASSERT(RHI_CreateResource());
+            Breadcrumbs::EndMarker(); // create_resource
+        }
+
+        ComputeMemoryUsage();
+
+        if (m_rhi_resource)
+        {
+            m_resource_state = ResourceState::PreparedForGpu;
+        }
+        else
+        {
+            m_resource_state = ResourceState::Max;
+        }
+
+        Breadcrumbs::EndMarker(); // prepare_gpu
+    }
+
+    bool RHI_Texture::IsCompressedFormat(const RHI_Format format)
+    {
+        return
+            format == RHI_Format::BC1_Unorm ||
+            format == RHI_Format::BC3_Unorm ||
+            format == RHI_Format::BC5_Unorm ||
+            format == RHI_Format::BC7_Unorm ||
+            format == RHI_Format::ASTC;
+    }
+
+    size_t RHI_Texture::CalculateMipSize(uint32_t width, uint32_t height, uint32_t depth, RHI_Format format, uint32_t bits_per_channel, uint32_t channel_count)
+    {
+        SP_ASSERT(width  > 0);
+        SP_ASSERT(height > 0);
+        SP_ASSERT(depth  > 0);
+
+        if (IsCompressedFormat(format))
+        {
+            uint32_t block_size;
+            uint32_t block_width  = 4; // default block width  for BC formats
+            uint32_t block_height = 4; // default block height for BC formats
+            switch (format)
+            {
+            case RHI_Format::BC1_Unorm:
+                block_size = 8;
+                break;
+            case RHI_Format::BC3_Unorm:
+            case RHI_Format::BC5_Unorm:
+            case RHI_Format::BC7_Unorm:
+                block_size = 16;
+                break;
+            case RHI_Format::ASTC: // VK_FORMAT_ASTC_4x4_UNORM_BLOCK
+                block_width  = 4;
+                block_height = 4;
+                block_size  = 16;
+                break;
+            default:
+                SP_ASSERT(false);
+                return 0;
+            }
+            uint32_t num_blocks_wide = (width + block_width - 1) / block_width;
+            uint32_t num_blocks_high = (height + block_height - 1) / block_height;
+            return static_cast<size_t>(num_blocks_wide) * static_cast<size_t>(num_blocks_high) * static_cast<size_t>(depth) * static_cast<size_t>(block_size);
+        }
+        else
+        {
+            SP_ASSERT(channel_count > 0);
+            SP_ASSERT(bits_per_channel > 0);
+            return static_cast<size_t>(width) * static_cast<size_t>(height) * static_cast<size_t>(depth) * static_cast<size_t>(channel_count) * static_cast<size_t>(bits_per_channel / 8);
+        }
+    }
+}

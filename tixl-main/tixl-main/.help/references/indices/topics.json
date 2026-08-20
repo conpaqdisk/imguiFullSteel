@@ -1,0 +1,511 @@
+{
+  "topics": {
+    "ui:Graph": {
+      "term": "Graph",
+      "parent": null,
+      "synonyms": [
+        "GraphWindow",
+        "GraphCanvas",
+        "Operator Graph",
+        "Magnetic Graph",
+        "MagGraph"
+      ],
+      "classes": [
+        "GraphWindow",
+        "MagGraphView"
+      ],
+      "docFile": "references/topics/ui/Graph.md"
+    },
+    "ui:SkillQuest": {
+      "term": "SkillQuest",
+      "parent": null,
+      "synonyms": [
+        "Skill Quest tutorials",
+        "Tutorials"
+      ],
+      "classes": [
+        "SkillTraining"
+      ],
+      "docFile": "references/topics/ui/SkillQuest.md"
+    },
+    "ui:SkillQuestLevel": {
+      "term": "Skill Quest Level",
+      "parent": "ui:SkillQuest",
+      "synonyms": [],
+      "classes": [
+        "QuestLevel"
+      ],
+      "docFile": "references/topics/ui/SkillQuestLevel.md"
+    },
+    "ui:SkillMap": {
+      "term": "Skill Map",
+      "parent": "ui:SkillQuest",
+      "synonyms": [
+        "Skill Quest Map"
+      ],
+      "classes": [
+        "SkillMapData"
+      ],
+      "docFile": "references/topics/ui/SkillMap.md"
+    },
+    "ui:ParameterWindow": {
+      "term": "Parameter window",
+      "parent": null,
+      "synonyms": [
+        "Parameter View"
+      ],
+      "classes": [
+        "ParameterWindow"
+      ],
+      "docFile": "references/topics/ui/ParameterWindow.md"
+    },
+    "ui:OutputWindow": {
+      "term": "Output Window",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "OutputWindow"
+      ],
+      "docFile": "references/topics/ui/OutputWindow.md"
+    },
+    "ui:Settings": {
+      "term": "Settings",
+      "parent": null,
+      "synonyms": [
+        "Settings Window",
+        "User Settings"
+      ],
+      "classes": [
+        "SettingsWindow"
+      ],
+      "docFile": "references/topics/ui/Settings.md"
+    },
+    "ui:ProjectSettings": {
+      "term": "Project Settings",
+      "parent": null,
+      "synonyms": [
+        "Composition settings"
+      ],
+      "classes": [
+        "ProjectSettingsWindow"
+      ],
+      "docFile": "references/topics/ui/ProjectSettings.md"
+    },
+    "ui:Symbol": {
+      "term": "Symbol",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "Symbol"
+      ],
+      "docFile": "references/topics/ui/Symbol.md"
+    },
+    "ui:Composition": {
+      "term": "Composition",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "Instance"
+      ],
+      "docFile": "references/topics/ui/Composition.md"
+    },
+    "ui:UserProject": {
+      "term": "User Project",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "EditableSymbolProject"
+      ],
+      "docFile": "references/topics/ui/UserProject.md"
+    },
+    "ui:Asset": {
+      "term": "Asset",
+      "parent": null,
+      "synonyms": [
+        "Assets"
+      ],
+      "classes": [
+        "Asset"
+      ],
+      "docFile": "references/topics/ui/Asset.md"
+    },
+    "ui:AssetLibrary": {
+      "term": "Asset Library",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "AssetLibrary"
+      ],
+      "docFile": "references/topics/ui/AssetLibrary.md"
+    },
+    "ui:SymbolLibrary": {
+      "term": "Symbol Library",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "SymbolLibrary"
+      ],
+      "docFile": "references/topics/ui/SymbolLibrary.md"
+    },
+    "ui:SymbolBrowser": {
+      "term": "Symbol browser",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "PlaceholderCreation"
+      ],
+      "docFile": "references/topics/ui/SymbolBrowser.md"
+    },
+    "ui:VariationWindow": {
+      "term": "Variation window",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "VariationsWindow"
+      ],
+      "docFile": "references/topics/ui/VariationWindow.md"
+    },
+    "ui:SearchWindow": {
+      "term": "Search window",
+      "parent": null,
+      "synonyms": [
+        "Control F",
+        "Find"
+      ],
+      "classes": [
+        "SearchDialog"
+      ],
+      "docFile": "references/topics/ui/SearchWindow.md"
+    },
+    "ui:Annotations": {
+      "term": "Annotations",
+      "parent": null,
+      "synonyms": [
+        "sections"
+      ],
+      "classes": [
+        "MagGraphAnnotation"
+      ],
+      "docFile": "references/topics/ui/Annotations.md"
+    },
+    "ui:OperatorSettings": {
+      "term": "Operator Settings",
+      "parent": null,
+      "synonyms": [
+        "Operator names"
+      ],
+      "classes": [
+        "ParameterSettings"
+      ],
+      "docFile": "references/topics/ui/OperatorSettings.md"
+    },
+    "ui:GradientEditor": {
+      "term": "Gradient editor",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "GradientEditor"
+      ],
+      "docFile": "references/topics/ui/GradientEditor.md"
+    },
+    "ui:Timeline": {
+      "term": "Timeline",
+      "parent": null,
+      "synonyms": [
+        "timeline window"
+      ],
+      "classes": [
+        "TimeLineCanvas"
+      ],
+      "docFile": "references/topics/ui/Timeline.md"
+    },
+    "ui:DopeSheet": {
+      "term": "Dope sheet",
+      "parent": "ui:Timeline",
+      "synonyms": [
+        "dope sheet area"
+      ],
+      "classes": [
+        "DopeSheetArea"
+      ],
+      "docFile": "references/topics/ui/DopeSheet.md"
+    },
+    "ui:AnimationArea": {
+      "term": "Animation area",
+      "parent": "ui:Timeline",
+      "synonyms": [],
+      "classes": [
+        "TimelineDetailsArea"
+      ],
+      "docFile": "references/topics/ui/AnimationArea.md"
+    },
+    "ui:CurveEditor": {
+      "term": "Curve editor",
+      "parent": "ui:Timeline",
+      "synonyms": [
+        "Curve area"
+      ],
+      "classes": [
+        "TimelineCurveEditor"
+      ],
+      "docFile": "references/topics/ui/CurveEditor.md"
+    },
+    "ui:ControlBar": {
+      "term": "Control bar",
+      "parent": null,
+      "synonyms": [
+        "tool bar"
+      ],
+      "classes": [
+        "TimeControls"
+      ],
+      "docFile": "references/topics/ui/ControlBar.md"
+    },
+    "ui:PerformanceMonitor": {
+      "term": "Performance monitor",
+      "parent": null,
+      "synonyms": [
+        "performance window",
+        "performance graph"
+      ],
+      "classes": [
+        "PerformanceWindow"
+      ],
+      "docFile": "references/topics/ui/PerformanceMonitor.md"
+    },
+    "ui:ControlView": {
+      "term": "Control view",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "SnapshotControlView"
+      ],
+      "docFile": "references/topics/ui/ControlView.md"
+    },
+    "ui:ShaderGraph": {
+      "term": "Shader graph",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "ShaderGraphNode"
+      ],
+      "docFile": "references/topics/ui/ShaderGraph.md"
+    },
+    "ui:ShaderNode": {
+      "term": "Shader node",
+      "parent": "ui:ShaderGraph",
+      "synonyms": [],
+      "classes": [
+        "ShaderGraphNode"
+      ],
+      "docFile": "references/topics/ui/ShaderNode.md"
+    },
+    "ui:Field": {
+      "term": "Field",
+      "parent": null,
+      "synonyms": [
+        "SDF",
+        "distance field",
+        "value field"
+      ],
+      "classes": [
+        "ShaderGraphNode"
+      ],
+      "docFile": "references/topics/ui/Field.md"
+    },
+    "ui:Gizmo": {
+      "term": "Gizmo",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "TransformGizmoHandling"
+      ],
+      "docFile": "references/topics/ui/Gizmo.md"
+    },
+    "ui:WelcomeWindow": {
+      "term": "Welcome window",
+      "parent": null,
+      "synonyms": [],
+      "classes": [],
+      "docFile": "references/topics/ui/WelcomeWindow.md"
+    },
+    "ui:WelcomeAlphaWindow": {
+      "term": "Welcome alpha window",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "WelcomeAlphaWindow"
+      ],
+      "docFile": "references/topics/ui/WelcomeAlphaWindow.md"
+    },
+    "ui:ProjectPanel": {
+      "term": "Project panel",
+      "parent": null,
+      "synonyms": [
+        "project list",
+        "home"
+      ],
+      "classes": [
+        "ProjectsPanel"
+      ],
+      "docFile": "references/topics/ui/ProjectPanel.md"
+    },
+    "ui:RenderSettings": {
+      "term": "Render settings",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "RenderWindow"
+      ],
+      "docFile": "references/topics/ui/RenderSettings.md"
+    },
+    "ui:OutputSettings": {
+      "term": "Output settings",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "OutputWindowState"
+      ],
+      "docFile": "references/topics/ui/OutputSettings.md"
+    },
+    "ui:IoView": {
+      "term": "IO view",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "IoViewWindow"
+      ],
+      "docFile": "references/topics/ui/IoView.md"
+    },
+    "ui:ConsoleLog": {
+      "term": "Console log",
+      "parent": null,
+      "synonyms": [
+        "log window",
+        "console window"
+      ],
+      "classes": [
+        "ConsoleLogWindow"
+      ],
+      "docFile": "references/topics/ui/ConsoleLog.md"
+    },
+    "ui:SplashScreen": {
+      "term": "Splash screen",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "SplashScreen"
+      ],
+      "docFile": "references/topics/ui/SplashScreen.md"
+    },
+    "ui:Player": {
+      "term": "Player",
+      "parent": null,
+      "synonyms": [],
+      "classes": [],
+      "docFile": "references/topics/ui/Player.md"
+    },
+    "ui:PlayerExporter": {
+      "term": "Player exporter",
+      "parent": "ui:Player",
+      "synonyms": [],
+      "classes": [
+        "PlayerExporter"
+      ],
+      "docFile": "references/topics/ui/PlayerExporter.md"
+    },
+    "ui:ColorEditor": {
+      "term": "Color editor",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "ColorEditPopup"
+      ],
+      "docFile": "references/topics/ui/ColorEditor.md"
+    },
+    "ui:InfinitySlider": {
+      "term": "Infinity slider",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "InfinitySliderOverlay"
+      ],
+      "docFile": "references/topics/ui/InfinitySlider.md"
+    },
+    "ui:ParameterPopup": {
+      "term": "Parameter popup",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "ParameterPopUp"
+      ],
+      "docFile": "references/topics/ui/ParameterPopup.md"
+    },
+    "ui:FocusMode": {
+      "term": "Focus mode",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "LayoutHandling"
+      ],
+      "docFile": "references/topics/ui/FocusMode.md"
+    },
+    "ui:IdleMotion": {
+      "term": "Idle motion",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "Playback"
+      ],
+      "docFile": "references/topics/ui/IdleMotion.md"
+    },
+    "ui:EvaluationContext": {
+      "term": "Evaluation context",
+      "parent": null,
+      "synonyms": [
+        "context",
+        "variables"
+      ],
+      "classes": [
+        "EvaluationContext"
+      ],
+      "docFile": "references/topics/ui/EvaluationContext.md"
+    },
+    "ui:TimeOverrides": {
+      "term": "Time overrides",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "EvaluationContext"
+      ],
+      "docFile": "references/topics/ui/TimeOverrides.md"
+    },
+    "ui:LocalTime": {
+      "term": "Local time",
+      "parent": "ui:EvaluationContext",
+      "synonyms": [],
+      "classes": [
+        "EvaluationContext"
+      ],
+      "docFile": "references/topics/ui/LocalTime.md"
+    },
+    "ui:PlaybackTime": {
+      "term": "Play back time",
+      "parent": "ui:EvaluationContext",
+      "synonyms": [],
+      "classes": [
+        "Playback"
+      ],
+      "docFile": "references/topics/ui/PlaybackTime.md"
+    },
+    "ui:AudioInput": {
+      "term": "Audio input",
+      "parent": null,
+      "synonyms": [],
+      "classes": [
+        "WasapiAudioInput"
+      ],
+      "docFile": "references/topics/ui/AudioInput.md"
+    }
+  }
+}

@@ -1,0 +1,4769 @@
+
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES =================================
+#include "pch.h"
+#include <unordered_set>
+#include "Physics.h"
+#include "Render.h"
+#include "Camera.h"
+#include "Terrain.h"
+#include "../Entity.h"
+#include "../../rhi/RHI_Vertex.h"
+#include "../../physics/PhysicsWorld.h"
+#include "../../car/Car.h"
+#include "../../car/CarSimulation.h"
+#include "../../geometry/Mesh.h"
+#include "../../geometry/GeometryProcessing.h"
+#include "../../rendering/Renderer.h"
+#include "../../rendering/GeometryBuffer.h"
+#include "../../core/ProgressTracker.h"
+SP_WARNINGS_OFF
+#include <sol/sol.hpp>
+#ifdef DEBUG
+    #define _DEBUG 1
+    #undef NDEBUG
+#else
+    #define NDEBUG 1
+    #undef _DEBUG
+#endif
+#define PX_PHYSX_STATIC_LIB
+#include "../io/pugixml.hpp"
+SP_WARNINGS_ON
+//============================================
+
+//= NAMESPACES ===============
+using namespace std;
+using namespace spartan::math;
+using namespace physx;
+//============================
+
+namespace spartan
+{
+    namespace
+    {
+        const float distance_deactivate = 80.0f;
+        const float distance_activate   = 40.0f;
+
+        // 1.8m total height for an average adult, a capsule totals cylinder_height + 2 * radius
+        const float controller_radius   = 0.25f;
+        const float standing_height     = 1.3f;  // cylinder height (total = 1.3 + 0.5 = 1.8m)
+        const float crouch_height       = 0.5f;  // cylinder height when crouching (total = 0.5 + 0.5 = 1.0m)
+
+        // derivatives
+        const float distance_deactivate_squared = distance_deactivate * distance_deactivate;
+        const float distance_activate_squared   = distance_activate * distance_activate;
+
+        PxControllerManager* controller_manager = nullptr;
+
+        // fft water buoyancy, applied once per fixed physics step to every submerged dynamic body
+        namespace buoyancy
+        {
+            const float water_density   = 1000.0f; // kg per cubic meter
+            const float max_accel       = 30.0f;   // cap so featherweight bodies don't rocket out of the water
+            const float drag_horizontal = 2.0f;    // velocity damping per second at full submersion
+            const float drag_vertical   = 20.0f;   // near critical for the buoyancy spring, floats settle onto the surface instead of bouncing
+            const float drag_angular    = 4.0f;    // spin damping per second at full submersion
+            const float align_gain      = 10.0f;   // angular acceleration per radian of tilt toward the wave normal, makes floats pitch and roll with the swell
+            vector<Physics*> bodies;               // guarded by the physx mutex
+        }
+
+        // classify a ground actor into a car surface type from its entity name
+        car::surface_type classify_ground_actor(const PxRigidActor* actor)
+        {
+            if (!actor || !actor->userData)
+            {
+                return car::surface_asphalt;
+            }
+
+            string name = static_cast<Entity*>(actor->userData)->GetObjectName();
+            for (char& c : name)
+            {
+                if (c >= 'A' && c <= 'Z')
+                {
+                    c = static_cast<char>(c - 'A' + 'a');
+                }
+            }
+
+            if (name.find("ice") != string::npos || name.find("snow") != string::npos)
+            {
+                return car::surface_ice;
+            }
+            if (name.find("grass") != string::npos || name.find("lawn") != string::npos)
+            {
+                return car::surface_grass;
+            }
+            if (name.find("gravel") != string::npos || name.find("dirt") != string::npos || name.find("sand") != string::npos)
+            {
+                return car::surface_gravel;
+            }
+            if (name.find("wet") != string::npos || name.find("puddle") != string::npos)
+            {
+                return car::surface_wet_asphalt;
+            }
+            if (name.find("concrete") != string::npos)
+            {
+                return car::surface_concrete;
+            }
+            return car::surface_asphalt;
+        }
+
+        // tag all shapes on an actor with a collision type in word2
+        // used by the simulation filter shader to suppress specific pairs
+        void tag_actor_shapes(PxRigidActor* actor, PxU32 collision_type, PxU32 collision_group = 0)
+        {
+            PxShape* shapes[16];
+            PxU32 count = actor->getShapes(shapes, 16);
+            for (PxU32 i = 0; i < count; i++)
+            {
+                PxFilterData fd = shapes[i]->getSimulationFilterData();
+                fd.word2 = collision_type;
+                fd.word3 = collision_group;
+                shapes[i]->setSimulationFilterData(fd);
+            }
+        }
+
+        // helper to build lock flags from position and rotation lock vectors
+        PxRigidDynamicLockFlags build_lock_flags(const Vector3& position_lock, const Vector3& rotation_lock)
+        {
+            PxRigidDynamicLockFlags flags = PxRigidDynamicLockFlags(0);
+            if (position_lock.x)
+            {
+                flags |= PxRigidDynamicLockFlag::eLOCK_LINEAR_X;
+            }
+            if (position_lock.y)
+            {
+                flags |= PxRigidDynamicLockFlag::eLOCK_LINEAR_Y;
+            }
+            if (position_lock.z)
+            {
+                flags |= PxRigidDynamicLockFlag::eLOCK_LINEAR_Z;
+            }
+            if (rotation_lock.x)
+            {
+                flags |= PxRigidDynamicLockFlag::eLOCK_ANGULAR_X;
+            }
+            if (rotation_lock.y)
+            {
+                flags |= PxRigidDynamicLockFlag::eLOCK_ANGULAR_Y;
+            }
+            if (rotation_lock.z)
+            {
+                flags |= PxRigidDynamicLockFlag::eLOCK_ANGULAR_Z;
+            }
+            return flags;
+        }
+
+        // transform conversion helpers
+        PxTransform to_px_transform(const Vector3& pos, const Quaternion& rot)
+        {
+            return PxTransform(PxVec3(pos.x, pos.y, pos.z), PxQuat(rot.x, rot.y, rot.z, rot.w));
+        }
+
+        PxTransform to_px_transform(const math::Matrix& matrix)
+        {
+            Vector3 pos = matrix.GetTranslation();
+            Quaternion rot = matrix.GetRotation();
+            return PxTransform(PxVec3(pos.x, pos.y, pos.z), PxQuat(rot.x, rot.y, rot.z, rot.w));
+        }
+
+        void from_px_transform(const PxTransform& pose, Vector3& pos, Quaternion& rot)
+        {
+            pos = Vector3(pose.p.x, pose.p.y, pose.p.z);
+            rot = Quaternion(pose.q.x, pose.q.y, pose.q.z, pose.q.w);
+        }
+
+        Vector3 from_px_vec3(const PxVec3& v)
+        {
+            return Vector3(v.x, v.y, v.z);
+        }
+
+        PxVec3 to_px_vec3(const Vector3& v)
+        {
+            return PxVec3(v.x, v.y, v.z);
+        }
+    }
+
+    Physics::Physics(Entity* entity) : Component(entity)
+    {
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_is_static, bool);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_is_kinematic, bool);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_mass, float);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_friction, float);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_friction_rolling, float);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_restitution, float);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_position_lock, Vector3);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_rotation_lock, Vector3);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_center_of_mass, Vector3);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_velocity, Vector3);
+        // runtime physx handles must not be copied through generic component attributes
+        SP_REGISTER_ATTRIBUTE_VALUE_SET(m_body_type, SetBodyType, BodyType);
+
+        lock_guard<recursive_mutex> lock(PhysicsWorld::GetMutex());
+        buoyancy::bodies.push_back(this);
+    }
+
+    car::Simulation* Physics::EnsureVehicleSimulation()
+    {
+        if (!m_vehicle_simulation)
+        {
+            m_vehicle_simulation = make_unique<car::Simulation>();
+            m_vehicle_simulation->set_telemetry_path("car_telemetry_" + to_string(GetEntity()->GetObjectId()) + ".csv");
+        }
+        return m_vehicle_simulation.get();
+    }
+
+    uint32_t Physics::GetVehicleCollisionGroup() const
+    {
+        return m_vehicle_simulation ? m_vehicle_simulation->multibody_collision_group() : 0;
+    }
+
+    Physics::~Physics()
+    {
+        {
+            lock_guard<recursive_mutex> lock(PhysicsWorld::GetMutex());
+            buoyancy::bodies.erase(remove(buoyancy::bodies.begin(), buoyancy::bodies.end(), this), buoyancy::bodies.end());
+        }
+
+        Remove();
+    }
+
+    void Physics::Initialize()
+    {
+        Component::Initialize();
+    }
+
+    BodyType Physics::DetectBodyType()
+    {
+        Render* render = GetEntity()->GetComponent<Render>();
+        if (render)
+        {
+            // check if the mesh is a simple primitive shape (case-insensitive)
+            string mesh_name = render->GetMeshName();
+            transform(mesh_name.begin(), mesh_name.end(), mesh_name.begin(), ::tolower);
+
+            if (mesh_name.find("cube") != string::npos || mesh_name.find("box") != string::npos)
+            {
+                return BodyType::Box;
+            }
+            else if (mesh_name.find("sphere") != string::npos)
+            {
+                return BodyType::Sphere;
+            }
+            else if (mesh_name.find("capsule") != string::npos || mesh_name.find("cylinder") != string::npos)
+            {
+                return BodyType::Capsule;
+            }
+            else if (mesh_name.find("plane") != string::npos || mesh_name.find("quad") != string::npos)
+            {
+                return BodyType::Plane;
+            }
+            else
+            {
+                // default to mesh collision for complex shapes
+                return BodyType::Mesh;
+            }
+        }
+
+        // no render - default to box (common for invisible colliders/triggers)
+        return BodyType::Box;
+    }
+
+    void Physics::Shutdown()
+    {
+        // release the controller manager (created lazily when first controller is made)
+        if (controller_manager)
+        {
+            controller_manager->release();
+            controller_manager = nullptr;
+        }
+    }
+
+    void Physics::Remove()
+    {
+        // serialize physx writes, async scene loading runs this on worker threads in parallel
+        lock_guard<recursive_mutex> physx_lock(PhysicsWorld::GetMutex());
+
+        PhysicsWorld::UnregisterVehicleStepCallback(this);
+        if (m_vehicle_simulation && m_vehicle_simulation->get_body())
+        {
+            PhysicsWorld::RemoveActor(
+                m_vehicle_simulation->get_body()
+            );
+            m_vehicle_simulation->destroy();
+            m_actors.clear();
+            m_actors_active.clear();
+        }
+
+        // release controller if it exists
+        // skip if controller_manager was already released during shutdown
+        if (m_controller && controller_manager)
+        {
+            static_cast<PxController*>(m_controller)->release();
+            m_controller = nullptr;
+        }
+
+        // release all actors
+        // skip if physics world was already shut down (scene is null)
+        for (auto* body : m_actors)
+        {
+            if (body && PhysicsWorld::GetScene())
+            {
+                PxRigidActor* actor = static_cast<PxRigidActor*>(body);
+                PhysicsWorld::RemoveActor(actor);
+                actor->release();
+            }
+        }
+        m_actors.clear();
+        m_actors_active.clear();
+
+        // release material (shared by both controller and regular bodies)
+        // skip if physics world was already shut down
+        if (m_material && PhysicsWorld::GetPhysics())
+        {
+            static_cast<PxMaterial*>(m_material)->release();
+            m_material = nullptr;
+        }
+
+        // terrain regenerates often, a leaked grid holds tens of megabytes per rebuild
+        if (m_mesh && m_mesh_is_heightfield)
+        {
+            if (PhysicsWorld::GetPhysics())
+            {
+                static_cast<PxHeightField*>(m_mesh)->release();
+            }
+            m_mesh                 = nullptr;
+            m_mesh_is_heightfield  = false;
+        }
+
+        // release cloth state
+        m_cloth_particles.clear();
+        m_cloth_constraints.clear();
+        m_cloth_indices.clear();
+        m_cloth_base_vertices.clear();
+        m_cloth_weld_map.clear();
+        m_cloth_vertex_count         = 0;
+        m_cloth_global_vertex_offset = 0;
+    }
+
+    void Physics::PreTick()
+    {
+        // physx treats a main thread write during worker actor creation as concurrent access and corrupts its pruner tree
+        if (ProgressTracker::IsLoading())
+        {
+            return;
+        }
+
+        // deferred creation after loading (render component needs to be available first)
+        if (m_needs_creation)
+        {
+            m_needs_creation = false;
+            Create();
+        }
+
+        // sync physics transforms to entities before other components (like camera) tick
+        // this ensures child entities have up-to-date parent transforms when they compute matrices
+        const bool is_playing  = Engine::IsFlagSet(EngineMode::Playing);
+        const float delta_time = static_cast<float>(Timer::GetDeltaTimeSec());
+
+        if (!is_playing)
+        {
+            UpdateShapeGeometry();
+        }
+
+        switch (m_body_type)
+        {
+            case BodyType::Controller:
+                TickController(is_playing, delta_time);
+                break;
+
+            case BodyType::Vehicle:
+                TickVehicle(is_playing);
+                break;
+
+            case BodyType::Cloth:
+                TickCloth(is_playing, delta_time);
+                break;
+
+            default:
+                if (!m_is_static)
+                {
+                    TickDynamicBodies(is_playing);
+                }
+                else if (!is_playing)
+                {
+                    SyncStaticPoses();
+                }
+                break;
+        }
+    }
+
+    void Physics::Tick()
+    {
+        // the entity is published before Create finishes appending actors, so reading m_actors here would race
+        if (ProgressTracker::IsLoading())
+        {
+            return;
+        }
+
+        // distance-based activation/deactivation for static actors
+        if (
+            m_body_type != BodyType::Controller &&
+            m_body_type != BodyType::Cloth &&
+            m_is_static
+        )
+        {
+            TickDistanceActivation();
+        }
+    }
+
+    void Physics::TickController(bool is_playing, float delta_time)
+    {
+        if (!m_controller)
+        {
+            return;
+        }
+
+        PxCapsuleController* controller = static_cast<PxCapsuleController*>(m_controller);
+
+        if (is_playing)
+        {
+            // the editor camera can end up under the terrain, lift the capsule out so it falls onto the surface instead of being trapped
+            if (!m_controller_was_playing)
+            {
+                LiftControllerAboveTerrain();
+            }
+            m_controller_was_playing = true;
+
+            // apply gravity
+            m_velocity.y += PhysicsWorld::GetGravity().y * delta_time;
+
+            // buoyancy, the fft water pushes the capsule up toward a waterline above its center, drag damps the bob
+            {
+                PxExtendedVec3 position = controller->getPosition();
+                float water_height      = 0.0f;
+                if (Renderer::GetOceanHeight(static_cast<float>(position.x), static_cast<float>(position.z), water_height))
+                {
+                    const float waterline = 0.25f; // meters above the capsule center the water settles at
+                    const float depth     = water_height - (static_cast<float>(position.y) + waterline);
+                    if (depth > 0.0f)
+                    {
+                        const float buoyancy_gain = 30.0f; // upward acceleration per meter of submersion
+                        const float water_drag    = 11.0f; // near critical damping for the gain above, settles without bobbing past the waterline
+                        m_velocity.y += (depth * buoyancy_gain - m_velocity.y * water_drag) * delta_time;
+                    }
+                }
+            }
+
+            // move controller
+            PxControllerFilters filters;
+            filters.mFilterFlags = PxQueryFlag::eSTATIC | PxQueryFlag::eDYNAMIC;
+            PxControllerCollisionFlags collision_flags = controller->move(PxVec3(0.0f, m_velocity.y * delta_time, 0.0f), 0.001f, delta_time, filters);
+
+            // reset vertical velocity on ground collision
+            if (collision_flags & PxControllerCollisionFlag::eCOLLISION_DOWN)
+            {
+                m_velocity.y = 0.0f;
+            }
+
+            // sync physx -> entity position and compute xz velocity
+            PxExtendedVec3 pos_ext   = controller->getPosition();
+            Vector3 pos_previous     = GetEntity()->GetPosition();
+            Vector3 pos              = Vector3(static_cast<float>(pos_ext.x), static_cast<float>(pos_ext.y), static_cast<float>(pos_ext.z));
+            GetEntity()->SetPosition(pos);
+
+            if (delta_time > 0.0f)
+            {
+                m_velocity.x = (pos.x - pos_previous.x) / delta_time;
+                m_velocity.z = (pos.z - pos_previous.z) / delta_time;
+            }
+        }
+        else
+        {
+            // editor mode: sync entity -> physx
+            Vector3 entity_pos = GetEntity()->GetPosition();
+            controller->setPosition(PxExtendedVec3(entity_pos.x, entity_pos.y, entity_pos.z));
+            m_velocity               = Vector3::Zero;
+            m_controller_was_playing = false;
+        }
+    }
+
+    void Physics::LiftControllerAboveTerrain()
+    {
+        Terrain* terrain = Terrain::FindActive();
+        if (!m_controller || !terrain)
+        {
+            return;
+        }
+
+        PxCapsuleController* controller = static_cast<PxCapsuleController*>(m_controller);
+        PxExtendedVec3 position         = controller->getPosition();
+        float terrain_height            = 0.0f;
+        if (!terrain->SampleHeight(static_cast<float>(position.x), static_cast<float>(position.z), terrain_height))
+        {
+            return;
+        }
+
+        // the controller position is the capsule center, its feet sit half the height plus one radius below it
+        const float feet_offset = controller->getHeight() * 0.5f + controller->getRadius();
+        const float minimum_y   = terrain_height + feet_offset;
+        if (static_cast<float>(position.y) >= minimum_y)
+        {
+            return;
+        }
+
+        // a small lift keeps the capsule from resolving against the surface it just left
+        const float clearance = 0.1f;
+        const Vector3 lifted  = Vector3(static_cast<float>(position.x), minimum_y + clearance, static_cast<float>(position.z));
+        controller->setPosition(PxExtendedVec3(lifted.x, lifted.y, lifted.z));
+        GetEntity()->SetPosition(lifted);
+        m_velocity = Vector3::Zero;
+    }
+
+    void Physics::TickVehicle(bool is_playing)
+    {
+        if (!m_vehicle_simulation_active || m_actors.empty() || !m_actors[0])
+        {
+            return;
+        }
+
+        PxRigidActor* actor = static_cast<PxRigidActor*>(m_actors[0]);
+
+        if (is_playing)
+        {
+            // driven from PhysicsWorld's substep callback so forces stay in lockstep with the integration, otherwise the chassis wobbles
+
+            // get the raw physx pose, this is the same pose used by the wheel debug shapes
+            Vector3 physics_pos;
+            Quaternion physics_rot;
+            from_px_transform(actor->getGlobalPose(), physics_pos, physics_rot);
+
+            // extrapolate the leftover time so the chassis stays smooth between fixed steps, bounded by one physx step
+            PxRigidDynamic* dynamic         = actor->is<PxRigidDynamic>();
+            Vector3 physics_vel             = dynamic ? from_px_vec3(dynamic->getLinearVelocity())  : Vector3::Zero;
+            Vector3 physics_ang_vel         = dynamic ? from_px_vec3(dynamic->getAngularVelocity()) : Vector3::Zero;
+            float leftover_time             = PhysicsWorld::GetInterpolationAlpha() * PhysicsWorld::GetFixedTimeStep();
+            Vector3 render_pos              = physics_pos + physics_vel * leftover_time;
+            Quaternion render_rot           = physics_rot;
+            float ang_speed                 = physics_ang_vel.Length();
+            if (ang_speed > 0.001f)
+            {
+                Vector3 axis         = physics_ang_vel / ang_speed;
+                float angle          = ang_speed * leftover_time;
+                Quaternion delta_rot = Quaternion::FromAxisAngle(axis, angle);
+                render_rot           = delta_rot * physics_rot;
+                render_rot.Normalize();
+            }
+            m_vehicle_physics_position = physics_pos;
+            m_vehicle_physics_rotation = physics_rot;
+            m_vehicle_render_position  = render_pos;
+            m_vehicle_render_rotation  = render_rot;
+            GetEntity()->SetPosition(render_pos);
+            GetEntity()->SetRotation(render_rot);
+
+            // update wheel visuals
+            if (m_vehicle_sim_mode == VehicleSimMode::Cheap)
+            {
+                UpdateCheapWheelTransforms();
+            }
+            else
+            {
+                UpdateWheelTransforms();
+            }
+
+            // tick the car (input, camera, sounds, telemetry)
+            if (m_car)
+            {
+                m_car->Tick();
+            }
+        }
+        else
+        {
+            // editor mode: sync entity -> physx, reset velocities
+            m_wheel_offsets_synced      = false;
+            m_interpolation_initialized = false;
+            m_vehicle_physics_position  = GetEntity()->GetPosition();
+            m_vehicle_physics_rotation  = GetEntity()->GetRotation();
+            m_vehicle_render_position   = m_vehicle_physics_position;
+            m_vehicle_render_rotation   = m_vehicle_physics_rotation;
+
+            actor->setGlobalPose(to_px_transform(GetEntity()->GetPosition(), GetEntity()->GetRotation()));
+
+            if (PxRigidDynamic* dynamic = actor->is<PxRigidDynamic>())
+            {
+                dynamic->setLinearVelocity(PxVec3(0, 0, 0));
+                dynamic->setAngularVelocity(PxVec3(0, 0, 0));
+            }
+
+            // still tick so play stop can restore skeleton body visibility and m_was_playing
+            if (m_car)
+            {
+                m_car->Tick();
+            }
+        }
+    }
+
+    void Physics::TickVehicleSubstep(float dt)
+    {
+        if (!m_vehicle_simulation_active || m_actors.empty() || !m_actors[0])
+        {
+            return;
+        }
+
+        if (m_vehicle_simulation_interval > 0.0f)
+        {
+            m_vehicle_simulation_accumulator += dt;
+            if (m_vehicle_simulation_accumulator + 0.000001f < m_vehicle_simulation_interval)
+            {
+                return;
+            }
+            dt = m_vehicle_simulation_accumulator;
+            m_vehicle_simulation_accumulator = 0.0f;
+            m_vehicle_simulation->clear_force_accumulators();
+        }
+
+        if (m_vehicle_sim_mode == VehicleSimMode::Cheap)
+        {
+            TickVehicleCheapSubstep(dt);
+            return;
+        }
+
+        // sync wheel offsets once at start of play
+        if (!m_wheel_offsets_synced)
+        {
+            SyncWheelOffsetsFromEntities();
+            m_wheel_offsets_synced = true;
+        }
+
+        // force model runs immediately before physx simulation for the same fixed step
+        m_vehicle_simulation->tick(dt);
+
+        // surface classification intentionally reaches tire forces one substep later
+        // actor caching avoids repeated entity name classification
+        for (int i = 0; i < car::wheel_count; i++)
+        {
+            const PxRigidActor* ground = m_vehicle_simulation->get_wheel_state(i).contact_actor;
+            if (ground != m_wheel_ground_actors[i])
+            {
+                m_wheel_ground_actors[i]   = ground;
+                m_wheel_ground_surfaces[i] = static_cast<uint8_t>(classify_ground_actor(ground));
+            }
+            m_vehicle_simulation->set_wheel_surface(i, static_cast<car::surface_type>(m_wheel_ground_surfaces[i]));
+        }
+    }
+
+    void Physics::TickVehicleCheapSubstep(float dt)
+    {
+        PxRigidDynamic* body = m_vehicle_simulation->get_body();
+        if (!body || dt <= 0.0f)
+        {
+            return;
+        }
+
+        // pedals land in input_target, cheap mode still needs the smooth copy into input
+        m_vehicle_simulation->update_input(dt);
+
+        // cheap cars are held at ride height, gravity would sink the chassis hull into the road
+        body->setActorFlag(PxActorFlag::eDISABLE_GRAVITY, true);
+
+        const car::car_preset& spec = m_vehicle_simulation->get_spec();
+        const float wheelbase = std::max(spec.wheelbase > 0.0f ? spec.wheelbase : 2.7f, 1.5f);
+        const float max_steer = std::clamp(
+            spec.max_steer_angle > 0.0f ? spec.max_steer_angle : 0.6f,
+            0.25f,
+            0.9f
+        );
+        const float wheel_radius = std::max(
+            (spec.front_wheel_radius + spec.rear_wheel_radius) * 0.5f,
+            0.2f
+        );
+        // body origin sits wheel radius plus suspension height above the road, same as full sim spawn
+        const float ride_height = wheel_radius + std::max(m_vehicle_simulation->get_config().suspension_height, 0.1f);
+        const float accel = 8.0f;
+        const float brake_decel = 14.0f;
+        const float lateral_damp = 10.0f;
+        const float drag = 0.35f;
+
+        Vector3 position;
+        Quaternion rotation;
+        from_px_transform(body->getGlobalPose(), position, rotation);
+
+        // snap height to the road so wheels sit on the surface
+        Vector3 hit_position;
+        const Vector3 ray_origin = position + Vector3::Up * 3.0f;
+        if (PhysicsWorld::RaycastStatic(ray_origin, Vector3::Down, 8.0f, hit_position))
+        {
+            position.y = hit_position.y + ride_height;
+            body->setGlobalPose(
+                PxTransform(
+                    PxVec3(position.x, position.y, position.z),
+                    PxQuat(rotation.x, rotation.y, rotation.z, rotation.w)
+                )
+            );
+        }
+
+        Vector3 forward = rotation * Vector3::Forward;
+        forward.y = 0.0f;
+        if (forward.LengthSquared() > 0.0001f)
+        {
+            forward.Normalize();
+        }
+        else
+        {
+            forward = Vector3::Forward;
+        }
+        Vector3 right = rotation * Vector3::Right;
+        right.y = 0.0f;
+        if (right.LengthSquared() > 0.0001f)
+        {
+            right.Normalize();
+        }
+        else
+        {
+            right = Vector3::Right;
+        }
+
+        PxVec3 px_vel = body->getLinearVelocity();
+        Vector3 velocity(px_vel.x, 0.0f, px_vel.z);
+        const float forward_speed = Vector3::Dot(velocity, forward);
+        const float lateral_speed = Vector3::Dot(velocity, right);
+
+        const float throttle = std::clamp(m_vehicle_simulation->get_throttle(), 0.0f, 1.0f);
+        const float brake = std::clamp(m_vehicle_simulation->get_brake(), 0.0f, 1.0f);
+        const float steer = std::clamp(m_vehicle_simulation->get_steering(), -1.0f, 1.0f);
+        const float handbrake = std::clamp(m_vehicle_simulation->get_handbrake(), 0.0f, 1.0f);
+
+        float drive = throttle * accel;
+        if (fabsf(forward_speed) > 0.5f)
+        {
+            drive -= brake * brake_decel * (forward_speed >= 0.0f ? 1.0f : -1.0f);
+        }
+        else if (brake > throttle)
+        {
+            // arcade reverse when nearly stopped
+            drive = -brake * accel * 0.65f;
+        }
+        drive -= handbrake * brake_decel * (forward_speed >= 0.0f ? 1.0f : -1.0f) * 0.75f;
+
+        Vector3 planar_velocity = forward * forward_speed + right * lateral_speed;
+        planar_velocity += forward * (drive * dt);
+        planar_velocity -= right * lateral_speed * std::clamp(lateral_damp * dt, 0.0f, 1.0f);
+        planar_velocity *= std::max(1.0f - drag * dt, 0.0f);
+        velocity.x = planar_velocity.x;
+        velocity.y = 0.0f;
+        velocity.z = planar_velocity.z;
+
+        const float signed_speed = Vector3::Dot(velocity, forward);
+        const float steer_speed_scale = std::clamp(fabsf(signed_speed) / 12.0f, 0.0f, 1.0f);
+        m_cheap_steer_angle = steer * max_steer * (0.35f + 0.65f * steer_speed_scale);
+        float yaw_rate = 0.0f;
+        if (fabsf(signed_speed) > 0.2f)
+        {
+            yaw_rate = (signed_speed / wheelbase) * tanf(m_cheap_steer_angle);
+        }
+
+        body->setLinearVelocity(PxVec3(velocity.x, 0.0f, velocity.z));
+        body->setAngularVelocity(PxVec3(0.0f, yaw_rate, 0.0f));
+        body->wakeUp();
+
+        const float roll_speed = signed_speed / std::max(wheel_radius, 0.05f);
+        m_cheap_wheel_roll += roll_speed * dt;
+    }
+
+    void Physics::TickDynamicBodies(bool is_playing)
+    {
+        Render* render = GetEntity()->GetComponent<Render>();
+        if (!render)
+        {
+            return;
+        }
+
+        for (uint32_t i = 0; i < static_cast<uint32_t>(m_actors.size()); i++)
+        {
+            if (!m_actors[i])
+            {
+                continue;
+            }
+
+            PxRigidActor* actor     = static_cast<PxRigidActor*>(m_actors[i]);
+            PxRigidDynamic* dynamic = actor->is<PxRigidDynamic>();
+
+            // get transform (from instance or entity)
+            auto get_transform = [&]() -> math::Matrix
+            {
+                if (render->HasInstancing() && i < render->GetInstanceCount())
+                {
+                    return render->GetInstance(i, true);
+                }
+                if (i == 0)
+                {
+                    return GetEntity()->GetMatrix();
+                }
+                return math::Matrix(); // invalid - caller should skip
+            };
+
+            if (is_playing)
+            {
+                if (m_is_kinematic && dynamic)
+                {
+                    // sync entity -> physx (kinematic target)
+                    math::Matrix transform = get_transform();
+                    if (transform == math::Matrix())
+                    {
+                        continue;
+                    }
+                    dynamic->setKinematicTarget(to_px_transform(transform));
+                }
+                else
+                {
+                    // sync physx -> entity (simulated dynamic)
+                    if (i == 0)
+                    {
+                        Vector3 pos;
+                        Quaternion rot;
+                        from_px_transform(actor->getGlobalPose(), pos, rot);
+                        GetEntity()->SetPosition(pos);
+                        GetEntity()->SetRotation(rot);
+                    }
+                }
+            }
+            else
+            {
+                // editor mode: sync entity -> physx
+                math::Matrix transform = get_transform();
+                if (transform == math::Matrix())
+                {
+                    continue;
+                }
+
+                actor->setGlobalPose(to_px_transform(transform));
+
+                // reset velocities for non-kinematics
+                if (dynamic && !m_is_kinematic)
+                {
+                    dynamic->setLinearVelocity(PxVec3(0, 0, 0));
+                    dynamic->setAngularVelocity(PxVec3(0, 0, 0));
+                }
+            }
+        }
+    }
+
+    void Physics::TickBuoyancy()
+    {
+        // called from the fixed step loop which already holds the physx mutex
+        for (Physics* body : buoyancy::bodies)
+        {
+            body->ApplyBuoyancy();
+        }
+    }
+
+    void Physics::ApplyBuoyancy()
+    {
+        if (!m_enabled || m_is_static || m_is_kinematic)
+        {
+            return;
+        }
+
+        // the controller floats in TickController, vehicles and cloth have their own force models
+        if (m_body_type == BodyType::Controller || m_body_type == BodyType::Vehicle || m_body_type == BodyType::Cloth || m_body_type == BodyType::Plane)
+        {
+            return;
+        }
+
+        const float volume = ComputeVolume();
+        if (volume <= 0.0f)
+        {
+            return;
+        }
+
+        const float gravity = -PhysicsWorld::GetGravity().y;
+        for (void* entry : m_actors)
+        {
+            PxRigidActor* actor     = static_cast<PxRigidActor*>(entry);
+            PxRigidDynamic* dynamic = actor ? actor->is<PxRigidDynamic>() : nullptr;
+            if (!dynamic)
+            {
+                continue;
+            }
+
+            const PxBounds3 bounds  = actor->getWorldBounds();
+            const PxVec3 center     = bounds.getCenter();
+            const PxVec3 extents    = bounds.getExtents();
+            const float body_height = max(bounds.getDimensions().y, 0.01f);
+
+            // four sample points around the footprint, each carries a quarter of the displaced volume,
+            // applied off center so a wave slope produces torque and the body pitches and rolls with the swell
+            const float span_x = max(extents.x * 0.7f, 0.25f);
+            const float span_z = max(extents.z * 0.7f, 0.25f);
+            const PxVec3 offsets[4] =
+            {
+                PxVec3( span_x, 0.0f, 0.0f),
+                PxVec3(-span_x, 0.0f, 0.0f),
+                PxVec3(0.0f, 0.0f,  span_z),
+                PxVec3(0.0f, 0.0f, -span_z)
+            };
+
+            // archimedes capped so light bodies stay stable, split across the sample points
+            const float force_per_point = min(buoyancy::water_density * gravity * volume, dynamic->getMass() * buoyancy::max_accel) * 0.25f;
+
+            float heights[4] = {};
+            bool heights_valid = true;
+            for (uint32_t i = 0; i < 4; i++)
+            {
+                const PxVec3 point = center + offsets[i];
+                if (!Renderer::GetOceanHeight(point.x, point.z, heights[i]))
+                {
+                    heights_valid = false;
+                    break;
+                }
+            }
+
+            if (!heights_valid)
+            {
+                continue;
+            }
+
+            float submersion = 0.0f;
+            for (uint32_t i = 0; i < 4; i++)
+            {
+                const PxVec3 point = center + offsets[i];
+                const float depth = heights[i] - bounds.minimum.y;
+                if (depth <= 0.0f)
+                {
+                    continue;
+                }
+
+                const float point_submersion = min(depth / body_height, 1.0f);
+                submersion                  += point_submersion * 0.25f;
+                PxRigidBodyExt::addForceAtPos(*dynamic, PxVec3(0.0f, force_per_point * point_submersion, 0.0f), point, PxForceMode::eFORCE);
+            }
+
+            if (submersion <= 0.0f)
+            {
+                continue;
+            }
+
+            // the per point force differential is too weak to visibly rotate a small body, so also steer the
+            // body up axis toward the wave normal built from the same samples, this is what makes floats wobble
+            PxVec3 water_normal = PxVec3((heights[1] - heights[0]) / (2.0f * span_x), 1.0f, (heights[3] - heights[2]) / (2.0f * span_z));
+            water_normal        = water_normal.getNormalized();
+            const PxVec3 up     = dynamic->getGlobalPose().q.getBasisVector1();
+            dynamic->addTorque(up.cross(water_normal) * buoyancy::align_gain * submersion, PxForceMode::eACCELERATION);
+
+            // water resistance, heave is damped near critically so floats ride the surface instead of oscillating past it
+            const PxVec3 velocity = dynamic->getLinearVelocity();
+            const PxVec3 drag     = PxVec3(velocity.x * buoyancy::drag_horizontal, velocity.y * buoyancy::drag_vertical, velocity.z * buoyancy::drag_horizontal);
+            dynamic->addForce(drag * -submersion, PxForceMode::eACCELERATION);
+            dynamic->addTorque(dynamic->getAngularVelocity() * -buoyancy::drag_angular * submersion, PxForceMode::eACCELERATION);
+        }
+    }
+
+    // editor only, keeps a static body under a hand moved entity
+    //
+    // the entity matrix is hoisted and tested first, rewriting a pose rewrites the static pruner entry
+    // behind it, and a scattered prop owns one actor per copy, so doing that unconditionally every frame
+    // costs more than the rest of the scene put together
+    void Physics::SyncStaticPoses()
+    {
+        const Matrix matrix = GetEntity()->GetMatrix();
+        if (matrix == m_transform_previous)
+        {
+            return;
+        }
+        m_transform_previous = matrix;
+
+        Render* render      = GetEntity()->GetComponent<Render>();
+        const bool instanced = render && render->HasInstancing();
+
+        for (uint32_t i = 0; i < static_cast<uint32_t>(m_actors.size()); i++)
+        {
+            PxRigidActor* actor = static_cast<PxRigidActor*>(m_actors[i]);
+            if (!actor)
+            {
+                continue;
+            }
+
+            // an instanced render owns one actor per copy, writing the entity matrix into all of them
+            // stacks every hull on the entity origin instead of leaving them where they were scattered
+            actor->setGlobalPose(to_px_transform(instanced ? render->GetInstance(i, true) : matrix));
+        }
+    }
+
+    void Physics::TickDistanceActivation()
+    {
+        Camera* camera = World::GetCamera();
+        Render* render = GetEntity()->GetComponent<Render>();
+        if (!camera || !render)
+        {
+            return;
+        }
+
+        const Vector3 camera_pos = camera->GetEntity()->GetPosition();
+
+        // ensure tracking vector matches actor count
+        if (m_actors_active.size() != m_actors.size())
+        {
+            m_actors_active.resize(m_actors.size(), true);
+            m_actors_active_count = static_cast<uint32_t>(m_actors.size());
+        }
+
+        // a scattered prop entity owns one actor per instance, and a populated world has tens of
+        // thousands of them, so walking every instance every frame is the single largest cost in the
+        // editor. they all sit inside one world box, and once the set is fully asleep a box that cannot
+        // reach the activation radius rejects the whole entity in constant time
+        const float box_distance_squared = Vector3::DistanceSquared(
+            camera_pos,
+            render->GetBoundingBox().GetClosestPoint(camera_pos)
+        );
+
+        if (m_actors_active_count == 0 && box_distance_squared > distance_activate_squared)
+        {
+            return;
+        }
+
+        for (uint32_t i = 0; i < static_cast<uint32_t>(m_actors.size()); i++)
+        {
+            PxRigidActor* actor = static_cast<PxRigidActor*>(m_actors[i]);
+            if (!actor)
+            {
+                continue;
+            }
+
+            // compute distance to actor
+            Vector3 closest_point = render->HasInstancing()
+                ? render->GetInstance(i, true).GetTranslation()
+                : render->GetBoundingBox().GetClosestPoint(camera_pos);
+            const float distance_squared = Vector3::DistanceSquared(camera_pos, closest_point);
+
+            // use hysteresis to prevent flickering at boundary
+            const bool is_active = m_actors_active[i];
+            if (is_active && distance_squared > distance_deactivate_squared)
+            {
+                PhysicsWorld::RemoveActor(actor);
+                m_actors_active[i] = false;
+                m_actors_active_count--;
+            }
+            else if (!is_active && distance_squared <= distance_activate_squared)
+            {
+                PhysicsWorld::AddActor(actor);
+                m_actors_active[i] = true;
+                m_actors_active_count++;
+            }
+        }
+    }
+
+    void Physics::Save(pugi::xml_node& node)
+    {
+        node.append_attribute("mass")             = m_mass;
+        node.append_attribute("friction")         = m_friction;
+        node.append_attribute("friction_rolling") = m_friction_rolling;
+        node.append_attribute("restitution")      = m_restitution;
+        node.append_attribute("is_static")        = m_is_static;
+        node.append_attribute("is_kinematic")     = m_is_kinematic;
+        node.append_attribute("position_lock_x")  = m_position_lock.x;
+        node.append_attribute("position_lock_y")  = m_position_lock.y;
+        node.append_attribute("position_lock_z")  = m_position_lock.z;
+        node.append_attribute("rotation_lock_x")  = m_rotation_lock.x;
+        node.append_attribute("rotation_lock_y")  = m_rotation_lock.y;
+        node.append_attribute("rotation_lock_z")  = m_rotation_lock.z;
+        node.append_attribute("center_of_mass_x") = m_center_of_mass.x;
+        node.append_attribute("center_of_mass_y") = m_center_of_mass.y;
+        node.append_attribute("center_of_mass_z") = m_center_of_mass.z;
+        node.append_attribute("body_type")        = static_cast<int>(m_body_type);
+
+        // cloth parameters
+        node.append_attribute("cloth_stiffness")      = m_cloth_stiffness;
+        node.append_attribute("cloth_damping")         = m_cloth_damping;
+        node.append_attribute("cloth_iterations")      = m_cloth_iterations;
+        node.append_attribute("cloth_wind_enabled")    = m_cloth_wind_enabled;
+        node.append_attribute("cloth_pin_direction_x") = m_cloth_pin_direction.x;
+        node.append_attribute("cloth_pin_direction_y") = m_cloth_pin_direction.y;
+        node.append_attribute("cloth_pin_direction_z") = m_cloth_pin_direction.z;
+    }
+
+    void Physics::Load(pugi::xml_node& node)
+    {
+        m_mass             = node.attribute("mass").as_float(0.001f);
+        m_friction         = node.attribute("friction").as_float(1.0f);
+        m_friction_rolling = node.attribute("friction_rolling").as_float(0.002f);
+        m_restitution      = node.attribute("restitution").as_float(0.2f);
+        m_is_static        = node.attribute("is_static").as_bool(true);
+        m_is_kinematic     = node.attribute("is_kinematic").as_bool(false);
+        m_position_lock.x  = node.attribute("position_lock_x").as_float(0.0f);
+        m_position_lock.y  = node.attribute("position_lock_y").as_float(0.0f);
+        m_position_lock.z  = node.attribute("position_lock_z").as_float(0.0f);
+        m_rotation_lock.x  = node.attribute("rotation_lock_x").as_float(0.0f);
+        m_rotation_lock.y  = node.attribute("rotation_lock_y").as_float(0.0f);
+        m_rotation_lock.z  = node.attribute("rotation_lock_z").as_float(0.0f);
+        m_center_of_mass.x = node.attribute("center_of_mass_x").as_float(0.0f);
+        m_center_of_mass.y = node.attribute("center_of_mass_y").as_float(0.0f);
+        m_center_of_mass.z = node.attribute("center_of_mass_z").as_float(0.0f);
+        m_body_type        = static_cast<BodyType>(node.attribute("body_type").as_int(static_cast<int>(BodyType::Max)));
+
+        // cloth parameters
+        m_cloth_stiffness    = node.attribute("cloth_stiffness").as_float(0.9f);
+        m_cloth_damping      = node.attribute("cloth_damping").as_float(0.01f);
+        m_cloth_iterations   = node.attribute("cloth_iterations").as_uint(8);
+        m_cloth_wind_enabled = node.attribute("cloth_wind_enabled").as_bool(true);
+        m_cloth_pin_direction.x = node.attribute("cloth_pin_direction_x").as_float(0.0f);
+        m_cloth_pin_direction.y = node.attribute("cloth_pin_direction_y").as_float(1.0f);
+        m_cloth_pin_direction.z = node.attribute("cloth_pin_direction_z").as_float(0.0f);
+        m_cloth_pin_direction = m_cloth_pin_direction.LengthSquared() > 0.0001f ? m_cloth_pin_direction.Normalized() : Vector3::Up;
+
+        // defer creation until tick so that render component is available
+        // (components load in enum order, and render comes after physics)
+        m_needs_creation = true;
+    }
+
+    void Physics::RegisterForScripting(sol::state_view State)
+    {
+
+        State.new_enum("BodyType",
+            "Box",          BodyType::Box,
+            "Sphere",       BodyType::Sphere,
+            "Plane",        BodyType::Plane,
+            "Capsule",      BodyType::Capsule,
+            "Mesh",         BodyType::Mesh,
+            "MeshConvex",   BodyType::MeshConvex,
+            "Controller",   BodyType::Controller,
+            "Vehicle",      BodyType::Vehicle,
+            "Cloth",        BodyType::Cloth,
+            "Heightfield",  BodyType::Heightfield,
+            "Max",          BodyType::Max);
+
+
+        State.new_enum("WheelIndex",
+            "FrontLeft",    WheelIndex::FrontLeft,
+            "FrontRight",   WheelIndex::FrontRight,
+            "RearLeft",     WheelIndex::RearLeft,
+            "RearRight",    WheelIndex::RearRight,
+            "Count",        WheelIndex::Count);
+
+
+        State.new_usertype<Physics>("Physics",
+            sol::base_classes,              sol::bases<Component>(),
+
+            "GetMass",                      &Physics::GetMass,
+            "SetMass",                      &Physics::SetMass,
+            "GetFriction",                  &Physics::GetFriction,
+            "SetFriction",                  &Physics::SetFriction,
+            "GetFrictionRolling",           &Physics::GetFrictionRolling,
+            "SetFrictionRolling",           &Physics::SetFrictionRolling,
+            "GetRestitution",               &Physics::GetRestitution,
+            "SetRestitution",               &Physics::SetRestitution,
+
+            "SetLinearVelocity",            &Physics::SetLinearVelocity,
+            "GetLinearVelocity",            &Physics::GetLinearVelocity,
+            "SetAngularVelocity",           &Physics::SetAngularVelocity,
+
+            "SetCenterOfMass",              &Physics::SetCenterOfMass,
+            "GetCenterOfMass",              &Physics::GetCenterOfMass,
+
+            "GetCapsuleVolume",             &Physics::GetCapsuleVolume,
+            "GetCapsuleRadius",             &Physics::GetCapsuleRadius,
+
+            "SetVehicleThrottle",           &Physics::SetVehicleThrottle,
+            "SetVehicleBrake",              &Physics::SetVehicleBrake,
+            "SetVehicleSteering",           &Physics::SetVehicleSteering,
+            "SetVehicleHandbrake",          &Physics::SetVehicleHandbrake,
+
+            "SetWheelEntity",               &Physics::SetWheelEntity,
+            "GetWheelEntity",               &Physics::GetWheelEntity,
+
+            "SetChassisEntity",             &Physics::SetChassisEntity,
+            "GetChassisEntity",             &Physics::GetChassisEntity,
+
+            "SetWheelRadius",               &Physics::SetWheelRadius,
+            "GetWheelRadius",               &Physics::GetWheelRadius,
+            "GetSuspensionHeight",          &Physics::GetSuspensionHeight,
+            "ComputeWheelRadiusFromEntity", &Physics::ComputeWheelRadiusFromEntity,
+
+            "GetVehicleThrottle",           &Physics::GetVehicleThrottle,
+            "GetVehicleBrake",              &Physics::GetVehicleBrake,
+            "GetVehicleSteering",           &Physics::GetVehicleSteering,
+            "GetVehicleHandbrake",          &Physics::GetVehicleHandbrake,
+            "IsWheelGrounded",              &Physics::IsWheelGrounded,
+            "GetWheelCompression",          &Physics::GetWheelCompression,
+            "GetWheelSuspensionForce",      &Physics::GetWheelSuspensionForce,
+            "GetWheelContactPoint",         &Physics::GetWheelContactPoint,
+            "GetWheelContactNormal",        &Physics::GetWheelContactNormal,
+            "GetWheelWidth",                &Physics::GetWheelWidth,
+            "GetWheelSlipAngle",            &Physics::GetWheelSlipAngle,
+            "GetWheelSlipRatio",            &Physics::GetWheelSlipRatio,
+            "GetWheelSlipMagnitude",        &Physics::GetWheelSlipMagnitude,
+            "GetWheelTireLoad",             &Physics::GetWheelTireLoad,
+            "GetWheelLateralForce",         &Physics::GetWheelLateralForce,
+            "GetWheelLongitudinalForce",    &Physics::GetWheelLongitudinalForce,
+            "GetWheelAngularVelocity",      &Physics::GetWheelAngularVelocity,
+            "GetWheelRPM",                  &Physics::GetWheelRPM,
+            "GetWheelTemperature",          &Physics::GetWheelTemperature,
+            "GetWheelTempGripFactor",       &Physics::GetWheelTempGripFactor,
+            "GetWheelBrakeTemp",            &Physics::GetWheelBrakeTemp,
+            "GetWheelBrakeEfficiency",      &Physics::GetWheelBrakeEfficiency,
+
+
+            "SetAbsEnabled",                &Physics::SetAbsEnabled,
+            "GetAbsEnabled",                &Physics::GetAbsEnabled,
+            "IsAbsActive",                  &Physics::IsAbsActive,
+            "IsAbsActiveAny",               &Physics::IsAbsActiveAny,
+
+            "SetTcEnabled",                 &Physics::SetTcEnabled,
+            "GetTcEnabled",                 &Physics::GetTcEnabled,
+            "IsTcActive",                   &Physics::IsTcActive,
+            "GetTcReduction",               &Physics::GetTcReduction,
+
+            "SetTurboEnabled",              &Physics::SetTurboEnabled,
+            "GetTurboEnabled",              &Physics::GetTurboEnabled,
+            "GetBoostPressure",             &Physics::GetBoostPressure,
+            "GetBoostMaxPressure",          &Physics::GetBoostMaxPressure,
+
+            "SetDrsEnabled",                &Physics::SetDrsEnabled,
+            "GetDrsEnabled",                &Physics::GetDrsEnabled,
+            "SetDrsActive",                 &Physics::SetDrsActive,
+            "GetDrsActive",                 &Physics::GetDrsActive,
+
+            "SetDiffType",                  &Physics::SetDiffType,
+            "GetDiffType",                  &Physics::GetDiffType,
+            "GetDiffTypeName",              &Physics::GetDiffTypeName,
+
+            "GetWheelWear",                 &Physics::GetWheelWear,
+            "GetWheelWearGripFactor",       &Physics::GetWheelWearGripFactor,
+            "ResetTireWear",                &Physics::ResetTireWear,
+
+            "SetManualTransmission",        &Physics::SetManualTransmission,
+            "GetManualTransmission",        &Physics::GetManualTransmission,
+            "ShiftUp",                      &Physics::ShiftUp,
+            "ShiftDown",                    &Physics::ShiftDown,
+            "ShiftToNeutral",               &Physics::ShiftToNeutral,
+            "GetCurrentGear",               &Physics::GetCurrentGear,
+            "GetCurrentGearString",         &Physics::GetCurrentGearString,
+            "GetEngineRPM",                 &Physics::GetEngineRPM,
+            "GetEngineTorque",              &Physics::GetEngineTorque,
+            "GetMotorTorque",               &Physics::GetMotorTorque,
+            "GetIdleRPM",                   &Physics::GetIdleRPM,
+            "GetRedlineRPM",                &Physics::GetRedlineRPM,
+            "IsShifting",                   &Physics::IsShifting,
+
+            "SyncWheelOffsetsFromEntities", &Physics::SyncWheelOffsetsFromEntities,
+
+            "GetClothStiffness",            &Physics::GetClothStiffness,
+            "SetClothStiffness",            &Physics::SetClothStiffness,
+            "GetClothDamping",              &Physics::GetClothDamping,
+            "SetClothDamping",              &Physics::SetClothDamping,
+            "GetClothIterations",           &Physics::GetClothIterations,
+            "SetClothIterations",           &Physics::SetClothIterations,
+            "GetClothWindEnabled",          &Physics::GetClothWindEnabled,
+            "SetClothWindEnabled",          &Physics::SetClothWindEnabled,
+
+            "IsGrounded",                   &Physics::IsGrounded,
+            "GetGroundEntity",              &Physics::GetGroundEntity,
+            "GetBodyType",                  &Physics::GetBodyType,
+            "SetBodyType",                  &Physics::SetBodyType,
+            "IsStatic",                     &Physics::IsStatic,
+            "SetStatic",                    &Physics::SetStatic
+            );
+
+    }
+
+    sol::reference Physics::AsLua(sol::state_view state)
+    {
+        return sol::make_reference(state, this);
+    }
+
+    void Physics::SetMass(float mass)
+    {
+        // approximate mass from volume
+        if (mass == mass_from_volume)
+        {
+            if (m_body_type == BodyType::Max)
+            {
+                SP_LOG_WARNING("This call will be ignored. You need to set the body type before setting mass from volume.");
+                return;
+            }
+
+            if (m_body_type == BodyType::Plane)
+            {
+                mass = 1.0f; // infinite plane, use default mass
+            }
+            else if (m_body_type == BodyType::Controller)
+            {
+                mass = 70.0f; // approximate human mass
+            }
+            else
+            {
+                constexpr float density = 1000.0f; // kg per cubic meter, water
+                float volume            = ComputeVolume();
+                if (volume > 0.0f)
+                {
+                    mass = volume * density;
+                }
+            }
+        }
+
+        // ensure safe physx mass range
+        m_mass = min(max(mass, 0.001f), 10000.0f);
+
+        if (m_body_type == BodyType::Cloth)
+        {
+            float inverse_mass = 1.0f / m_mass;
+            for (ClothParticle& particle : m_cloth_particles)
+            {
+                if (particle.inverse_mass > 0.0f)
+                {
+                    particle.inverse_mass = inverse_mass;
+                }
+            }
+        }
+
+        // update mass for all dynamic bodies
+        for (auto* body : m_actors)
+        {
+            if (body)
+            {
+                if (PxRigidDynamic* dynamic = static_cast<PxRigidActor*>(body)->is<PxRigidDynamic>())
+                {
+                    dynamic->setMass(m_mass);
+                    // update inertia if center of mass is set
+                    if (m_center_of_mass != Vector3::Zero)
+                    {
+                        PxVec3 p(m_center_of_mass.x, m_center_of_mass.y, m_center_of_mass.z);
+                        PxRigidBodyExt::setMassAndUpdateInertia(*dynamic, m_mass, &p);
+                    }
+                }
+            }
+        }
+    }
+
+    void Physics::SetFriction(float friction)
+    {
+        if (m_friction == friction)
+        {
+            return;
+        }
+
+        if (m_material)
+        {
+            m_friction = friction;
+            static_cast<PxMaterial*>(m_material)->setStaticFriction(m_friction);
+        }
+    }
+
+    void Physics::SetFrictionRolling(float friction_rolling)
+    {
+        if (m_friction_rolling == friction_rolling)
+        {
+            return;
+        }
+
+        if (m_material)
+        {
+            m_friction_rolling = friction_rolling;
+            static_cast<PxMaterial*>(m_material)->setDynamicFriction(m_friction_rolling);
+        }
+    }
+
+    void Physics::SetRestitution(float restitution)
+    {
+        if (m_restitution == restitution)
+        {
+            return;
+        }
+
+        if (m_material)
+        {
+            m_restitution = restitution;
+            static_cast<PxMaterial*>(m_material)->setRestitution(m_restitution);
+        }
+    }
+
+    void Physics::SetLinearVelocity(const Vector3& velocity) const
+    {
+        if (m_body_type == BodyType::Controller)
+        {
+            return;
+        }
+
+        for (auto* body : m_actors)
+        {
+            if (!body)
+            {
+                continue;
+            }
+
+            if (PxRigidDynamic* dynamic = static_cast<PxRigidActor*>(body)->is<PxRigidDynamic>())
+            {
+                dynamic->setLinearVelocity(PxVec3(velocity.x, velocity.y, velocity.z));
+                dynamic->wakeUp();
+            }
+        }
+    }
+
+    Vector3 Physics::GetLinearVelocity() const
+    {
+        if (m_body_type == BodyType::Controller)
+        {
+            if (m_controller)
+            {
+                // for controllers, return the stored velocity used for movement
+                return m_velocity;
+            }
+            return Vector3::Zero;
+        }
+
+        if (m_actors.empty() || !m_actors[0])
+        {
+            return Vector3::Zero;
+        }
+
+        if (PxRigidDynamic* dynamic = static_cast<PxRigidActor*>(m_actors[0])->is<PxRigidDynamic>())
+        {
+            PxVec3 velocity = dynamic->getLinearVelocity();
+            return Vector3(velocity.x, velocity.y, velocity.z);
+        }
+
+        return Vector3::Zero;
+    }
+
+    void Physics::SetAngularVelocity(const Vector3& velocity) const
+    {
+        if (m_body_type == BodyType::Controller)
+        {
+            return;
+        }
+
+        for (auto* body : m_actors)
+        {
+            if (!body)
+            {
+                continue;
+            }
+
+            if (PxRigidDynamic* dynamic = static_cast<PxRigidActor*>(body)->is<PxRigidDynamic>())
+            {
+                dynamic->setAngularVelocity(PxVec3(velocity.x, velocity.y, velocity.z));
+                dynamic->wakeUp();
+            }
+        }
+    }
+
+    void Physics::ApplyForce(const Vector3& force, PhysicsForce mode) const
+    {
+        if (m_body_type == BodyType::Controller)
+        {
+            SP_LOG_WARNING("Don't call ApplyForce on a controller, call Move() instead");
+            return;
+        }
+
+        for (auto* body : m_actors)
+        {
+            if (!body)
+            {
+                continue;
+            }
+
+            if (PxRigidDynamic* dynamic = static_cast<PxRigidActor*>(body)->is<PxRigidDynamic>())
+            {
+                PxForceMode::Enum px_mode = (mode == PhysicsForce::Constant) ? PxForceMode::eFORCE : PxForceMode::eIMPULSE;
+                dynamic->addForce(PxVec3(force.x, force.y, force.z), px_mode);
+                dynamic->wakeUp();
+            }
+        }
+    }
+
+    void Physics::SetPositionLock(bool lock)
+    {
+        SetPositionLock(lock ? Vector3::One : Vector3::Zero);
+    }
+
+    void Physics::SetPositionLock(const Vector3& lock)
+    {
+        if (m_body_type == BodyType::Controller)
+        {
+            return;
+        }
+
+        m_position_lock = lock;
+        for (auto* body : m_actors)
+        {
+            if (PxRigidDynamic* dynamic = static_cast<PxRigidActor*>(body)->is<PxRigidDynamic>())
+            {
+                dynamic->setRigidDynamicLockFlags(build_lock_flags(m_position_lock, m_rotation_lock));
+            }
+        }
+    }
+
+    void Physics::SetRotationLock(bool lock)
+    {
+        SetRotationLock(lock ? Vector3::One : Vector3::Zero);
+    }
+
+    void Physics::SetRotationLock(const Vector3& lock)
+    {
+        if (m_body_type == BodyType::Controller)
+        {
+            return;
+        }
+
+        m_rotation_lock = lock;
+        for (auto* body : m_actors)
+        {
+            if (PxRigidDynamic* dynamic = static_cast<PxRigidActor*>(body)->is<PxRigidDynamic>())
+            {
+                dynamic->setRigidDynamicLockFlags(build_lock_flags(m_position_lock, m_rotation_lock));
+            }
+        }
+    }
+
+    void Physics::SetCenterOfMass(const Vector3& center_of_mass)
+    {
+        if (m_body_type == BodyType::Controller)
+        {
+            return;
+        }
+
+        m_center_of_mass = center_of_mass;
+        for (auto* body : m_actors)
+        {
+            if (!body)
+            {
+                continue;
+            }
+
+            if (PxRigidDynamic* dynamic = static_cast<PxRigidActor*>(body)->is<PxRigidDynamic>())
+            {
+                if (m_center_of_mass != Vector3::Zero)
+                {
+                    PxVec3 p(m_center_of_mass.x, m_center_of_mass.y, m_center_of_mass.z);
+                    PxRigidBodyExt::setMassAndUpdateInertia(*dynamic, m_mass, &p);
+                }
+                else
+                {
+                    // update inertia with default center of mass (0,0,0)
+                    PxRigidBodyExt::setMassAndUpdateInertia(*dynamic, m_mass, nullptr);
+                }
+            }
+        }
+    }
+
+    void Physics::SetBodyType(BodyType type)
+    {
+        if (m_body_type == type)
+        {
+            return;
+        }
+
+        m_body_type = type;
+        if (m_body_type == BodyType::Vehicle)
+        {
+            EnsureVehicleSimulation();
+        }
+        Create();
+    }
+
+    void Physics::SetUseConvexHull(bool enabled)
+    {
+        if (m_use_convex_hull == enabled)
+        {
+            return;
+        }
+
+        m_use_convex_hull = enabled;
+
+        // the cooked shape is baked at create time, so the switch only takes effect on a rebuild
+        if (m_body_type == BodyType::Mesh)
+        {
+            Create();
+        }
+    }
+
+    void Physics::SetVehiclePreset(const car::car_preset& preset)
+    {
+        EnsureVehicleSimulation()->load_car(preset);
+    }
+
+    void Physics::SetVehicleSimulationActive(bool active)
+    {
+        if (m_body_type != BodyType::Vehicle || m_vehicle_simulation_active == active)
+        {
+            return;
+        }
+
+        car::Simulation* simulation = EnsureVehicleSimulation();
+        if (!active)
+        {
+            simulation->set_force_retention(false);
+        }
+        simulation->set_simulation_enabled(active);
+        if (active)
+        {
+            simulation->set_force_retention(m_vehicle_simulation_interval > 0.0f);
+            m_wheel_offsets_synced = false;
+            m_interpolation_initialized = false;
+            if (m_vehicle_sim_mode == VehicleSimMode::Cheap)
+            {
+                simulation->set_mechanism_simulation_enabled(false);
+            }
+        }
+        m_vehicle_simulation_accumulator = 0.0f;
+        m_vehicle_simulation_active = active;
+    }
+
+    void Physics::SetVehicleSimMode(VehicleSimMode mode)
+    {
+        if (m_vehicle_sim_mode == mode)
+        {
+            return;
+        }
+
+        // body not ready yet, remember the mode for create
+        if (m_body_type != BodyType::Vehicle || !m_vehicle_simulation || !m_vehicle_simulation->get_body())
+        {
+            m_vehicle_sim_mode = mode;
+            return;
+        }
+
+        PxRigidDynamic* body = m_vehicle_simulation->get_body();
+        Vector3 position;
+        Quaternion rotation;
+        from_px_transform(body->getGlobalPose(), position, rotation);
+        const Vector3 linear_velocity = GetLinearVelocity();
+        Vector3 angular_velocity = Vector3::Zero;
+        {
+            const PxVec3 px_ang = body->getAngularVelocity();
+            angular_velocity = Vector3(px_ang.x, px_ang.y, px_ang.z);
+        }
+
+        if (mode == VehicleSimMode::Cheap)
+        {
+            CaptureCheapWheelRestPoses();
+            // clear while mechanisms are still simulated, then disable them
+            m_vehicle_simulation->clear_force_accumulators();
+            m_vehicle_simulation->set_mechanism_simulation_enabled(false);
+            body->setActorFlag(PxActorFlag::eDISABLE_GRAVITY, true);
+            m_cheap_wheel_roll = 0.0f;
+            m_cheap_steer_angle = 0.0f;
+            SetBodyTransform(position, rotation, false);
+            SetLinearVelocity(linear_velocity);
+            SetAngularVelocity(angular_velocity);
+        }
+        else
+        {
+            // cheap mode leaves mechanism actors frozen at old world poses while the
+            // chassis keeps moving, re enabling them without a rebuild detonates constraints
+            PxPhysics* physics = static_cast<PxPhysics*>(PhysicsWorld::GetPhysics());
+            PxScene* scene = static_cast<PxScene*>(PhysicsWorld::GetScene());
+            if (!m_vehicle_simulation->ensure_multibody(physics, scene))
+            {
+                SP_LOG_ERROR("failed to build suspension assembly for full sim mode");
+                return;
+            }
+            body->setActorFlag(PxActorFlag::eDISABLE_GRAVITY, false);
+            m_wheel_offsets_synced = false;
+            // rebuild at the current chassis pose with zeroed velocities first
+            SetBodyTransform(position, rotation, true);
+            m_vehicle_simulation->set_mechanism_simulation_enabled(true);
+            // leave velocities zero, restoring cheap chassis speed onto a fresh assembly launches the car
+        }
+
+        m_vehicle_sim_mode = mode;
+        m_vehicle_simulation_accumulator = 0.0f;
+        m_interpolation_initialized = false;
+    }
+
+    void Physics::SetVehicleSimulationFrequency(float frequency)
+    {
+        car::Simulation* simulation = EnsureVehicleSimulation();
+        const float fixed_time_step = PhysicsWorld::GetFixedTimeStep();
+        const float requested_interval = frequency > 0.0f ? 1.0f / frequency : 0.0f;
+        m_vehicle_simulation_interval = requested_interval > fixed_time_step ? requested_interval : 0.0f;
+        m_vehicle_simulation_accumulator = 0.0f;
+        simulation->clear_force_accumulators();
+        simulation->set_force_retention(m_vehicle_simulation_interval > 0.0f);
+    }
+
+    void Physics::SetClothPinDirection(const Vector3& direction)
+    {
+        Vector3 normalized_direction = direction.LengthSquared() > 0.0001f ? direction.Normalized() : Vector3::Up;
+        if (m_cloth_pin_direction == normalized_direction)
+        {
+            return;
+        }
+
+        m_cloth_pin_direction = normalized_direction;
+        if (m_body_type == BodyType::Cloth)
+        {
+            Create();
+        }
+    }
+
+    bool Physics::IsGrounded() const
+    {
+        // only controller bodies support ground queries, avoid spamming a warning for other body types
+        if (m_body_type != BodyType::Controller)
+        {
+            return false;
+        }
+
+        return GetGroundEntity() != nullptr; // eCOLLISION_DOWN is not very reliable (it can flicker), so we use raycasting as a fallback
+    }
+
+    Entity* Physics::GetGroundEntity() const
+    {
+        // check if body is a controller
+        if (m_body_type != BodyType::Controller)
+        {
+            SP_LOG_WARNING("this method is only applicable for controller bodies.");
+            return nullptr;
+        }
+
+        if (!m_controller)
+        {
+            return nullptr;
+        }
+
+        // get controller's current position
+        PxController* controller = static_cast<PxController*>(m_controller);
+        PxExtendedVec3 pos_ext   = controller->getPosition();
+        PxVec3 pos               = PxVec3(static_cast<float>(pos_ext.x), static_cast<float>(pos_ext.y), static_cast<float>(pos_ext.z));
+
+        // ray start just below the controller
+        const float ray_length = standing_height;
+        PxVec3 ray_start       = pos;
+        PxVec3 ray_dir         = PxVec3(0.0f, -1.0f, 0.0f);
+
+        const PxU32 max_hits = 10;
+        PxRaycastHit hit_buffer[max_hits];
+        PxRaycastBuffer hit(hit_buffer, max_hits);
+
+        PxQueryFilterData filter_data;
+        filter_data.flags = PxQueryFlag::eSTATIC | PxQueryFlag::eDYNAMIC;
+
+        PxScene* scene = static_cast<PxScene*>(PhysicsWorld::GetScene());
+        if (!scene)
+        {
+            return nullptr;
+        }
+
+        // get the actor used by the controller to avoid returning itself
+        PxRigidActor* actor_to_ignore = controller->getActor();
+
+        lock_guard<recursive_mutex> physx_lock(PhysicsWorld::GetMutex());
+        if (scene->raycast(ray_start, ray_dir, ray_length, hit, PxHitFlag::eDEFAULT, filter_data))
+        {
+            for (PxU32 i = 0; i < hit.nbTouches; ++i)
+            {
+                const PxRaycastHit& current_hit = hit.getTouch(i);
+
+                if (!current_hit.actor || current_hit.actor == actor_to_ignore)
+                {
+                    continue;
+                }
+
+                if (current_hit.actor->userData)
+                {
+                    return static_cast<Entity*>(current_hit.actor->userData);
+                }
+            }
+        }
+
+        return nullptr;
+    }
+
+    float Physics::ComputeVolume()
+    {
+        Vector3 scale = GetEntity()->GetScale();
+
+        switch (m_body_type)
+        {
+            case BodyType::Box:
+            {
+                return scale.x * scale.y * scale.z;
+            }
+            case BodyType::Sphere:
+            {
+                // 4/3 pi r cubed, radius is the largest axis halved
+                float radius = max(max(scale.x, scale.y), scale.z) * 0.5f;
+                return (4.0f / 3.0f) * math::pi * radius * radius * radius;
+            }
+            case BodyType::Capsule:
+            {
+                return GetCapsuleVolume();
+            }
+            case BodyType::Mesh:
+            case BodyType::MeshConvex:
+            case BodyType::Cloth:
+            {
+                // approximate with the bounding box, extents are half size
+                if (Render* render = GetEntity()->GetComponent<Render>())
+                {
+                    Vector3 extents = render->GetBoundingBox().GetExtents();
+                    return extents.x * extents.y * extents.z * 8.0f;
+                }
+                return m_body_type == BodyType::Cloth ? 0.01f : 1.0f;
+            }
+            default:
+            {
+                return 0.0f;
+            }
+        }
+    }
+
+    float Physics::GetCapsuleVolume()
+    {
+        // total volume is the sum of the cylinder and two hemispheres
+        const float radius = GetCapsuleRadius();
+        const Vector3 scale = GetEntity()->GetScale();
+
+        // cylinder volume: π * r² * h (clamp to avoid negative height)
+        const float cylinder_height = max(0.0f, scale.y - 2.0f * radius);
+        const float cylinder_volume = math::pi * radius * radius * cylinder_height;
+
+        // sphere volume (two hemispheres = one full sphere): (4/3) * π * r³
+        const float sphere_volume = (4.0f / 3.0f) * math::pi * radius * radius * radius;
+
+        return cylinder_volume + sphere_volume;
+    }
+
+    float Physics::GetCapsuleRadius()
+    {
+        Vector3 scale = GetEntity()->GetScale();
+        return max(scale.x, scale.z) * 0.5f;
+    }
+
+    Vector3 Physics::GetControllerTopLocal() const
+    {
+        if (m_body_type != BodyType::Controller || !m_controller)
+        {
+            SP_LOG_WARNING("Only applicable for controller bodies.");
+            return Vector3::Zero;
+        }
+
+        PxCapsuleController* controller = static_cast<PxCapsuleController*>(m_controller);
+        float height                    = controller->getHeight();
+        float radius                    = controller->getRadius();
+
+        // eye level for an average adult sits about 0.15m below the top of the head, returned relative to the capsule center
+        const float eye_offset_from_top = 0.13f;
+        return Vector3(0.0f, (height * 0.5f) + radius - eye_offset_from_top, 0.0f);
+    }
+
+    void Physics::SetStatic(bool is_static)
+    {
+        // return if state hasn't changed
+        if (m_is_static == is_static)
+        {
+            return;
+        }
+
+        // update static state
+        m_is_static    = is_static;
+        m_is_kinematic = false; // statics can't be kinematic
+
+        // recreate bodies to apply static/dynamic state
+        Create();
+    }
+
+    void Physics::SetKinematic(bool is_kinematic)
+    {
+        // return if state hasn't changed
+        if (m_is_kinematic == is_kinematic)
+        {
+            return;
+        }
+
+        // update kinematic state
+        m_is_kinematic = is_kinematic;
+        m_is_static    = false; // kinematics require dynamic (non-static) bodies
+
+        Create(); // recreate body to apply changes
+    }
+
+    void Physics::Move(const math::Vector3& offset)
+    {
+        if (m_body_type == BodyType::Controller && Engine::IsFlagSet(EngineMode::Playing))
+        {
+            if (!m_controller)
+            {
+                return;
+            }
+
+            PxCapsuleController* controller = static_cast<PxCapsuleController*>(m_controller);
+            float delta_time = static_cast<float>(Timer::GetDeltaTimeSec());
+            PxControllerFilters filters;
+            filters.mFilterFlags = PxQueryFlag::eSTATIC | PxQueryFlag::eDYNAMIC;
+            controller->move(PxVec3(offset.x, offset.y, offset.z), 0.001f, delta_time, filters);
+        }
+        else
+        {
+            GetEntity()->Translate(offset);
+        }
+    }
+
+    void Physics::Crouch(const bool crouch)
+    {
+        if (m_body_type != BodyType::Controller || !m_controller || !Engine::IsFlagSet(EngineMode::Playing))
+        {
+            return;
+        }
+
+        // resize the capsule
+        PxCapsuleController* controller = static_cast<PxCapsuleController*>(m_controller);
+        const float current_height      = controller->getHeight();
+        const float target_height       = crouch ? crouch_height : standing_height;
+        const float delta_time          = static_cast<float>(Timer::GetDeltaTimeSec());
+        const float speed               = 10.0f;
+        const float lerped_height       = math::lerp(current_height, target_height, 1.0f - exp(-speed * delta_time));
+        controller->resize(lerped_height);
+
+        // ensure bottom of the capsule is touching the ground
+        PxExtendedVec3 pos = controller->getPosition();
+        GetEntity()->SetPosition(Vector3(static_cast<float>(pos.x), static_cast<float>(pos.y), static_cast<float>(pos.z)));
+    }
+
+    void Physics::SetBodyTransform(const Vector3& position, const Quaternion& rotation, bool rebuild_vehicle)
+    {
+        // reset interpolation state to avoid lerping from old position to new teleport position
+        m_interpolation_initialized = false;
+        m_prev_position             = position;
+        m_prev_rotation             = rotation;
+        m_current_position          = position;
+        m_current_rotation          = rotation;
+        m_vehicle_physics_position  = position;
+        m_vehicle_physics_rotation  = rotation;
+        m_vehicle_render_position   = position;
+        m_vehicle_render_rotation   = rotation;
+
+        // for character controllers, use setPosition to teleport
+        if (m_body_type == BodyType::Controller && m_controller)
+        {
+            PxController* controller = static_cast<PxController*>(m_controller);
+            controller->setPosition(PxExtendedVec3(position.x, position.y, position.z));
+            m_velocity = Vector3::Zero; // reset movement velocity
+            return;
+        }
+
+        // for vehicles, use the simulation body directly
+        PxRigidDynamic* vehicle_body = m_vehicle_simulation->get_body();
+        if (m_body_type == BodyType::Vehicle && vehicle_body)
+        {
+            PxTransform pose(PxVec3(position.x, position.y, position.z), PxQuat(rotation.x, rotation.y, rotation.z, rotation.w));
+            vehicle_body->setGlobalPose(pose);
+            vehicle_body->setLinearVelocity(PxVec3(0, 0, 0));
+            vehicle_body->setAngularVelocity(PxVec3(0, 0, 0));
+
+            // reset wheel angular velocities
+            for (int i = 0; i < 4; i++)
+            {
+                m_vehicle_simulation->set_wheel_angular_velocity(i, 0.0f);
+            }
+
+            if (rebuild_vehicle && m_vehicle_simulation->has_multibody())
+            {
+                if (!m_vehicle_simulation->rebuild_multibody(false))
+                {
+                    SP_LOG_ERROR("failed to rebuild suspension after vehicle reset");
+                }
+                m_vehicle_simulation->reset_drivetrain_transients();
+                m_vehicle_simulation->reset_wheel_thermals();
+            }
+            m_vehicle_simulation->clear_force_accumulators();
+            return;
+        }
+
+        // for regular rigid bodies
+        if (!m_actors.empty() && m_actors[0])
+        {
+            PxRigidActor* actor = static_cast<PxRigidActor*>(m_actors[0]);
+            PxTransform pose(PxVec3(position.x, position.y, position.z), PxQuat(rotation.x, rotation.y, rotation.z, rotation.w));
+            actor->setGlobalPose(pose);
+
+            if (PxRigidDynamic* dynamic = actor->is<PxRigidDynamic>())
+            {
+                dynamic->setLinearVelocity(PxVec3(0, 0, 0));
+                dynamic->setAngularVelocity(PxVec3(0, 0, 0));
+            }
+        }
+    }
+
+    void Physics::SetVehicleThrottle(float value)
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return;
+        }
+
+        m_vehicle_simulation->set_throttle(value);
+    }
+
+    void Physics::SetVehicleBrake(float value)
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return;
+        }
+
+        m_vehicle_simulation->set_brake(value);
+    }
+
+    void Physics::SetVehicleSteering(float value)
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return;
+        }
+
+        m_vehicle_simulation->set_steering(value);
+    }
+
+    void Physics::SetVehicleHandbrake(float value)
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return;
+        }
+
+        m_vehicle_simulation->set_handbrake(value);
+    }
+
+    void Physics::SetWheelEntity(WheelIndex wheel, Entity* entity)
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            SP_LOG_WARNING("SetWheelEntity only works with Vehicle body type");
+            return;
+        }
+
+        int index = static_cast<int>(wheel);
+        if (index >= 0 && index < static_cast<int>(WheelIndex::Count))
+        {
+            if (m_wheel_entities[index] != entity)
+            {
+                m_cheap_wheel_rest_captured[index] = false;
+            }
+            m_wheel_entities[index] = entity;
+
+            // sync the physics wheel offset from the entity position
+            if (entity)
+            {
+                if (!m_cheap_wheel_rest_captured[index])
+                {
+                    m_cheap_wheel_local_pos[index] = entity->GetPositionLocal();
+                    m_cheap_wheel_local_rot[index] = entity->GetRotationLocal();
+                    m_cheap_wheel_rest_captured[index] = true;
+                }
+
+                Entity* vehicle_entity = GetEntity();
+                if (vehicle_entity)
+                {
+                    // transform wheel world position to vehicle-local space
+                    Vector3 vehicle_world_pos = vehicle_entity->GetPosition();
+                    Quaternion vehicle_world_rot = vehicle_entity->GetRotation();
+                    Quaternion vehicle_world_rot_inv = vehicle_world_rot.Conjugate();
+
+                    // try to get the actual mesh center from the render's bounding box
+                    Vector3 wheel_world_pos = entity->GetPosition();
+                    Render* render = entity->GetComponent<Render>();
+                    if (render)
+                    {
+                        render->Tick();
+                        BoundingBox aabb = render->GetBoundingBox();
+                        wheel_world_pos = aabb.GetCenter();
+                        Vector3 center_offset = entity->GetRotation().Conjugate() * (wheel_world_pos - entity->GetPosition());
+                        m_wheel_mesh_center_offsets[index] = center_offset.IsFinite() ? center_offset : Vector3::Zero;
+                    }
+
+                    Vector3 local_pos = vehicle_world_rot_inv * (wheel_world_pos - vehicle_world_pos);
+                    m_vehicle_simulation->set_wheel_offset(index, local_pos.x, local_pos.z);
+                }
+            }
+        }
+    }
+
+    Entity* Physics::GetWheelEntity(WheelIndex wheel) const
+    {
+        int index = static_cast<int>(wheel);
+        if (index >= 0 && index < static_cast<int>(WheelIndex::Count))
+        {
+            return m_wheel_entities[index];
+        }
+        return nullptr;
+    }
+
+    void Physics::SetChassisEntity(Entity* entity, const vector<Entity*>& entities_to_exclude)
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            SP_LOG_WARNING("SetChassisEntity only works with Vehicle body type");
+            return;
+        }
+
+        m_chassis_entity = entity;
+        m_chassis_entities_to_exclude = entities_to_exclude;
+        if (entity)
+        {
+            // store base position so we can offset from it
+            m_chassis_base_pos = entity->GetPositionLocal();
+            SP_LOG_INFO("SetChassisEntity: chassis set to '%s', base_pos=(%.2f, %.2f, %.2f), excluding %zu entities",
+                entity->GetObjectName().c_str(), m_chassis_base_pos.x, m_chassis_base_pos.y, m_chassis_base_pos.z, entities_to_exclude.size());
+
+            BuildChassisConvexShapes(entity, entities_to_exclude);
+
+            // re-tag after shape replacement
+            if (PxRigidDynamic* body = m_vehicle_simulation->get_body())
+            {
+                tag_actor_shapes(body, 2, m_vehicle_simulation->multibody_collision_group());
+            }
+        }
+        else
+        {
+            SP_LOG_WARNING("SetChassisEntity: entity is null!");
+        }
+    }
+
+    void Physics::BuildChassisConvexShapes(Entity* chassis_entity, const vector<Entity*>& entities_to_exclude)
+    {
+        if (!m_vehicle_simulation->get_body() || !chassis_entity)
+        {
+            return;
+        }
+
+        PxPhysics* physics = static_cast<PxPhysics*>(PhysicsWorld::GetPhysics());
+        if (!physics)
+        {
+            return;
+        }
+
+        // setting the chassis mutates shapes on a body that is already attached to the
+        // scene, async load runs this on worker threads so serialize against other physx writes
+        lock_guard<recursive_mutex> physx_lock(PhysicsWorld::GetMutex());
+
+        // collect all entities with render components in the hierarchy
+        vector<Entity*> mesh_entities;
+        mesh_entities.push_back(chassis_entity);
+        chassis_entity->GetDescendants(&mesh_entities);
+
+        // helper to check if an entity should be excluded
+        auto should_exclude = [&entities_to_exclude](Entity* ent) -> bool
+        {
+            for (Entity* excluded : entities_to_exclude)
+            {
+                if (ent == excluded)
+                {
+                    return true;
+                }
+
+                // also check if this entity is a descendant of an excluded entity
+                Entity* parent = ent->GetParent();
+                while (parent)
+                {
+                    if (parent == excluded)
+                    {
+                        return true;
+                    }
+                    parent = parent->GetParent();
+                }
+            }
+            return false;
+        };
+
+        // filter to only entities with render components, excluding specified entities
+        vector<pair<Entity*, Render*>> render_entities;
+        for (Entity* ent : mesh_entities)
+        {
+            // skip inactive entities and excluded entities
+            if (!ent->GetActive())
+            {
+                continue;
+            }
+            if (should_exclude(ent))
+            {
+                continue;
+            }
+
+            if (Render* render = ent->GetComponent<Render>())
+            {
+                render_entities.push_back({ent, render});
+            }
+        }
+
+        if (render_entities.empty())
+        {
+            SP_LOG_WARNING("No render entities found in chassis hierarchy (after exclusions)");
+            return;
+        }
+
+        SP_LOG_INFO(
+            "BuildChassisConvexShapes: collecting verts from %zu mesh entities (excluded %zu)",
+            render_entities.size(),
+            entities_to_exclude.size()
+        );
+
+        // the chassis entity's local transform relative to the vehicle (physics body)
+        Vector3 chassis_local_pos = chassis_entity->GetPositionLocal();
+        Quaternion chassis_local_rot = chassis_entity->GetRotationLocal();
+        Vector3 chassis_local_scale = chassis_entity->GetScaleLocal();
+        Vector3 chassis_world_pos = chassis_entity->GetPosition();
+        Quaternion chassis_world_rot = chassis_entity->GetRotation();
+        Quaternion chassis_world_rot_inv = chassis_world_rot.Conjugate();
+
+        const car::config& car_cfg = m_vehicle_simulation->get_config();
+
+        // raise verts only inside wheel wells so the body does not rest on the road
+        // skirts and overhangs outside those wells keep a lower floor for curb contact
+        const float wheel_well_min_y = -car_cfg.suspension_height;
+        const float body_floor_min_y = -(car_cfg.suspension_height + 0.18f);
+
+        auto is_in_wheel_well = [&](const Vector3& body_local_v) -> bool
+        {
+            for (int i = 0; i < car::wheel_count; i++)
+            {
+                const PxVec3 wheel_offset = m_vehicle_simulation->get_wheel_offset(i);
+                const float half_width = car_cfg.wheel_width_for(i) * 1.35f;
+                const float half_length = car_cfg.wheel_radius_for(i) * 1.45f;
+                if (fabsf(body_local_v.x - wheel_offset.x) <= half_width &&
+                    fabsf(body_local_v.z - wheel_offset.z) <= half_length)
+                {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        vector<PxVec3> all_vertices;
+        all_vertices.reserve(20000);
+
+        float pre_clip_min_y = numeric_limits<float>::infinity();
+        size_t clipped_count = 0;
+
+        for (const auto& [ent, render] : render_entities)
+        {
+            vector<uint32_t> indices;
+            vector<RHI_Vertex_PosTexNorTan> vertices;
+            render->GetGeometry(&indices, &vertices);
+            if (vertices.empty())
+            {
+                continue;
+            }
+
+            // thin dense visual meshes so the spatial bins stay cookable
+            const size_t max_sample_verts = 512;
+            if (vertices.size() > max_sample_verts && !indices.empty())
+            {
+                const size_t target_index_count = min<size_t>(indices.size(), max_sample_verts * 3);
+                geometry_processing::simplify(indices, vertices, target_index_count, false, false);
+            }
+
+            Vector3 ent_world_pos = ent->GetPosition();
+            Quaternion ent_world_rot = ent->GetRotation();
+            Vector3 ent_scale = ent->GetScale();
+
+            for (const auto& vertex : vertices)
+            {
+                Vector3 v(
+                    vertex.pos[0] * ent_scale.x,
+                    vertex.pos[1] * ent_scale.y,
+                    vertex.pos[2] * ent_scale.z
+                );
+
+                Vector3 world_v = ent_world_rot * v + ent_world_pos;
+                Vector3 chassis_local_v = chassis_world_rot_inv * (world_v - chassis_world_pos);
+                chassis_local_v.x *= chassis_local_scale.x;
+                chassis_local_v.y *= chassis_local_scale.y;
+                chassis_local_v.z *= chassis_local_scale.z;
+
+                Vector3 body_local_v = chassis_local_rot * chassis_local_v + chassis_local_pos;
+
+                if (body_local_v.y < pre_clip_min_y)
+                {
+                    pre_clip_min_y = body_local_v.y;
+                }
+
+                if (body_local_v.y < wheel_well_min_y && is_in_wheel_well(body_local_v))
+                {
+                    body_local_v.y = wheel_well_min_y;
+                    clipped_count++;
+                }
+                else if (body_local_v.y < body_floor_min_y)
+                {
+                    body_local_v.y = body_floor_min_y;
+                    clipped_count++;
+                }
+
+                all_vertices.emplace_back(body_local_v.x, body_local_v.y, body_local_v.z);
+            }
+        }
+
+        if (clipped_count > 0)
+        {
+            SP_LOG_INFO(
+                "BuildChassisConvexShapes: clipped %zu verts, wheel_well_y=%.3f floor_y=%.3f (was as low as %.3f)",
+                clipped_count,
+                wheel_well_min_y,
+                body_floor_min_y,
+                pre_clip_min_y
+            );
+        }
+
+        if (all_vertices.size() < 4)
+        {
+            SP_LOG_WARNING("BuildChassisConvexShapes: not enough vertices for chassis compound");
+            return;
+        }
+
+        PxVec3 bounds_min(PX_MAX_F32);
+        PxVec3 bounds_max(-PX_MAX_F32);
+        for (const PxVec3& vertex : all_vertices)
+        {
+            if (!vertex.isFinite())
+            {
+                continue;
+            }
+            bounds_min = bounds_min.minimum(vertex);
+            bounds_max = bounds_max.maximum(vertex);
+        }
+
+        const PxVec3 bounds_extent = bounds_max - bounds_min;
+        if (
+            bounds_extent.x <= 0.000001f ||
+            bounds_extent.y <= 0.000001f ||
+            bounds_extent.z <= 0.000001f
+        )
+        {
+            SP_LOG_WARNING("BuildChassisConvexShapes: degenerate chassis bounds");
+            return;
+        }
+
+        // a few large overlapping regions, each cooked into a low poly convex
+        // overlap is intentional so the compound reads as one continuous car
+        struct region_def
+        {
+            float min_u;
+            float max_u;
+            float min_v;
+            float max_v;
+            float min_w;
+            float max_w;
+            float expand; // grows the query so neighboring hulls overlap
+            size_t min_hits;
+        };
+
+        const region_def regions[] =
+        {
+            // main body, covers most of the silhouette
+            { 0.05f, 0.95f, 0.00f, 0.70f, 0.05f, 0.95f, 0.06f, 32 },
+            // cabin / canopy
+            { 0.18f, 0.82f, 0.35f, 1.00f, 0.25f, 0.75f, 0.05f, 16 },
+            // front
+            { 0.10f, 0.90f, 0.00f, 0.65f, 0.00f, 0.38f, 0.07f, 16 },
+            // rear
+            { 0.10f, 0.90f, 0.00f, 0.70f, 0.62f, 1.00f, 0.07f, 16 },
+            // left side / skirt
+            { 0.00f, 0.38f, 0.00f, 0.55f, 0.12f, 0.88f, 0.06f, 12 },
+            // right side / skirt
+            { 0.62f, 1.00f, 0.00f, 0.55f, 0.12f, 0.88f, 0.06f, 12 },
+        };
+
+        auto unit_to_world = [&](float u, float v, float w) -> PxVec3
+        {
+            return PxVec3(
+                bounds_min.x + bounds_extent.x * u,
+                bounds_min.y + bounds_extent.y * v,
+                bounds_min.z + bounds_extent.z * w
+            );
+        };
+
+        PxTolerancesScale px_scale;
+        px_scale.length = 1.0f;
+        Vector3 gravity = PhysicsWorld::GetGravity();
+        px_scale.speed = sqrtf(gravity.x * gravity.x + gravity.y * gravity.y + gravity.z * gravity.z);
+        PxCookingParams params(px_scale);
+        params.convexMeshCookingType = PxConvexMeshCookingType::eQUICKHULL;
+        params.meshPreprocessParams |= PxMeshPreprocessingFlag::eWELD_VERTICES;
+        params.meshWeldTolerance = 0.01f;
+        params.gaussMapLimit = 32;
+
+        PxInsertionCallback* insertion_callback = PxGetStandaloneInsertionCallback();
+        if (!insertion_callback)
+        {
+            SP_LOG_ERROR("BuildChassisConvexShapes: missing physx insertion callback");
+            return;
+        }
+
+        vector<PxConvexMesh*> meshes;
+        vector<PxVec3> aero_vertices;
+        meshes.reserve(sizeof(regions) / sizeof(regions[0]));
+
+        auto cook_region = [&](const vector<PxVec3>& region_verts) -> PxConvexMesh*
+        {
+            if (region_verts.size() < 4)
+            {
+                return nullptr;
+            }
+
+            vector<PxVec3> cook_verts = region_verts;
+            const size_t max_input = 96;
+            if (cook_verts.size() > max_input)
+            {
+                const size_t stride = cook_verts.size() / max_input;
+                vector<PxVec3> subsampled;
+                subsampled.reserve(max_input);
+                for (
+                    size_t i = 0;
+                    i < cook_verts.size() && subsampled.size() < max_input;
+                    i += stride
+                )
+                {
+                    subsampled.push_back(cook_verts[i]);
+                }
+                cook_verts = std::move(subsampled);
+            }
+
+            PxConvexMeshDesc mesh_desc;
+            mesh_desc.points.count = static_cast<PxU32>(cook_verts.size());
+            mesh_desc.points.stride = sizeof(PxVec3);
+            mesh_desc.points.data = cook_verts.data();
+            mesh_desc.flags = PxConvexFlag::eCOMPUTE_CONVEX | PxConvexFlag::eSHIFT_VERTICES;
+            mesh_desc.vertexLimit = 16;
+
+            PxConvexMeshCookingResult::Enum condition;
+            PxConvexMesh* convex_mesh = PxCreateConvexMesh(
+                params,
+                mesh_desc,
+                *insertion_callback,
+                &condition
+            );
+            if (!convex_mesh || condition != PxConvexMeshCookingResult::eSUCCESS)
+            {
+                if (convex_mesh)
+                {
+                    convex_mesh->release();
+                }
+                return nullptr;
+            }
+            return convex_mesh;
+        };
+
+        for (const region_def& region : regions)
+        {
+            float min_u = std::clamp(region.min_u - region.expand, 0.0f, 1.0f);
+            float max_u = std::clamp(region.max_u + region.expand, 0.0f, 1.0f);
+            float min_v = std::clamp(region.min_v - region.expand, 0.0f, 1.0f);
+            float max_v = std::clamp(region.max_v + region.expand, 0.0f, 1.0f);
+            float min_w = std::clamp(region.min_w - region.expand, 0.0f, 1.0f);
+            float max_w = std::clamp(region.max_w + region.expand, 0.0f, 1.0f);
+
+            const PxVec3 query_min = unit_to_world(min_u, min_v, min_w);
+            const PxVec3 query_max = unit_to_world(max_u, max_v, max_w);
+
+            vector<PxVec3> region_verts;
+            region_verts.reserve(1024);
+
+            for (const PxVec3& vertex : all_vertices)
+            {
+                if (!vertex.isFinite())
+                {
+                    continue;
+                }
+                if (
+                    vertex.x < query_min.x || vertex.x > query_max.x ||
+                    vertex.y < query_min.y || vertex.y > query_max.y ||
+                    vertex.z < query_min.z || vertex.z > query_max.z
+                )
+                {
+                    continue;
+                }
+                region_verts.push_back(vertex);
+            }
+
+            if (region_verts.size() < region.min_hits)
+            {
+                continue;
+            }
+
+            PxConvexMesh* convex_mesh = cook_region(region_verts);
+            if (!convex_mesh)
+            {
+                continue;
+            }
+
+            const PxU32 hull_vert_count = convex_mesh->getNbVertices();
+            const PxVec3* hull_verts = convex_mesh->getVertices();
+            aero_vertices.insert(aero_vertices.end(), hull_verts, hull_verts + hull_vert_count);
+            meshes.push_back(convex_mesh);
+        }
+
+        // fallback: one hull from everything if regions failed
+        if (meshes.empty())
+        {
+            PxConvexMesh* fallback = cook_region(all_vertices);
+            if (!fallback)
+            {
+                SP_LOG_WARNING("BuildChassisConvexShapes: failed to cook chassis proxies");
+                return;
+            }
+
+            const PxU32 hull_vert_count = fallback->getNbVertices();
+            const PxVec3* hull_verts = fallback->getVertices();
+            aero_vertices.assign(hull_verts, hull_verts + hull_vert_count);
+            meshes.push_back(fallback);
+        }
+
+        if (!m_vehicle_simulation->set_chassis(meshes, aero_vertices, physics))
+        {
+            SP_LOG_ERROR("Failed to set chassis compound");
+            for (PxConvexMesh* mesh : meshes)
+            {
+                if (mesh)
+                {
+                    mesh->release();
+                }
+            }
+            return;
+        }
+
+        for (PxConvexMesh* mesh : meshes)
+        {
+            if (mesh)
+            {
+                mesh->release();
+            }
+        }
+
+        SP_LOG_INFO(
+            "BuildChassisConvexShapes: created %zu overlapping convex proxies from %zu source verts",
+            meshes.size(),
+            all_vertices.size()
+        );
+    }
+
+    void Physics::SetWheelRadius(float radius)
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            SP_LOG_WARNING("SetWheelRadius only works with Vehicle body type");
+            return;
+        }
+
+        // a bad radius would divide through every tire force, so reject it here and continue with a sane default
+        if (!std::isfinite(radius) || radius <= 0.0f)
+        {
+            SP_LOG_WARNING("SetWheelRadius: refusing non finite or non positive radius %.3f, keeping %.3f", radius, m_wheel_radius);
+            return;
+        }
+
+        radius = std::max(radius, 0.05f);
+
+        m_wheel_radius = radius;
+
+        car::config& config = m_vehicle_simulation->get_config();
+        config.front_wheel_radius = radius;
+        config.rear_wheel_radius  = radius;
+
+        // recalculate and update body height based on actual wheel radius
+        if (PxRigidDynamic* body = m_vehicle_simulation->get_body())
+        {
+            // the body is in the scene, async load reaches this from car prefab workers
+            lock_guard<recursive_mutex> physx_lock(PhysicsWorld::GetMutex());
+
+            // spawn at the resting height, radius + suspension_height - sag, so the car does not bounce through its travel
+            float front_mass_per_wheel = m_vehicle_simulation->chassis_mass() * m_vehicle_simulation->get_weight_distribution_front() * 0.5f;
+            float front_omega = 2.0f * math::pi * m_vehicle_simulation->get_spec().front_spring_freq;
+            float front_stiffness = front_mass_per_wheel * front_omega * front_omega;
+            float front_load = front_mass_per_wheel * 9.81f;
+            float expected_sag = std::clamp(front_load / front_stiffness, 0.0f, config.suspension_travel * 0.8f);
+            const float correct_body_height = radius + config.suspension_height - expected_sag + 0.02f;
+
+            // update body position with correct height
+            PxTransform pose = body->getGlobalPose();
+            pose.p.y = correct_body_height;
+            body->setGlobalPose(pose);
+
+            if (!m_vehicle_simulation->rebuild_vehicle_geometry())
+            {
+                SP_LOG_ERROR("failed to rebuild suspension after wheel radius change");
+            }
+
+            SP_LOG_INFO("SetWheelRadius: adjusted body height to %.3f for radius %.3f", correct_body_height, radius);
+        }
+        else
+        {
+            m_vehicle_simulation->rebuild_vehicle_geometry();
+        }
+
+        SP_LOG_INFO("SetWheelRadius: wheel radius set to %.3f", radius);
+    }
+
+    void Physics::ComputeWheelRadiusFromEntity(Entity* wheel_entity)
+    {
+        if (!wheel_entity)
+        {
+            SP_LOG_WARNING("ComputeWheelRadiusFromEntity: wheel_entity is null");
+            return;
+        }
+
+        // get the render component to access the bounding box
+        Render* render = wheel_entity->GetComponent<Render>();
+        if (!render)
+        {
+            SP_LOG_WARNING("ComputeWheelRadiusFromEntity: wheel entity has no Render component");
+            return;
+        }
+
+        // force bounding box update to reflect current entity transform (including scale)
+        // this is needed because the bounding box is lazily updated during Tick()
+        render->Tick();
+
+        // get the aabb - this is in world space (transformed by entity matrix including scale)
+        BoundingBox aabb = render->GetBoundingBox();
+        Vector3 extents = aabb.GetExtents(); // half-sizes, already scaled
+
+        // a default constructed bbox has m_min = inf and m_max = -inf which produces a non finite
+        // center and a negative infinity extent. refuse to feed that into SetWheelRadius
+        Vector3 aabb_center = aabb.GetCenter();
+        if (extents.IsNaN() || aabb_center.IsNaN() || !std::isfinite(extents.x) || !std::isfinite(extents.y) || !std::isfinite(extents.z))
+        {
+            SP_LOG_WARNING("ComputeWheelRadiusFromEntity: non finite bbox on '%s', keeping previous radius %.3f",
+                wheel_entity->GetObjectName().c_str(), m_wheel_radius);
+            return;
+        }
+
+        // the wheel radius is the largest extent (wheels are usually symmetric)
+        // for a wheel mesh, this gives us the actual visual radius
+        float radius = max(max(extents.x, extents.y), extents.z);
+        if (!std::isfinite(radius) || radius <= 0.0f)
+        {
+            SP_LOG_WARNING("ComputeWheelRadiusFromEntity: computed radius %.3f on '%s' is invalid, keeping previous radius %.3f",
+                radius, wheel_entity->GetObjectName().c_str(), m_wheel_radius);
+            return;
+        }
+
+        m_wheel_radius = radius;
+
+        SP_LOG_INFO("ComputeWheelRadiusFromEntity: computed radius=%.3f from entity '%s' (extents: %.3f, %.3f, %.3f)",
+            radius, wheel_entity->GetObjectName().c_str(), extents.x, extents.y, extents.z);
+    }
+
+    float Physics::GetSuspensionHeight() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_config().suspension_height;
+    }
+
+    void Physics::ScaleWheelEntityToDimensions(Entity* wheel_entity, float target_radius, float target_width)
+    {
+        if (!wheel_entity || !std::isfinite(target_radius) || !std::isfinite(target_width) || target_radius <= 0.0f || target_width <= 0.0f)
+        {
+            return;
+        }
+
+        Render* render = wheel_entity->GetComponent<Render>();
+        if (!render)
+        {
+            return;
+        }
+
+        // scale is absolute and derives only from unscaled local mesh bounds
+        Vector3 extents = render->GetBoundingBoxMesh().GetExtents();
+        if (!extents.IsFinite() || extents.x <= 0.0001f || extents.y <= 0.0001f || extents.z <= 0.0001f)
+        {
+            return;
+        }
+
+        const float measured_radius = max(max(extents.x, extents.y), extents.z);
+        const Vector3 scale(target_radius / measured_radius);
+        if (!scale.IsFinite() || scale.x <= 0.0f || scale.y <= 0.0f || scale.z <= 0.0f)
+        {
+            return;
+        }
+
+        wheel_entity->SetScaleLocal(scale);
+        render->Tick();
+    }
+
+    float Physics::GetVehicleThrottle() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_throttle();
+    }
+
+    float Physics::GetVehicleBrake() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_brake();
+    }
+
+    float Physics::GetVehicleSteering() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_steering();
+    }
+
+    float Physics::GetVehicleHandbrake() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_handbrake();
+    }
+
+    bool Physics::IsWheelGrounded(WheelIndex wheel) const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return false;
+        }
+        return m_vehicle_simulation->is_wheel_grounded(static_cast<int>(wheel));
+    }
+
+    float Physics::GetWheelCompression(WheelIndex wheel) const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_wheel_compression(static_cast<int>(wheel));
+    }
+
+    float Physics::GetWheelSuspensionForce(WheelIndex wheel) const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_wheel_suspension_force(static_cast<int>(wheel));
+    }
+
+    float Physics::GetWheelSlipAngle(WheelIndex wheel) const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_wheel_slip_angle(static_cast<int>(wheel));
+    }
+
+    float Physics::GetWheelSlipRatio(WheelIndex wheel) const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_wheel_slip_ratio(static_cast<int>(wheel));
+    }
+
+    float Physics::GetWheelTireLoad(WheelIndex wheel) const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_wheel_tire_load(static_cast<int>(wheel));
+    }
+
+    Vector3 Physics::GetWheelContactPoint(WheelIndex wheel) const
+    {
+        int i = static_cast<int>(wheel);
+        if (m_body_type != BodyType::Vehicle || i < 0 || i >= car::wheel_count)
+        {
+            return Vector3::Zero;
+        }
+        return from_px_vec3(m_vehicle_simulation->get_wheel_state(i).contact_point);
+    }
+
+    Vector3 Physics::GetWheelContactNormal(WheelIndex wheel) const
+    {
+        int i = static_cast<int>(wheel);
+        if (m_body_type != BodyType::Vehicle || i < 0 || i >= car::wheel_count)
+        {
+            return Vector3::Up;
+        }
+        return from_px_vec3(m_vehicle_simulation->get_wheel_state(i).contact_normal);
+    }
+
+    float Physics::GetWheelSlipMagnitude(WheelIndex wheel) const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        int i           = static_cast<int>(wheel);
+        float slip_ratio = m_vehicle_simulation->get_wheel_slip_ratio(i);
+        float slip_angle = m_vehicle_simulation->get_wheel_slip_angle(i);
+        return sqrtf(slip_ratio * slip_ratio + slip_angle * slip_angle);
+    }
+
+    float Physics::GetWheelWidth(WheelIndex wheel) const
+    {
+        int i = static_cast<int>(wheel);
+        if (m_body_type != BodyType::Vehicle || i < 0 || i >= car::wheel_count)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_config().wheel_width_for(i);
+    }
+
+    float Physics::GetWheelLateralForce(WheelIndex wheel) const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_wheel_lateral_force(static_cast<int>(wheel));
+    }
+
+    float Physics::GetWheelLongitudinalForce(WheelIndex wheel) const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_wheel_longitudinal_force(static_cast<int>(wheel));
+    }
+
+    float Physics::GetWheelAngularVelocity(WheelIndex wheel) const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_wheel_angular_velocity(static_cast<int>(wheel));
+    }
+
+    float Physics::GetWheelRPM(WheelIndex wheel) const
+    {
+        // convert angular velocity (rad/s) to RPM
+        // rpm = (rad/s) * (60 / 2π) = (rad/s) * 9.5493
+        float angular_vel = GetWheelAngularVelocity(wheel);
+        return fabsf(angular_vel) * 9.5493f;
+    }
+
+    float Physics::GetWheelTemperature(WheelIndex wheel) const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_wheel_temperature(static_cast<int>(wheel));
+    }
+
+    float Physics::GetWheelTempGripFactor(WheelIndex wheel) const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 1.0f;
+        }
+        return m_vehicle_simulation->get_wheel_temp_grip_factor(static_cast<int>(wheel));
+    }
+
+    float Physics::GetWheelBrakeTemp(WheelIndex wheel) const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_wheel_brake_temp(static_cast<int>(wheel));
+    }
+
+    float Physics::GetWheelBrakeEfficiency(WheelIndex wheel) const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 1.0f;
+        }
+        return m_vehicle_simulation->get_wheel_brake_efficiency(static_cast<int>(wheel));
+    }
+
+    float Physics::GetWheelSurfaceTemp(WheelIndex wheel, int zone) const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_wheel_surface_temp(static_cast<int>(wheel), zone);
+    }
+
+    float Physics::GetWheelCoreTemp(WheelIndex wheel) const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_wheel_core_temp(static_cast<int>(wheel));
+    }
+
+    float Physics::GetTirePressure() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_tire_pressure();
+    }
+
+    float Physics::GetTirePressureOptimal() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_tire_pressure_optimal();
+    }
+
+    void Physics::SetAbsEnabled(bool enabled)
+    {
+        if (m_body_type == BodyType::Vehicle)
+        {
+            m_vehicle_simulation->set_abs_enabled(enabled);
+        }
+    }
+
+    bool Physics::GetAbsEnabled() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return false;
+        }
+        return m_vehicle_simulation->get_abs_enabled();
+    }
+
+    bool Physics::IsAbsActive(WheelIndex wheel) const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return false;
+        }
+        return m_vehicle_simulation->is_abs_active(static_cast<int>(wheel));
+    }
+
+    bool Physics::IsAbsActiveAny() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return false;
+        }
+        return m_vehicle_simulation->is_abs_active_any();
+    }
+
+    float Physics::GetAbsPhase() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_abs_phase();
+    }
+
+    void Physics::SetTcEnabled(bool enabled)
+    {
+        if (m_body_type == BodyType::Vehicle)
+        {
+            m_vehicle_simulation->set_tc_enabled(enabled);
+        }
+    }
+
+    bool Physics::GetTcEnabled() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return false;
+        }
+        return m_vehicle_simulation->get_tc_enabled();
+    }
+
+    bool Physics::IsTcActive() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return false;
+        }
+        return m_vehicle_simulation->is_tc_active();
+    }
+
+    float Physics::GetTcReduction() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_tc_reduction();
+    }
+
+    void Physics::SetTurboEnabled(bool enabled)
+    {
+        if (m_body_type == BodyType::Vehicle)
+        {
+            m_vehicle_simulation->set_turbo_enabled(enabled);
+        }
+    }
+
+    bool Physics::GetTurboEnabled() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return false;
+        }
+        return m_vehicle_simulation->get_turbo_enabled();
+    }
+
+    float Physics::GetBoostPressure() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_boost_pressure();
+    }
+
+    float Physics::GetBoostMaxPressure() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_boost_max_pressure();
+    }
+
+    // drs
+    void Physics::SetDrsEnabled(bool enabled)
+    {
+        if (m_body_type == BodyType::Vehicle)
+        {
+            m_vehicle_simulation->set_drs_enabled(enabled);
+        }
+    }
+
+    bool Physics::GetDrsEnabled() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return false;
+        }
+        return m_vehicle_simulation->get_drs_enabled();
+    }
+
+    void Physics::SetDrsActive(bool active)
+    {
+        if (m_body_type == BodyType::Vehicle)
+        {
+            m_vehicle_simulation->set_drs_active(active);
+        }
+    }
+
+    bool Physics::GetDrsActive() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return false;
+        }
+        return m_vehicle_simulation->get_drs_active();
+    }
+
+    // differential
+    void Physics::SetDiffType(int type)
+    {
+        if (m_body_type == BodyType::Vehicle)
+        {
+            m_vehicle_simulation->set_diff_type(type);
+        }
+    }
+
+    int Physics::GetDiffType() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 2;
+        }
+        return m_vehicle_simulation->get_diff_type();
+    }
+
+    const char* Physics::GetDiffTypeName() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return "N/A";
+        }
+        return m_vehicle_simulation->get_diff_type_name();
+    }
+
+    // tire wear
+    float Physics::GetWheelWear(WheelIndex wheel) const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_wheel_wear(static_cast<int>(wheel));
+    }
+
+    float Physics::GetWheelWearGripFactor(WheelIndex wheel) const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 1.0f;
+        }
+        return m_vehicle_simulation->get_wheel_wear_grip_factor(static_cast<int>(wheel));
+    }
+
+    void Physics::ResetTireWear()
+    {
+        if (m_body_type == BodyType::Vehicle)
+        {
+            m_vehicle_simulation->reset_tire_wear();
+        }
+    }
+
+    void Physics::SetManualTransmission(bool enabled)
+    {
+        if (m_body_type == BodyType::Vehicle)
+        {
+            m_vehicle_simulation->set_manual_transmission(enabled);
+        }
+    }
+
+    bool Physics::GetManualTransmission() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return false;
+        }
+        return m_vehicle_simulation->get_manual_transmission();
+    }
+
+    void Physics::ShiftUp()
+    {
+        if (m_body_type == BodyType::Vehicle)
+        {
+            m_vehicle_simulation->shift_up();
+        }
+    }
+
+    void Physics::ShiftDown()
+    {
+        if (m_body_type == BodyType::Vehicle)
+        {
+            m_vehicle_simulation->shift_down();
+        }
+    }
+
+    void Physics::ShiftToNeutral()
+    {
+        if (m_body_type == BodyType::Vehicle)
+        {
+            m_vehicle_simulation->shift_to_neutral();
+        }
+    }
+
+    int Physics::GetCurrentGear() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 1;
+        } // neutral
+        return m_vehicle_simulation->get_current_gear();
+    }
+
+    const char* Physics::GetCurrentGearString() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return "N";
+        }
+        return m_vehicle_simulation->get_gear_string();
+    }
+
+    float Physics::GetEngineRPM() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_current_engine_rpm();
+    }
+
+    float Physics::GetEngineTorque() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_engine_torque_current();
+    }
+
+    float Physics::GetMotorTorque() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_motor_torque();
+    }
+
+    float Physics::GetIdleRPM() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_idle_rpm();
+    }
+
+    float Physics::GetRedlineRPM() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return 0.0f;
+        }
+        return m_vehicle_simulation->get_redline_rpm();
+    }
+
+    bool Physics::IsShifting() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return false;
+        }
+        return m_vehicle_simulation->get_is_shifting();
+    }
+
+    Vector3 Physics::TransformVehiclePointToRender(const Vector3& point) const
+    {
+        return m_vehicle_render_position + m_vehicle_render_rotation * (m_vehicle_physics_rotation.Conjugate() * (point - m_vehicle_physics_position));
+    }
+
+    Quaternion Physics::TransformVehicleRotationToRender(const Quaternion& rotation) const
+    {
+        Quaternion result = m_vehicle_render_rotation * m_vehicle_physics_rotation.Conjugate() * rotation;
+        result.Normalize();
+        return result;
+    }
+
+    void Physics::SyncWheelOffsetsFromEntities()
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return;
+        }
+
+        Entity* vehicle_entity = GetEntity();
+        if (!vehicle_entity)
+        {
+            return;
+        }
+
+        // get vehicle's world transform to convert wheel world positions to vehicle-local space
+        Vector3 vehicle_world_pos = vehicle_entity->GetPosition();
+        Quaternion vehicle_world_rot = vehicle_entity->GetRotation();
+        Quaternion vehicle_world_rot_inv = vehicle_world_rot.Conjugate();
+
+        for (int i = 0; i < static_cast<int>(WheelIndex::Count); i++)
+        {
+            Entity* wheel_entity = m_wheel_entities[i];
+            if (!wheel_entity)
+            {
+                continue;
+            }
+
+            // skip wheels with non finite world transforms, the bbox derived from such a transform
+            // would otherwise crash the frustum culler assert when render->Tick runs below
+            if (!wheel_entity->GetMatrix().IsFinite())
+            {
+                SP_LOG_WARNING("non finite world matrix on wheel '%s' in SyncWheelOffsetsFromEntities, skipping", wheel_entity->GetObjectName().c_str());
+                continue;
+            }
+
+            // try to get the actual mesh center from the render's bounding box
+            // this handles meshes where the origin is not at the geometric center
+            Vector3 wheel_world_pos = wheel_entity->GetPosition();
+
+            Render* render = wheel_entity->GetComponent<Render>();
+            if (render)
+            {
+                render->Tick(); // ensure bounding box is up to date
+                BoundingBox aabb = render->GetBoundingBox();
+                Vector3 aabb_center = aabb.GetCenter();
+                if (!aabb_center.IsNaN())
+                {
+                    wheel_world_pos = aabb_center;
+                }
+                else
+                {
+                    SP_LOG_WARNING("non finite bbox center on wheel '%s' in SyncWheelOffsetsFromEntities, using entity origin", wheel_entity->GetObjectName().c_str());
+                }
+            }
+
+            // transform to vehicle-local space
+            // this handles cases where wheel is a child of an intermediate entity (e.g. "model")
+            Vector3 local_pos = vehicle_world_rot_inv * (wheel_world_pos - vehicle_world_pos);
+
+            // update the physics wheel offset x and z to match the mesh position
+            m_vehicle_simulation->set_wheel_offset(i, local_pos.x, local_pos.z);
+        }
+
+        if (m_vehicle_simulation->has_multibody() && !m_vehicle_simulation->rebuild_multibody())
+        {
+            SP_LOG_ERROR("failed to rebuild car suspension after wheel synchronization");
+        }
+    }
+
+    void Physics::SetCenterOfMassOffset(const Vector3& offset)
+    {
+        SetCenterOfMassOffset(offset.x, offset.y, offset.z);
+    }
+
+    void Physics::SetCenterOfMassOffset(float x, float y, float z)
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            SP_LOG_WARNING("SetCenterOfMassOffset only works with Vehicle body type");
+            return;
+        }
+
+        m_vehicle_simulation->set_center_of_mass(x, y, z);
+    }
+
+    Vector3 Physics::GetCenterOfMassOffset() const
+    {
+        if (m_body_type != BodyType::Vehicle)
+        {
+            return Vector3::Zero;
+        }
+
+        return Vector3(m_vehicle_simulation->get_center_of_mass_x(), m_vehicle_simulation->get_center_of_mass_y(), m_vehicle_simulation->get_center_of_mass_z());
+    }
+
+    void Physics::SetMeshConvexSourceEntity(Entity* entity)
+    {
+        m_mesh_convex_source = entity;
+
+        // if body type is already MeshConvex, recreate the physics shapes
+        if (m_body_type == BodyType::MeshConvex)
+        {
+            Create();
+        }
+    }
+
+    void Physics::UpdateWheelTransforms()
+    {
+        if (m_body_type != BodyType::Vehicle || !Engine::IsFlagSet(EngineMode::Playing))
+        {
+            return;
+        }
+
+        for (int i = 0; i < static_cast<int>(WheelIndex::Count); i++)
+        {
+            Entity* wheel_entity = m_wheel_entities[i];
+            if (!wheel_entity)
+            {
+                continue;
+            }
+
+            bool is_right_wheel = (i == static_cast<int>(WheelIndex::FrontRight) || i == static_cast<int>(WheelIndex::RearRight));
+            PxRigidDynamic* wheel_actor = m_vehicle_simulation->get_multibody_state().corners[i].wheel_body;
+            if (!wheel_actor)
+            {
+                continue;
+            }
+
+            Vector3 wheel_position;
+            Quaternion wheel_rotation;
+            from_px_transform(wheel_actor->getGlobalPose(), wheel_position, wheel_rotation);
+            if (!wheel_position.IsFinite() || !wheel_rotation.IsFinite())
+            {
+                continue;
+            }
+
+            if (is_right_wheel)
+            {
+                wheel_rotation *= Quaternion::FromAxisAngle(Vector3::Up, math::pi);
+            }
+            wheel_position = TransformVehiclePointToRender(wheel_position);
+            wheel_rotation = TransformVehicleRotationToRender(wheel_rotation);
+            wheel_position -= wheel_rotation * m_wheel_mesh_center_offsets[i];
+            wheel_entity->SetPosition(wheel_position);
+            wheel_entity->SetRotation(wheel_rotation);
+        }
+    }
+
+    void Physics::CaptureCheapWheelRestPoses()
+    {
+        for (int i = 0; i < static_cast<int>(WheelIndex::Count); i++)
+        {
+            Entity* wheel_entity = m_wheel_entities[i];
+            if (!wheel_entity)
+            {
+                continue;
+            }
+            if (!m_cheap_wheel_rest_captured[i])
+            {
+                m_cheap_wheel_local_pos[i] = wheel_entity->GetPositionLocal();
+                m_cheap_wheel_local_rot[i] = wheel_entity->GetRotationLocal();
+                m_cheap_wheel_rest_captured[i] = true;
+            }
+        }
+    }
+
+    void Physics::UpdateCheapWheelTransforms()
+    {
+        if (m_body_type != BodyType::Vehicle || !Engine::IsFlagSet(EngineMode::Playing))
+        {
+            return;
+        }
+
+        CaptureCheapWheelRestPoses();
+
+        Entity* vehicle_entity = GetEntity();
+        if (!vehicle_entity)
+        {
+            return;
+        }
+
+        const Vector3 vehicle_position = vehicle_entity->GetPosition();
+        const Quaternion vehicle_rotation = vehicle_entity->GetRotation();
+        Vector3 car_right = vehicle_rotation * Vector3::Right;
+        Vector3 car_up = vehicle_rotation * Vector3::Up;
+        if (car_right.LengthSquared() > 0.0001f)
+        {
+            car_right.Normalize();
+        }
+        if (car_up.LengthSquared() > 0.0001f)
+        {
+            car_up.Normalize();
+        }
+
+        const Quaternion spin = Quaternion::FromAxisAngle(car_right, m_cheap_wheel_roll);
+        const Quaternion steer_q = Quaternion::FromAxisAngle(car_up, m_cheap_steer_angle);
+
+        for (int i = 0; i < static_cast<int>(WheelIndex::Count); i++)
+        {
+            Entity* wheel_entity = m_wheel_entities[i];
+            if (!wheel_entity || !m_cheap_wheel_rest_captured[i])
+            {
+                continue;
+            }
+
+            const bool is_front =
+                i == static_cast<int>(WheelIndex::FrontLeft) ||
+                i == static_cast<int>(WheelIndex::FrontRight);
+            const Quaternion base = vehicle_rotation * m_cheap_wheel_local_rot[i];
+            Quaternion wheel_rotation = (is_front ? steer_q : Quaternion::Identity) * spin * base;
+            Vector3 wheel_position = vehicle_position + vehicle_rotation * m_cheap_wheel_local_pos[i];
+            wheel_position -= wheel_rotation * m_wheel_mesh_center_offsets[i];
+            if (!wheel_position.IsFinite() || !wheel_rotation.IsFinite())
+            {
+                continue;
+            }
+            wheel_entity->SetPosition(wheel_position);
+            wheel_entity->SetRotation(wheel_rotation);
+        }
+    }
+
+    void Physics::Create()
+    {
+        // serializes the whole physx setup, the prefab path runs on loader workers and physx corrupts the scene on concurrent writes
+        lock_guard<recursive_mutex> physx_lock(PhysicsWorld::GetMutex());
+
+        // clear previous state
+        Remove();
+
+        // auto-detect body type if not explicitly set
+        if (m_body_type == BodyType::Max)
+        {
+            m_body_type = DetectBodyType();
+        }
+
+        PxPhysics* physics = static_cast<PxPhysics*>(PhysicsWorld::GetPhysics());
+        PxScene* scene     = static_cast<PxScene*>(PhysicsWorld::GetScene());
+
+        // material - shared across all shapes (if multiple shapes are used)
+        m_material = physics->createMaterial(m_friction, m_friction_rolling, m_restitution);
+
+        // body/controller
+        if (m_body_type == BodyType::Controller)
+        {
+            if (!controller_manager)
+            {
+                controller_manager = PxCreateControllerManager(*scene);
+                if (!controller_manager)
+                {
+                    SP_LOG_ERROR("Failed to create controller manager");
+                    return;
+                }
+            }
+
+            PxCapsuleControllerDesc desc;
+            desc.radius           = controller_radius;
+            desc.height           = standing_height;
+            desc.climbingMode     = PxCapsuleClimbingMode::eEASY; // easier handling on steps/slopes
+            desc.stepOffset       = 0.3f; // keep under half a meter for better stepping
+            desc.slopeLimit       = cosf(60.0f * math::deg_to_rad); // 60° climbable slope
+            desc.contactOffset    = 0.01f; // allows early contact without tunneling
+            desc.upDirection      = PxVec3(0, 1, 0); // up is y
+            desc.nonWalkableMode  = PxControllerNonWalkableMode::ePREVENT_CLIMBING_AND_FORCE_SLIDING;
+
+            // optional but recommended: disable callbacks unless needed
+            desc.reportCallback   = nullptr;
+            desc.behaviorCallback = nullptr;
+
+            // apply initial position
+            const Vector3& pos = GetEntity()->GetPosition();
+            desc.position      = PxExtendedVec3(pos.x, pos.y, pos.z);
+
+            // assign material
+            desc.material = static_cast<PxMaterial*>(m_material);
+
+            // create controller
+            m_controller = static_cast<PxControllerManager*>(controller_manager)->createController(desc);
+            if (!m_controller)
+            {
+                SP_LOG_ERROR("failed to create capsule controller");
+                static_cast<PxMaterial*>(m_material)->release();
+                m_material = nullptr;
+                return;
+            }
+
+            // note: the controller internally references the material, so don't release m_material here
+            // it will be released in Remove() when the controller is destroyed
+
+            // tag the cct's internal actor so the simulation filter shader can
+            // suppress contacts between the character controller and the vehicle
+            PxRigidActor* cct_actor = static_cast<PxController*>(m_controller)->getActor();
+            if (cct_actor)
+            {
+                tag_actor_shapes(cct_actor, 1);
+            }
+        }
+        else if (m_body_type == BodyType::Vehicle)
+        {
+            EnsureVehicleSimulation();
+            car::setup_params params;
+            params.physics = physics;
+            params.scene   = scene;
+            params.create_mechanisms = m_vehicle_sim_mode == VehicleSimMode::Full;
+
+            if (m_vehicle_simulation->setup(params))
+            {
+                m_actors.resize(1, nullptr);
+                PxRigidDynamic* body = m_vehicle_simulation->get_body();
+                m_actors[0] = body;
+                m_actors_active.assign(1, true);
+                m_actors_active_count = 1;
+
+                Vector3 pos = GetEntity()->GetPosition();
+                PxTransform current_pose = body->getGlobalPose();
+                body->setGlobalPose(PxTransform(PxVec3(pos.x, current_pose.p.y, pos.z)));
+                if (params.create_mechanisms)
+                {
+                    if (!m_vehicle_simulation->rebuild_multibody(false))
+                    {
+                        SP_LOG_ERROR("failed to place car suspension assembly");
+                    }
+                }
+                if (m_chassis_entity)
+                {
+                    BuildChassisConvexShapes(m_chassis_entity, m_chassis_entities_to_exclude);
+                }
+                body->userData = reinterpret_cast<void*>(GetEntity());
+                tag_actor_shapes(body, 2, m_vehicle_simulation->multibody_collision_group());
+                if (!m_vehicle_simulation_active)
+                {
+                    m_vehicle_simulation->set_simulation_enabled(false);
+                }
+                else if (m_vehicle_sim_mode == VehicleSimMode::Cheap)
+                {
+                    m_vehicle_simulation->set_mechanism_simulation_enabled(false);
+                    body->setActorFlag(PxActorFlag::eDISABLE_GRAVITY, true);
+                }
+
+                // run the vehicle force model in lockstep with the fixed physics step
+                PhysicsWorld::RegisterVehicleStepCallback(this, [this](float dt) { TickVehicleSubstep(dt); });
+            }
+            else
+            {
+                SP_LOG_ERROR("failed to create vehicle physics body");
+            }
+        }
+        else if (m_body_type == BodyType::Cloth)
+        {
+            CreateCloth();
+            return;
+        }
+        else if (m_body_type == BodyType::Heightfield)
+        {
+            // a terrain grid is never anything but immovable ground
+            m_is_static    = true;
+            m_is_kinematic = false;
+
+            CreateHeightfield();
+            if (!m_mesh)
+            {
+                return;
+            }
+
+            CreateBodies();
+            m_scale_previous = GetEntity()->GetScale();
+            return;
+        }
+        else if (m_body_type == BodyType::MeshConvex)
+        {
+            // compound shape built from convex hulls of entity hierarchy meshes
+            // this walks all descendants of a source entity and creates a convex hull for each mesh
+
+            Entity* source_entity = m_mesh_convex_source ? m_mesh_convex_source : GetEntity();
+            if (!source_entity)
+            {
+                SP_LOG_ERROR("No source entity for MeshConvex body type");
+                return;
+            }
+
+            // collect all entities with render components in the hierarchy
+            vector<Entity*> mesh_entities;
+            mesh_entities.push_back(source_entity);
+            source_entity->GetDescendants(&mesh_entities);
+
+            // filter to only entities with render components
+            vector<pair<Entity*, Render*>> render_entities;
+            for (Entity* entity : mesh_entities)
+            {
+                if (Render* render = entity->GetComponent<Render>())
+                {
+                    render_entities.push_back({entity, render});
+                }
+            }
+
+            if (render_entities.empty())
+            {
+                SP_LOG_ERROR("No render entities found in hierarchy for MeshConvex");
+                return;
+            }
+
+            // create the rigid body at the physics entity's transform
+            Vector3 body_pos = GetEntity()->GetPosition();
+            Quaternion body_rot = GetEntity()->GetRotation();
+            PxTransform body_pose(
+                PxVec3(body_pos.x, body_pos.y, body_pos.z),
+                PxQuat(body_rot.x, body_rot.y, body_rot.z, body_rot.w)
+            );
+
+            PxRigidActor* actor = nullptr;
+            if (IsStatic())
+            {
+                actor = physics->createRigidStatic(body_pose);
+            }
+            else
+            {
+                actor = physics->createRigidDynamic(body_pose);
+                PxRigidDynamic* dynamic = actor->is<PxRigidDynamic>();
+                if (dynamic)
+                {
+                    dynamic->setMass(m_mass);
+                    dynamic->setRigidBodyFlag(PxRigidBodyFlag::eENABLE_CCD, !m_is_kinematic);
+                    dynamic->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, m_is_kinematic);
+                    dynamic->setRigidDynamicLockFlags(build_lock_flags(m_position_lock, m_rotation_lock));
+                }
+            }
+
+            if (!actor)
+            {
+                SP_LOG_ERROR("Failed to create rigid actor for MeshConvex");
+                return;
+            }
+
+            // cooking parameters for convex hull generation
+            PxTolerancesScale px_scale;
+            px_scale.length = 1.0f;
+            Vector3 gravity = PhysicsWorld::GetGravity();
+            px_scale.speed = sqrtf(gravity.x * gravity.x + gravity.y * gravity.y + gravity.z * gravity.z);
+            PxCookingParams params(px_scale);
+            params.convexMeshCookingType = PxConvexMeshCookingType::eQUICKHULL;
+            params.meshPreprocessParams |= PxMeshPreprocessingFlag::eWELD_VERTICES;
+            params.meshWeldTolerance = 0.00001f;
+            params.gaussMapLimit = 32;
+
+            PxInsertionCallback* insertion_callback = PxGetStandaloneInsertionCallback();
+            PxMaterial* material = static_cast<PxMaterial*>(m_material);
+            if (!insertion_callback || !material)
+            {
+                SP_LOG_ERROR("MeshConvex requires valid PhysX cooking and material state");
+                actor->release();
+                return;
+            }
+
+            // inverse transform to convert world positions to body-local space
+            Quaternion body_rot_inv = body_rot.Conjugate();
+
+            int shapes_created = 0;
+            for (const auto& [entity, render] : render_entities)
+            {
+                // get geometry
+                vector<uint32_t> indices;
+                vector<RHI_Vertex_PosTexNorTan> vertices;
+                render->GetGeometry(&indices, &vertices);
+                if (vertices.empty())
+                {
+                    continue;
+                }
+
+                // simplify geometry for physics (use moderate detail for convex hulls)
+                const size_t max_convex_verts = 256; // physx limit
+                if (vertices.size() > max_convex_verts)
+                {
+                    const size_t target_index_count = min<size_t>(indices.size(), max_convex_verts * 3);
+                    geometry_processing::simplify(indices, vertices, target_index_count, false, false);
+                }
+
+                // compute the local transform of this entity relative to the physics body
+                Vector3 entity_world_pos = entity->GetPosition();
+                Quaternion entity_world_rot = entity->GetRotation();
+                Vector3 entity_scale = entity->GetScale();
+
+                // transform entity position to body-local space
+                Vector3 local_pos = body_rot_inv * (entity_world_pos - body_pos);
+                Quaternion local_rot = body_rot_inv * entity_world_rot;
+
+                // convert vertices to physx format in entity-local space (with scale)
+                vector<PxVec3> px_vertices;
+                px_vertices.reserve(vertices.size());
+                for (const auto& vertex : vertices)
+                {
+                    px_vertices.emplace_back(
+                        vertex.pos[0] * entity_scale.x,
+                        vertex.pos[1] * entity_scale.y,
+                        vertex.pos[2] * entity_scale.z
+                    );
+                }
+                if (px_vertices.size() < 4)
+                {
+                    SP_LOG_WARNING(
+                        "Skipping convex hull with fewer than four vertices for entity '%s'",
+                        entity->GetObjectName().c_str()
+                    );
+                    continue;
+                }
+                PxVec3 minimum(PX_MAX_F32);
+                PxVec3 maximum(-PX_MAX_F32);
+                bool finite = true;
+                for (const PxVec3& vertex : px_vertices)
+                {
+                    if (!vertex.isFinite())
+                    {
+                        finite = false;
+                        break;
+                    }
+                    minimum.x = min(minimum.x, vertex.x);
+                    minimum.y = min(minimum.y, vertex.y);
+                    minimum.z = min(minimum.z, vertex.z);
+                    maximum.x = max(maximum.x, vertex.x);
+                    maximum.y = max(maximum.y, vertex.y);
+                    maximum.z = max(maximum.z, vertex.z);
+                }
+                const PxVec3 extent = maximum - minimum;
+                if (
+                    !finite ||
+                    extent.x <= 0.000001f ||
+                    extent.y <= 0.000001f ||
+                    extent.z <= 0.000001f
+                )
+                {
+                    SP_LOG_WARNING(
+                        "Skipping degenerate convex hull for entity '%s'",
+                        entity->GetObjectName().c_str()
+                    );
+                    continue;
+                }
+
+                // create convex mesh
+                PxConvexMeshDesc mesh_desc;
+                mesh_desc.points.count = static_cast<PxU32>(px_vertices.size());
+                mesh_desc.points.stride = sizeof(PxVec3);
+                mesh_desc.points.data = px_vertices.data();
+                mesh_desc.flags =
+                    PxConvexFlag::eCOMPUTE_CONVEX |
+                    PxConvexFlag::eSHIFT_VERTICES;
+                mesh_desc.vertexLimit = 64;
+
+                PxConvexMeshCookingResult::Enum condition;
+                PxConvexMesh* convex_mesh = PxCreateConvexMesh(params, mesh_desc, *insertion_callback, &condition);
+                if (!convex_mesh || condition != PxConvexMeshCookingResult::eSUCCESS)
+                {
+                    SP_LOG_WARNING("Failed to create convex hull for entity '%s'", entity->GetObjectName().c_str());
+                    if (convex_mesh)
+                    {
+                        convex_mesh->release();
+                    }
+                    continue;
+                }
+
+                // create shape with local pose relative to body
+                PxConvexMeshGeometry geometry(convex_mesh);
+                PxShape* shape = physics->createShape(geometry, *material);
+                if (shape)
+                {
+                    // set local pose to position this shape relative to body center
+                    PxTransform local_pose(
+                        PxVec3(local_pos.x, local_pos.y, local_pos.z),
+                        PxQuat(local_rot.x, local_rot.y, local_rot.z, local_rot.w)
+                    );
+                    shape->setLocalPose(local_pose);
+                    shape->setFlag(PxShapeFlag::eVISUALIZATION, true);
+                    actor->attachShape(*shape);
+                    shape->release(); // actor owns the shape now
+                    shapes_created++;
+                }
+
+                convex_mesh->release(); // shape holds its own reference
+            }
+
+            if (shapes_created == 0)
+            {
+                SP_LOG_WARNING(
+                    "No convex shapes were created for MeshConvex on '%s'",
+                    GetEntity() ? GetEntity()->GetObjectName().c_str() : "unknown"
+                );
+                actor->release();
+                return;
+            }
+
+            // update mass and inertia based on compound shape
+            if (PxRigidDynamic* dynamic = actor->is<PxRigidDynamic>())
+            {
+                if (m_center_of_mass != Vector3::Zero)
+                {
+                    PxVec3 com(m_center_of_mass.x, m_center_of_mass.y, m_center_of_mass.z);
+                    PxRigidBodyExt::setMassAndUpdateInertia(*dynamic, m_mass, &com);
+                }
+                else
+                {
+                    PxRigidBodyExt::setMassAndUpdateInertia(*dynamic, m_mass);
+                }
+            }
+
+            actor->userData = reinterpret_cast<void*>(GetEntity());
+            PhysicsWorld::AddActor(actor);
+
+            m_actors.resize(1, nullptr);
+            m_actors[0] = actor;
+            m_actors_active.assign(1, true);
+            m_actors_active_count = 1;
+
+            SP_LOG_INFO("MeshConvex created: %d convex shapes from %zu entities", shapes_created, render_entities.size());
+        }
+        else
+        {
+            // mesh
+            if (m_body_type == BodyType::Mesh)
+            {
+                Render* render = GetEntity()->GetComponent<Render>();
+                if (!render)
+                {
+                    SP_LOG_ERROR("No Render component found for mesh shape");
+                    return;
+                }
+
+                // get geometry
+                vector<uint32_t> indices;
+                vector<RHI_Vertex_PosTexNorTan> vertices;
+                render->GetGeometry(&indices, &vertices);
+                if (vertices.empty() || indices.empty())
+                {
+                    SP_LOG_ERROR("Empty vertex or index data for mesh shape");
+                    return;
+                }
+
+                // simplify geometry
+                const float volume        = render->GetBoundingBox().GetVolume();
+                const float max_volume    = 100000.0f;
+                // simplify geometry based on volume (larger objects get more detail)
+                const float volume_factor       = clamp(volume / max_volume, 0.0f, 1.0f);
+                const size_t min_index_count    = min<size_t>(indices.size(), 256);
+                const size_t max_index_count    = 16'000;
+                const size_t target_index_count = clamp<size_t>(static_cast<size_t>(indices.size() * volume_factor), min_index_count, max_index_count);
+                geometry_processing::simplify(indices, vertices, target_index_count, false, false);
+
+                // warn if we hit the complexity cap (original mesh was very detailed)
+                if (indices.size() > max_index_count && target_index_count == max_index_count)
+                {
+                    SP_LOG_WARNING("Mesh '%s' was simplified to %zu indices. It's still complex and may impact physics performance.", render->GetEntity()->GetObjectName().c_str(), target_index_count);
+                }
+
+                // convert vertices to physx format
+                vector<PxVec3> px_vertices;
+                px_vertices.reserve(vertices.size());
+                Vector3 scale = GetEntity()->GetScale();
+                for (const auto& vertex : vertices)
+                {
+                    px_vertices.emplace_back(vertex.pos[0] * scale.x, vertex.pos[1] * scale.y, vertex.pos[2] * scale.z);
+                }
+
+                // remove degenerate triangles (zero/near-zero area) that would cause physx cooking to fail
+                {
+                    const float area_epsilon = 1e-6f;
+                    vector<uint32_t> valid_indices;
+                    valid_indices.reserve(indices.size());
+
+                    for (size_t i = 0; i < indices.size(); i += 3)
+                    {
+                        const PxVec3& v0 = px_vertices[indices[i]];
+                        const PxVec3& v1 = px_vertices[indices[i + 1]];
+                        const PxVec3& v2 = px_vertices[indices[i + 2]];
+
+                        // compute triangle area via cross product
+                        PxVec3 edge1 = v1 - v0;
+                        PxVec3 edge2 = v2 - v0;
+                        float area   = edge1.cross(edge2).magnitude() * 0.5f;
+
+                        if (area > area_epsilon)
+                        {
+                            valid_indices.push_back(indices[i]);
+                            valid_indices.push_back(indices[i + 1]);
+                            valid_indices.push_back(indices[i + 2]);
+                        }
+                    }
+
+                    indices = move(valid_indices);
+                }
+
+                if (indices.empty())
+                {
+                    SP_LOG_WARNING("Mesh '%s' has no valid triangles after degenerate removal, skipping physics", GetEntity()->GetObjectName().c_str());
+                    return;
+                }
+
+                // cooking parameters
+                PxTolerancesScale _scale;
+                _scale.length                          = 1.0f;                         // 1 unit = 1 meter
+                Vector3 gravity                        = PhysicsWorld::GetGravity();
+                _scale.speed                           = sqrtf(gravity.x * gravity.x + gravity.y * gravity.y + gravity.z * gravity.z); // magnitude of gravity vector
+                PxCookingParams params(_scale);
+                params.areaTestEpsilon                 = 0.06f * _scale.length * _scale.length;
+                params.planeTolerance                  = 0.0007f;
+                params.convexMeshCookingType           = PxConvexMeshCookingType::eQUICKHULL;
+                params.suppressTriangleMeshRemapTable  = false;
+                params.buildTriangleAdjacencies        = true;
+                params.buildGPUData                    = false;
+                params.meshPreprocessParams           |= PxMeshPreprocessingFlag::eWELD_VERTICES;
+                params.meshWeldTolerance               = 0.01f;
+                params.meshAreaMinLimit                = 0.0f;
+                params.meshEdgeLengthMaxLimit          = 500.0f;
+                params.gaussMapLimit                   = 32;
+                params.maxWeightRatioInTet             = FLT_MAX;
+
+                PxInsertionCallback* insertion_callback = PxGetStandaloneInsertionCallback();
+                // triangle mesh for exact collision, hull when the caller asked for one or the body
+                // is dynamic, physx cannot simulate a dynamic triangle mesh
+                const bool cook_convex = m_use_convex_hull || !(IsStatic() || IsKinematic());
+                if (!cook_convex)
+                {
+                    PxTriangleMeshDesc mesh_desc;
+                    mesh_desc.points.count     = static_cast<PxU32>(px_vertices.size());
+                    mesh_desc.points.stride    = sizeof(PxVec3);
+                    mesh_desc.points.data      = px_vertices.data();
+                    mesh_desc.triangles.count  = static_cast<PxU32>(indices.size() / 3);
+                    mesh_desc.triangles.stride = 3 * sizeof(PxU32);
+                    mesh_desc.triangles.data   = indices.data();
+
+                    // create
+                    PxTriangleMeshCookingResult::Enum condition;
+                    m_mesh = PxCreateTriangleMesh(params, mesh_desc, *insertion_callback, &condition);
+                    if (condition != PxTriangleMeshCookingResult::eSUCCESS)
+                    {
+                        SP_LOG_ERROR("Failed to create triangle mesh: %d", condition);
+                        if (m_mesh)
+                        {
+                            static_cast<PxTriangleMesh*>(m_mesh)->release();
+                            m_mesh = nullptr;
+                        }
+                        return;
+                    }
+                }
+                else // convex hull
+                {
+                    PxConvexMeshDesc mesh_desc;
+                    mesh_desc.points.count  = static_cast<PxU32>(px_vertices.size());
+                    mesh_desc.points.stride = sizeof(PxVec3);
+                    mesh_desc.points.data   = px_vertices.data();
+                    mesh_desc.flags         = PxConvexFlag::eCOMPUTE_CONVEX;
+
+                    // create
+                    PxConvexMeshCookingResult::Enum condition;
+                    m_mesh = PxCreateConvexMesh(params, mesh_desc, *insertion_callback, &condition);
+                    if (!m_mesh || condition != PxConvexMeshCookingResult::eSUCCESS)
+                    {
+                        SP_LOG_ERROR("Failed to create convex mesh: %d", condition);
+                        if (m_mesh)
+                        {
+                            static_cast<PxConvexMesh*>(m_mesh)->release();
+                            m_mesh = nullptr;
+                        }
+                        return;
+                    }
+                }
+            }
+
+            CreateBodies();
+            m_scale_previous = GetEntity()->GetScale();
+        }
+    }
+
+    void Physics::UpdateShapeGeometry()
+    {
+        Vector3 scale = GetEntity()->GetScale();
+        if (scale == m_scale_previous)
+        {
+            return;
+        }
+
+        m_scale_previous = scale;
+
+        for (uint32_t i = 0; i < static_cast<uint32_t>(m_actors.size()); i++)
+        {
+            PxRigidActor* actor = static_cast<PxRigidActor*>(m_actors[i]);
+            if (!actor)
+            {
+                continue;
+            }
+
+            PxShape* shape = nullptr;
+            if (actor->getNbShapes() == 0)
+            {
+                continue;
+            }
+            actor->getShapes(&shape, 1);
+            if (!shape)
+            {
+                continue;
+            }
+
+            switch (m_body_type)
+            {
+                case BodyType::Box:
+                    shape->setGeometry(PxBoxGeometry(scale.x * 0.5f, scale.y * 0.5f, scale.z * 0.5f));
+                    break;
+                case BodyType::Sphere:
+                {
+                    float radius = max(max(scale.x, scale.y), scale.z) * 0.5f;
+                    shape->setGeometry(PxSphereGeometry(radius));
+                    break;
+                }
+                case BodyType::Capsule:
+                {
+                    float radius      = max(scale.x, scale.z) * 0.5f;
+                    float half_height = scale.y * 0.5f;
+                    shape->setGeometry(PxCapsuleGeometry(radius, half_height));
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+    }
+
+    void Physics::CreateHeightfield()
+    {
+        // the component sits on a tile child of the terrain, so each body covers only the slice of the
+        // grid its tile draws, that keeps distance activation able to drop the ones far from the camera
+        Entity* entity   = GetEntity();
+        Terrain* terrain = entity->GetComponent<Terrain>();
+        int tile_index   = -1;
+        if (!terrain && entity->GetParent())
+        {
+            terrain    = entity->GetParent()->GetComponent<Terrain>();
+            tile_index = Terrain::ParseTileIndex(entity);
+        }
+
+        if (!terrain || !terrain->HasHeightfield())
+        {
+            // a saved world can restore this component before the terrain has generated, the terrain
+            // rebuilds the body itself once its grid exists
+            SP_LOG_WARNING("a heightfield body needs a generated terrain component on itself or its parent");
+            return;
+        }
+
+        const vector<Vector3>& positions = terrain->GetPositions();
+        const uint32_t grid_width        = terrain->GetDenseWidth();  // samples along local x
+        const uint32_t grid_height       = terrain->GetDenseHeight(); // samples along local z
+        if (positions.size() < static_cast<size_t>(grid_width) * static_cast<size_t>(grid_height))
+        {
+            SP_LOG_ERROR("terrain grid holds fewer positions than its dimensions declare");
+            return;
+        }
+
+        // the sample window, neighbouring tiles share their boundary row and column so the surfaces
+        // meet without a seam and without overlapping each other
+        uint32_t x_start = 0;
+        uint32_t z_start = 0;
+        uint32_t x_count = grid_width;
+        uint32_t z_count = grid_height;
+        if (tile_index >= 0)
+        {
+            const uint32_t n  = max(terrain->GetTileCountAxis(), 1u);
+            const uint32_t tx = static_cast<uint32_t>(tile_index) % n;
+            const uint32_t tz = static_cast<uint32_t>(tile_index) / n;
+
+            x_start = (tx * (grid_width - 1)) / n;
+            z_start = (tz * (grid_height - 1)) / n;
+            x_count = ((tx + 1) * (grid_width - 1)) / n - x_start + 1;
+            z_count = ((tz + 1) * (grid_height - 1)) / n - z_start + 1;
+        }
+
+        if (x_count < 2 || z_count < 2)
+        {
+            SP_LOG_WARNING("terrain tile %d is too small to build a heightfield from", tile_index);
+            return;
+        }
+
+        float height_min = positions[static_cast<size_t>(z_start) * grid_width + x_start].y;
+        float height_max = height_min;
+        for (uint32_t z = 0; z < z_count; z++)
+        {
+            const size_t source_row = static_cast<size_t>(z_start + z) * grid_width + x_start;
+            for (uint32_t x = 0; x < x_count; x++)
+            {
+                const float height = positions[source_row + x].y;
+                height_min         = min(height_min, height);
+                height_max         = max(height_max, height);
+            }
+        }
+
+        // heights are int16, mapping the window's own range onto the full range keeps the step near a
+        // millimetre, a fixed scale would cost metres of precision on a tall map
+        const float height_centre = (height_max + height_min) * 0.5f;
+        const float height_scale  = max((height_max - height_min) / 65534.0f, 1e-4f);
+
+        // physx rows run along local x and columns along local z, the terrain grid is stored row major
+        // in z, so the two indices swap on the way in
+        const uint32_t sample_count = x_count * z_count;
+        vector<PxHeightFieldSample> samples(sample_count);
+        for (uint32_t z = 0; z < z_count; z++)
+        {
+            const size_t source_row = static_cast<size_t>(z_start + z) * grid_width + x_start;
+            for (uint32_t x = 0; x < x_count; x++)
+            {
+                const float quantised = (positions[source_row + x].y - height_centre) / height_scale;
+                samples[x * z_count + z].height = static_cast<PxI16>(clamp(quantised, -32767.0f, 32767.0f));
+            }
+        }
+
+        PxHeightFieldDesc desc;
+        desc.nbRows         = x_count;
+        desc.nbColumns      = z_count;
+        desc.format         = PxHeightFieldFormat::eS16_TM;
+        desc.samples.data   = samples.data();
+        desc.samples.stride = sizeof(PxHeightFieldSample);
+
+        m_mesh = PxCreateHeightField(desc, *PxGetStandaloneInsertionCallback());
+        if (!m_mesh)
+        {
+            SP_LOG_ERROR("failed to create the terrain heightfield");
+            return;
+        }
+        m_mesh_is_heightfield = true;
+
+        // a physx grid grows out of its corner, so the shape is pushed back to where the window starts
+        // in terrain space and then lifted to the middle of the height range
+        const TerrainGridMapping mapping = terrain->GetGridMapping();
+        m_heightfield_scale_row          = mapping.scale_x;
+        m_heightfield_scale_column       = mapping.scale_z;
+        m_heightfield_scale_height       = height_scale;
+        m_heightfield_offset             = Vector3(
+            -mapping.offset_x + static_cast<float>(x_start) * mapping.scale_x,
+            height_centre,
+            -mapping.offset_z + static_cast<float>(z_start) * mapping.scale_z
+        );
+
+        // the shape pose is relative to the tile entity, which already carries the tile's own offset
+        if (tile_index >= 0)
+        {
+            m_heightfield_offset.x -= entity->GetPositionLocal().x;
+            m_heightfield_offset.z -= entity->GetPositionLocal().z;
+        }
+    }
+
+    void Physics::CreateBodies()
+    {
+        PxPhysics* physics      = static_cast<PxPhysics*>(PhysicsWorld::GetPhysics());
+        Render* render  = GetEntity()->GetComponent<Render>();
+
+        // determine instance count - use render if available, otherwise single instance
+        const uint32_t instance_count = render ? render->GetInstanceCount() : 1;
+
+        // create bodies and shapes
+        m_actors.resize(instance_count, nullptr);
+        m_actors_active.assign(instance_count, true); // all actors start active
+        m_actors_active_count = instance_count;
+        for (uint32_t i = 0; i < instance_count; i++)
+        {
+            math::Matrix transform = (render && render->HasInstancing()) ? render->GetInstance(i, true) : GetEntity()->GetMatrix();
+            PxTransform pose(
+                PxVec3(transform.GetTranslation().x, transform.GetTranslation().y, transform.GetTranslation().z),
+                PxQuat(transform.GetRotation().x, transform.GetRotation().y, transform.GetRotation().z, transform.GetRotation().w)
+            );
+            PxRigidActor* actor = nullptr;
+            if (IsStatic())
+            {
+                actor = physics->createRigidStatic(pose);
+            }
+            else
+            {
+                actor = physics->createRigidDynamic(pose);
+                PxRigidDynamic* dynamic = actor->is<PxRigidDynamic>();
+                if (dynamic)
+                {
+                    dynamic->setMass(m_mass);
+                    dynamic->setRigidBodyFlag(PxRigidBodyFlag::eENABLE_CCD, !m_is_kinematic); // kinematics don't support ccd
+                    dynamic->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, m_is_kinematic);
+                    if (m_center_of_mass != Vector3::Zero)
+                    {
+                        PxVec3 p(m_center_of_mass.x, m_center_of_mass.y, m_center_of_mass.z);
+                        PxRigidBodyExt::setMassAndUpdateInertia(*dynamic, m_mass, &p);
+                    }
+                    dynamic->setRigidDynamicLockFlags(build_lock_flags(m_position_lock, m_rotation_lock));
+                }
+            }
+
+            PxShape* shape       = nullptr;
+            PxMaterial* material = static_cast<PxMaterial*>(m_material);
+            switch (m_body_type)
+            {
+                case BodyType::Box:
+                {
+                    Vector3 scale = GetEntity()->GetScale();
+                    PxBoxGeometry geometry(scale.x * 0.5f, scale.y * 0.5f, scale.z * 0.5f);
+                    shape = physics->createShape(geometry, *material);
+                    break;
+                }
+                case BodyType::Sphere:
+                {
+                    Vector3 scale = GetEntity()->GetScale();
+                    float radius  = max(max(scale.x, scale.y), scale.z) * 0.5f;
+                    PxSphereGeometry geometry(radius);
+                    shape = physics->createShape(geometry, *material);
+                    break;
+                }
+                case BodyType::Plane:
+                {
+                    PxPlaneGeometry geometry;
+                    shape = physics->createShape(geometry, *material);
+                    shape->setLocalPose(PxTransform(PxVec3(0, 0, 0), PxQuat(PxHalfPi, PxVec3(0, 0, 1))));
+                    break;
+                }
+                case BodyType::Capsule:
+                {
+                    Vector3 scale     = GetEntity()->GetScale();
+                    float radius      = max(scale.x, scale.z) * 0.5f;
+                    float half_height = scale.y * 0.5f;
+                    PxCapsuleGeometry geometry(radius, half_height);
+                    shape = physics->createShape(geometry, *material);
+                    shape->setLocalPose(PxTransform(PxVec3(0, 0, 0), PxQuat(PxHalfPi, PxVec3(0, 0, 1))));
+                    break;
+                }
+                case BodyType::Mesh:
+                {
+                    if (m_mesh)
+                    {
+                        // must mirror the cooking branch in Create, the pointer is one or the other
+                        const bool is_convex = m_use_convex_hull || !(IsStatic() || IsKinematic());
+
+                        // per instance scale, a scattered prop varies size per copy and without this
+                        // every instance collides at the size of the source mesh
+                        Vector3 scale = render->HasInstancing() ? render->GetInstance(i, false).GetScale() : Vector3::One;
+                        PxMeshScale mesh_scale(PxVec3(scale.x, scale.y, scale.z)); // runtime transform, cheap for statics but not reflected in the baked shape (raycasts etc)
+
+                        if (is_convex)
+                        {
+                            PxConvexMeshGeometry geometry(static_cast<PxConvexMesh*>(m_mesh), mesh_scale);
+                            shape = physics->createShape(geometry, *material);
+                        }
+                        else
+                        {
+                            PxTriangleMeshGeometry geometry(static_cast<PxTriangleMesh*>(m_mesh), mesh_scale);
+                            shape = physics->createShape(geometry, *material);
+                        }
+                    }
+                    break;
+                }
+                case BodyType::Heightfield:
+                {
+                    if (m_mesh)
+                    {
+                        PxHeightFieldGeometry geometry(
+                            static_cast<PxHeightField*>(m_mesh),
+                            PxMeshGeometryFlags(),
+                            m_heightfield_scale_height,
+                            m_heightfield_scale_row,
+                            m_heightfield_scale_column
+                        );
+                        shape = physics->createShape(geometry, *material);
+                        shape->setLocalPose(PxTransform(PxVec3(m_heightfield_offset.x, m_heightfield_offset.y, m_heightfield_offset.z)));
+                    }
+                    break;
+                }
+            }
+
+            if (shape)
+            {
+                shape->setFlag(PxShapeFlag::eVISUALIZATION, true);
+                actor->attachShape(*shape);
+                shape->release(); // release shape reference (actor owns it now)
+            }
+
+            if (actor)
+            {
+                actor->userData = reinterpret_cast<void*>(GetEntity());
+                PhysicsWorld::AddActor(actor);
+            }
+
+            m_actors[i] = actor;
+        }
+    }
+
+    void Physics::CreateCloth()
+    {
+        Render* render = GetEntity()->GetComponent<Render>();
+        if (!render)
+        {
+            SP_LOG_ERROR("Cloth requires a Render component");
+            return;
+        }
+
+        // extract geometry from the render's mesh
+        vector<uint32_t> indices;
+        vector<RHI_Vertex_PosTexNorTan> vertices;
+        render->GetGeometry(&indices, &vertices);
+        if (vertices.empty() || indices.empty())
+        {
+            SP_LOG_ERROR("Cloth mesh has no geometry");
+            return;
+        }
+
+        Mesh* source_mesh = render->GetMesh();
+        uint32_t source_sub_mesh_index = render->GetSubMeshIndex();
+        shared_ptr<Mesh> cloth_mesh = make_shared<Mesh>();
+        cloth_mesh->SetObjectName(source_mesh->GetObjectName());
+        cloth_mesh->SetType(source_mesh->GetType());
+        cloth_mesh->SetFlag(static_cast<uint32_t>(MeshFlags::PostProcessOptimize), false);
+        cloth_mesh->ReserveSubMeshes(source_sub_mesh_index + 1);
+        vector<RHI_Vertex_PosTexNorTan> cloth_mesh_vertices = vertices;
+        vector<uint32_t> cloth_mesh_indices = indices;
+        cloth_mesh->AddGeometry(cloth_mesh_vertices, cloth_mesh_indices, false, source_sub_mesh_index);
+        cloth_mesh->CreateGpuBuffers();
+        render->SetMesh(cloth_mesh.get(), source_sub_mesh_index);
+        m_cloth_mesh = move(cloth_mesh);
+
+        // store the global geometry buffer offset so we can update vertices in-place later
+        m_cloth_global_vertex_offset = render->GetVertexOffset();
+        m_cloth_vertex_count         = render->GetVertexCount();
+
+        // entity transform for converting local-space vertices to world space
+        Vector3 entity_pos   = GetEntity()->GetPosition();
+        Quaternion entity_rot = GetEntity()->GetRotation();
+        Vector3 entity_scale  = GetEntity()->GetScale();
+
+        // initialize particles from mesh vertices (local space, pre-scaled)
+        m_cloth_particles.resize(vertices.size());
+        for (size_t i = 0; i < vertices.size(); i++)
+        {
+            Vector3 local_pos(
+                vertices[i].pos[0] * entity_scale.x,
+                vertices[i].pos[1] * entity_scale.y,
+                vertices[i].pos[2] * entity_scale.z
+            );
+
+            Vector3 world_pos = entity_pos + entity_rot * local_pos;
+
+            m_cloth_particles[i].position          = world_pos;
+            m_cloth_particles[i].previous_position = world_pos;
+            m_cloth_particles[i].inverse_mass      = 1.0f / max(m_mass, 0.001f);
+        }
+
+        // imported meshes duplicate vertices at seams and hard edges, weld the coincident ones so the cloth stays connected
+        {
+            const float weld_epsilon = 1e-4f;
+
+            m_cloth_weld_map.resize(vertices.size());
+            map<tuple<int32_t, int32_t, int32_t>, uint32_t> position_to_canonical;
+            const float quantize = 1.0f / weld_epsilon;
+
+            for (uint32_t i = 0; i < static_cast<uint32_t>(m_cloth_particles.size()); i++)
+            {
+                const Vector3& pos = m_cloth_particles[i].position;
+                auto key = make_tuple(
+                    static_cast<int32_t>(roundf(pos.x * quantize)),
+                    static_cast<int32_t>(roundf(pos.y * quantize)),
+                    static_cast<int32_t>(roundf(pos.z * quantize))
+                );
+
+                auto it = position_to_canonical.find(key);
+                if (it != position_to_canonical.end())
+                {
+                    m_cloth_weld_map[i] = it->second;
+                    m_cloth_particles[i].inverse_mass = 0.0f; // slave: driven by canonical
+                }
+                else
+                {
+                    position_to_canonical[key] = i;
+                    m_cloth_weld_map[i] = i;
+                }
+            }
+        }
+
+        float max_pin_projection = -FLT_MAX;
+        for (uint32_t i = 0; i < static_cast<uint32_t>(m_cloth_particles.size()); i++)
+        {
+            if (m_cloth_weld_map[i] == i)
+            {
+                max_pin_projection = max(max_pin_projection, Vector3::Dot(m_cloth_particles[i].position, m_cloth_pin_direction));
+            }
+        }
+
+        const float pin_threshold = 0.05f;
+        for (uint32_t i = 0; i < static_cast<uint32_t>(m_cloth_particles.size()); i++)
+        {
+            if (m_cloth_weld_map[i] == i && Vector3::Dot(m_cloth_particles[i].position, m_cloth_pin_direction) >= max_pin_projection - pin_threshold)
+            {
+                m_cloth_particles[i].inverse_mass = 0.0f;
+            }
+        }
+
+        // store triangle indices and original vertices for normal recalculation + tex/tan preservation
+        m_cloth_indices = indices;
+        m_cloth_base_vertices = vertices;
+
+        // build distance constraints from triangle edges using welded (canonical) indices
+        // so constraints span across uv seams and hard edges
+        auto edge_key = [](uint32_t a, uint32_t b) -> uint64_t
+        {
+            if (a > b)
+            {
+                swap(a, b);
+            }
+            return (static_cast<uint64_t>(a) << 32) | static_cast<uint64_t>(b);
+        };
+
+        unordered_set<uint64_t> seen_edges;
+        for (size_t i = 0; i < indices.size(); i += 3)
+        {
+            uint32_t tri[3] = { indices[i], indices[i + 1], indices[i + 2] };
+            for (int e = 0; e < 3; e++)
+            {
+                uint32_t a = m_cloth_weld_map[tri[e]];
+                uint32_t b = m_cloth_weld_map[tri[(e + 1) % 3]];
+                if (a == b)
+                {
+                    continue;
+                }
+
+                uint64_t key = edge_key(a, b);
+                if (seen_edges.insert(key).second)
+                {
+                    ClothConstraint c;
+                    c.index_a     = a;
+                    c.index_b     = b;
+                    c.rest_length = (m_cloth_particles[a].position - m_cloth_particles[b].position).Length();
+                    m_cloth_constraints.push_back(c);
+                }
+            }
+        }
+
+        uint32_t canonical_count = 0;
+        for (uint32_t i = 0; i < static_cast<uint32_t>(m_cloth_weld_map.size()); i++)
+        {
+            if (m_cloth_weld_map[i] == i)
+            {
+                canonical_count++;
+            }
+        }
+
+        // the renderer may have already built this entity's blas without the update bit,
+        // so invalidate it to force a rebuild with ALLOW_UPDATE_BIT on the next frame
+        render->SetAllowBlasUpdate(true);
+        render->InvalidateAccelerationStructure();
+
+        SP_LOG_INFO("Cloth created: %u particles (%zu vertices, %u welded), %zu constraints, %zu triangles",
+            canonical_count, m_cloth_particles.size(), static_cast<uint32_t>(m_cloth_particles.size()) - canonical_count,
+            m_cloth_constraints.size(), indices.size() / 3);
+    }
+
+    void Physics::TickCloth(bool is_playing, float delta_time)
+    {
+        if (!is_playing || m_cloth_particles.empty())
+        {
+            return;
+        }
+
+        // sub-step with a fixed maximum dt to prevent simulation explosion from frame spikes
+        // (the synchronous gpu upload in UpdateVertices can stall the cpu, causing large delta_time values)
+        const float max_dt      = 1.0f / 60.0f;
+        const float clamped_dt  = min(delta_time, max_dt);
+        const float dt          = clamped_dt;
+        const float damping     = 1.0f - m_cloth_damping;
+        const Vector3 gravity   = PhysicsWorld::GetGravity();
+
+        // verlet integration
+        for (auto& p : m_cloth_particles)
+        {
+            if (p.inverse_mass == 0.0f)
+            {
+                continue;
+            }
+
+            Vector3 velocity = (p.position - p.previous_position) * damping;
+            p.previous_position = p.position;
+            p.position += velocity + gravity * (dt * dt);
+        }
+
+        // wind
+        if (m_cloth_wind_enabled)
+        {
+            float time = static_cast<float>(Timer::GetTimeSec());
+            for (auto& p : m_cloth_particles)
+            {
+                if (p.inverse_mass == 0.0f)
+                {
+                    continue;
+                }
+
+                Vector3 wind = World::SampleWind(p.position, time);
+                p.position += wind * (p.inverse_mass * dt * dt);
+            }
+        }
+
+        // constraint projection
+        for (uint32_t iter = 0; iter < m_cloth_iterations; iter++)
+        {
+            for (const auto& c : m_cloth_constraints)
+            {
+                ClothParticle& pa = m_cloth_particles[c.index_a];
+                ClothParticle& pb = m_cloth_particles[c.index_b];
+
+                Vector3 delta       = pb.position - pa.position;
+                float current_length = delta.Length();
+                if (current_length < 1e-7f)
+                {
+                    continue;
+                }
+
+                float diff         = (current_length - c.rest_length) / current_length;
+                float total_weight = pa.inverse_mass + pb.inverse_mass;
+                if (total_weight == 0.0f)
+                {
+                    continue;
+                }
+
+                Vector3 correction = delta * (diff * m_cloth_stiffness / total_weight);
+                pa.position += correction * pa.inverse_mass;
+                pb.position -= correction * pb.inverse_mass;
+            }
+        }
+
+        // sync welded vertices: copy canonical positions to their duplicates
+        if (!m_cloth_weld_map.empty())
+        {
+            for (uint32_t i = 0; i < static_cast<uint32_t>(m_cloth_particles.size()); i++)
+            {
+                uint32_t canonical = m_cloth_weld_map[i];
+                if (canonical != i)
+                {
+                    m_cloth_particles[i].position          = m_cloth_particles[canonical].position;
+                    m_cloth_particles[i].previous_position = m_cloth_particles[canonical].previous_position;
+                }
+            }
+        }
+
+        // ground collision (simple y=0 plane)
+        const float ground_y = 0.0f;
+        for (auto& p : m_cloth_particles)
+        {
+            if (p.position.y < ground_y)
+            {
+                p.position.y = ground_y;
+            }
+        }
+
+        // clamp particle positions to a sane world-space bound to prevent diverged
+        // particles from producing nan/inf vertex data that crashes the gpu
+        const float position_limit = 10000.0f;
+        for (auto& p : m_cloth_particles)
+        {
+            if (p.inverse_mass == 0.0f)
+            {
+                continue;
+            }
+
+            p.position.x = clamp(p.position.x, -position_limit, position_limit);
+            p.position.y = clamp(p.position.y, -position_limit, position_limit);
+            p.position.z = clamp(p.position.z, -position_limit, position_limit);
+
+            p.previous_position.x = clamp(p.previous_position.x, -position_limit, position_limit);
+            p.previous_position.y = clamp(p.previous_position.y, -position_limit, position_limit);
+            p.previous_position.z = clamp(p.previous_position.z, -position_limit, position_limit);
+        }
+
+        // write updated positions back to render vertices and recalculate normals
+        if (m_cloth_base_vertices.empty())
+        {
+            return;
+        }
+
+        // copy cached vertices to preserve tex/tan attributes
+        vector<RHI_Vertex_PosTexNorTan> updated_vertices = m_cloth_base_vertices;
+
+        // get the entity's inverse transform to convert world-space particles back to local space
+        Vector3 entity_pos    = GetEntity()->GetPosition();
+        Quaternion entity_rot = GetEntity()->GetRotation();
+        Quaternion inv_rot    = entity_rot.Conjugate();
+        Vector3 entity_scale  = GetEntity()->GetScale();
+        Vector3 inv_scale(
+            entity_scale.x != 0.0f ? 1.0f / entity_scale.x : 0.0f,
+            entity_scale.y != 0.0f ? 1.0f / entity_scale.y : 0.0f,
+            entity_scale.z != 0.0f ? 1.0f / entity_scale.z : 0.0f
+        );
+
+        // copy particle positions into vertex buffer (convert back to local space)
+        for (uint32_t i = 0; i < m_cloth_vertex_count && i < static_cast<uint32_t>(m_cloth_particles.size()); i++)
+        {
+            Vector3 local_pos = inv_rot * (m_cloth_particles[i].position - entity_pos);
+            local_pos.x *= inv_scale.x;
+            local_pos.y *= inv_scale.y;
+            local_pos.z *= inv_scale.z;
+
+            updated_vertices[i].pos[0] = local_pos.x;
+            updated_vertices[i].pos[1] = local_pos.y;
+            updated_vertices[i].pos[2] = local_pos.z;
+        }
+
+        // recalculate normals from triangle faces, accumulated in float buffers and packed at the end
+        vector<Vector3> tmp_normals(updated_vertices.size(), Vector3::Zero);
+        vector<Vector3> tmp_tangents(updated_vertices.size(), Vector3::Zero);
+
+        for (size_t i = 0; i + 2 < m_cloth_indices.size(); i += 3)
+        {
+            uint32_t i0 = m_cloth_indices[i];
+            uint32_t i1 = m_cloth_indices[i + 1];
+            uint32_t i2 = m_cloth_indices[i + 2];
+
+            if (i0 >= m_cloth_vertex_count || i1 >= m_cloth_vertex_count || i2 >= m_cloth_vertex_count)
+            {
+                continue;
+            }
+
+            Vector3 v0(updated_vertices[i0].pos[0], updated_vertices[i0].pos[1], updated_vertices[i0].pos[2]);
+            Vector3 v1(updated_vertices[i1].pos[0], updated_vertices[i1].pos[1], updated_vertices[i1].pos[2]);
+            Vector3 v2(updated_vertices[i2].pos[0], updated_vertices[i2].pos[1], updated_vertices[i2].pos[2]);
+
+            Vector3 edge1  = v1 - v0;
+            Vector3 edge2  = v2 - v0;
+            Vector3 normal = Vector3::Cross(edge1, edge2);
+
+            tmp_normals[i0] += normal;
+            tmp_normals[i1] += normal;
+            tmp_normals[i2] += normal;
+        }
+
+        // recalculate tangents from triangle uvs and deformed positions
+        for (size_t i = 0; i + 2 < m_cloth_indices.size(); i += 3)
+        {
+            uint32_t i0 = m_cloth_indices[i];
+            uint32_t i1 = m_cloth_indices[i + 1];
+            uint32_t i2 = m_cloth_indices[i + 2];
+
+            if (i0 >= m_cloth_vertex_count || i1 >= m_cloth_vertex_count || i2 >= m_cloth_vertex_count)
+            {
+                continue;
+            }
+
+            Vector3 p0(updated_vertices[i0].pos[0], updated_vertices[i0].pos[1], updated_vertices[i0].pos[2]);
+            Vector3 p1(updated_vertices[i1].pos[0], updated_vertices[i1].pos[1], updated_vertices[i1].pos[2]);
+            Vector3 p2(updated_vertices[i2].pos[0], updated_vertices[i2].pos[1], updated_vertices[i2].pos[2]);
+
+            Vector3 edge1 = p1 - p0;
+            Vector3 edge2 = p2 - p0;
+
+            Vector2 uv0 = updated_vertices[i0].get_uv();
+            Vector2 uv1 = updated_vertices[i1].get_uv();
+            Vector2 uv2 = updated_vertices[i2].get_uv();
+            float du1 = uv1.x - uv0.x;
+            float dv1 = uv1.y - uv0.y;
+            float du2 = uv2.x - uv0.x;
+            float dv2 = uv2.y - uv0.y;
+
+            float denom = du1 * dv2 - du2 * dv1;
+            if (fabsf(denom) < 1e-7f)
+            {
+                continue;
+            }
+
+            float inv_denom = 1.0f / denom;
+            Vector3 tangent = (edge1 * dv2 - edge2 * dv1) * inv_denom;
+
+            tmp_tangents[i0] += tangent;
+            tmp_tangents[i1] += tangent;
+            tmp_tangents[i2] += tangent;
+        }
+
+        // normalize and orthogonalize, pack into the vertex
+        for (uint32_t i = 0; i < m_cloth_vertex_count; i++)
+        {
+            Vector3 n = tmp_normals[i];
+            float n_len = n.Length();
+            if (n_len > 1e-7f)
+            {
+                n /= n_len;
+                updated_vertices[i].set_normal(n);
+            }
+            else
+            {
+                n = updated_vertices[i].get_normal();
+            }
+
+            Vector3 t = tmp_tangents[i];
+            t = t - n * Vector3::Dot(n, t);
+            float t_len = t.Length();
+            if (t_len > 1e-7f)
+            {
+                t /= t_len;
+                updated_vertices[i].set_tangent(t);
+            }
+        }
+
+        // push to gpu
+        GeometryBuffer::UpdateVertices(updated_vertices.data(), m_cloth_global_vertex_offset, m_cloth_vertex_count);
+
+        // signal that the blas needs an in-place refit so ray-traced shadows track the deformed mesh
+        if (Render* render = GetEntity()->GetComponent<Render>())
+        {
+            render->SetNeedsBlasRefit(true);
+        }
+    }
+}

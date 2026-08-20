@@ -1,0 +1,30 @@
+{
+  "FormatVersion": 3,
+  "Id": "55cc0f79-96c9-482e-9794-934dc0f87708"/*ValuesToTexture*/,
+  "Inputs": [
+    {
+      "Id": "092c8d1f-a70e-4298-b5df-52c9d62f8e04"/*Values*/,
+      "DefaultValue": {
+        "Values": []
+      }
+    },
+    {
+      "Id": "51545316-69fc-441f-b59f-44979e32972c"/*Pow*/,
+      "DefaultValue": 1.0
+    },
+    {
+      "Id": "63e90d86-5ad5-4333-8b99-7f8d285c4913"/*Direction*/,
+      "DefaultValue": 0
+    },
+    {
+      "Id": "748fe756-c7ee-4cc1-929e-078f99bea628"/*Offset*/,
+      "DefaultValue": 0.0
+    },
+    {
+      "Id": "cc812393-f080-4e17-a525-15b09f8acdd0"/*Gain*/,
+      "DefaultValue": 1.0
+    }
+  ],
+  "Children": [],
+  "Connections": []
+}

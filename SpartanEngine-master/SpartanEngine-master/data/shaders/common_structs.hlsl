@@ -1,0 +1,470 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES =========
+#include "common.hlsl"
+//====================
+
+#ifndef SPARTAN_COMMON_STRUCT
+#define SPARTAN_COMMON_STRUCT
+
+struct Surface
+{
+    // properties
+    uint   flags;
+    float3 albedo;
+    float  alpha;
+    float  roughness;
+    float  roughness_alpha;
+    float  metallic;
+    float  clearcoat;
+    float  clearcoat_roughness;
+    float  anisotropic;
+    float  anisotropic_rotation;
+    float  sheen;
+    float  subsurface_scattering;
+    float  flake_strength;
+    float  flake_scale;
+    float  pearl_strength;
+    float3 pearl_color;
+    float3 coat_tint;
+    float  coat_tint_strength;
+    float  ior;
+    float  absorption;
+    float  thickness;
+    float  occlusion;
+    float3 emissive;
+    float3 F0;
+    uint2  pos;
+    float2 uv;
+    float  depth;
+    float3 position;
+    float3 normal;
+    float3 bent_normal;
+    float3 camera_to_pixel;
+    float  camera_to_pixel_length;
+    float3 diffuse_energy;
+
+    // easy access to certain properties
+    bool has_texture_height()            { return flags & uint(1U << 0);  }
+    bool has_texture_normal()            { return flags & uint(1U << 1);  }
+    bool has_texture_albedo()            { return flags & uint(1U << 2);  }
+    bool has_texture_roughness()         { return flags & uint(1U << 3);  }
+    bool has_texture_metalness()         { return flags & uint(1U << 4);  }
+    bool has_texture_alpha_mask()        { return flags & uint(1U << 5);  }
+    bool has_texture_emissive()          { return flags & uint(1U << 6);  }
+    bool has_texture_occlusion()         { return flags & uint(1U << 7);  }
+    bool is_terrain()                    { return flags & uint(1U << 8);  }
+    bool has_wind_animation()            { return flags & uint(1U << 9);  }
+    bool color_variation_from_instance() { return flags & uint(1U << 10); }
+    bool is_grass_blade()                { return flags & uint(1U << 11); }
+    bool is_flower()                     { return flags & uint(1U << 12); }
+    bool is_water()                      { return flags & uint(1U << 13); }
+    bool is_tessellated()                { return flags & uint(1U << 14); }
+    bool is_motion_blur_radial()         { return flags & uint(1U << 19); }
+    bool is_sky()                        { return alpha == 0.0f; }
+    bool is_opaque()                     { return alpha == 1.0f; }
+    bool is_transparent()                { return alpha > 0.0f && alpha < 1.0f; }
+    
+    void Build(uint2 position_screen, float2 resolution_out, bool use_albedo, bool replace_color_with_one)
+    {
+        // initialize properties
+        pos = position_screen;
+        uv = (position_screen + 0.5f) / resolution_out;
+
+        // access resources
+        float4 sample_albedo        = !use_albedo ? 0.0f : tex_albedo.SampleLevel(samplers[sampler_point_clamp], uv, 0);
+        float4 sample_normal        = tex_normal.SampleLevel(samplers[sampler_point_clamp], uv, 0);
+        float4 sample_material      = tex_material.SampleLevel(samplers[sampler_point_clamp], uv, 0);
+        float sample_depth          = tex_depth.SampleLevel(samplers[sampler_point_clamp], uv, 0).r;
+        MaterialParameters material = material_parameters[sample_normal.a];
+
+        // initialize properties
+        depth                 = sample_depth;
+        normal                = sample_normal.xyz;
+        flags                 = material.flags;
+        albedo                = replace_color_with_one ? 1.0f : sample_albedo.rgb;
+        alpha                 = sample_albedo.a;
+        roughness             = sample_material.r;
+        metallic              = sample_material.g;
+        emissive              = sample_material.b;
+        // glass is always dielectric, force metallic 0 so f0 stays at the 0.04 dielectric value
+        bool alpha_transparent = (alpha > 0.0f && alpha < 1.0f);
+        metallic               = alpha_transparent ? 0.0f : metallic;
+        F0                     = lerp(0.04f, albedo, metallic);
+        anisotropic           = material.anisotropic;
+        anisotropic_rotation  = material.anisotropic_rotation;
+        clearcoat             = material.clearcoat;
+        clearcoat_roughness   = material.clearcoat_roughness;
+        sheen                 = material.sheen;
+        subsurface_scattering = material.subsurface_scattering;
+        flake_strength        = material.flake_strength;
+        flake_scale           = material.flake_scale;
+        pearl_strength        = material.pearl_strength;
+        pearl_color           = material.pearl_color.rgb;
+        coat_tint             = material.coat_tint.rgb;
+        coat_tint_strength    = material.coat_tint.a;
+        ior                   = material.ior;
+        absorption            = material.absorption;
+        thickness             = material.thickness;
+        diffuse_energy        = 1.0f;
+
+        // roughness is authored as perceptual roughness, as is convention
+        roughness_alpha = roughness * roughness;
+
+        // ssao, bent normal defaults to geometric normal so ibl never samples world-up or zero
+        bent_normal          = normal;
+        occlusion            = sample_material.a;
+        bool is_fully_opaque = sample_albedo.a >= 0.999f;
+        if (is_ssao_enabled() && is_fully_opaque)
+        {
+            float4 ssao_sample = tex_ssao.SampleLevel(samplers[sampler_point_clamp], uv, 0);
+            float3 ssao_bent   = ssao_sample.rgb;
+            if (!any(isnan(ssao_bent)) && dot(ssao_bent, ssao_bent) > 1e-6f)
+            {
+                bent_normal = normalize(ssao_bent);
+            }
+            occlusion = min(sample_material.a, ssao_sample.a);
+        }
+
+        if (!is_fully_opaque)
+        {
+            occlusion   = 1.0f;
+            bent_normal = normal;
+        }
+
+        position               = get_position(depth, render_uv_to_screen_uv(uv));
+        camera_to_pixel        = position - get_camera_position();
+        camera_to_pixel_length = length(camera_to_pixel);
+        camera_to_pixel        = normalize(camera_to_pixel);
+
+        float n_dot_v        = saturate(dot(normal, -camera_to_pixel));
+        float edge           = 1.0f - n_dot_v;
+        float edge5          = edge * edge * edge * edge * edge;
+        float pearl_blend    = saturate(pearl_strength * edge5);
+        float coat_blend     = saturate(coat_tint_strength * lerp(0.35f, 1.0f, edge5));
+        float3 paint_albedo  = lerp(albedo, pearl_color, pearl_blend);
+        paint_albedo        *= lerp(float3(1.0f, 1.0f, 1.0f), coat_tint, coat_blend);
+        if (!replace_color_with_one)
+        {
+            albedo = paint_albedo;
+        }
+        F0                   = lerp(F0, pearl_color, pearl_blend * 0.35f);
+    }
+};
+
+struct Light
+{
+    // properties
+    uint   index;
+    uint   flags;
+    float3 color;
+    float3 position;
+    float  intensity;
+    float3 to_pixel;
+    float3 forward;
+    float3 right;
+    float  distance_to_pixel;
+    float  angle;
+    float  near;
+    float  far;
+    float  area_width;
+    float  area_height;
+    float3 radiance;
+    float  n_dot_l;
+    float  attenuation;
+    float  cos_outer;
+    float  cos_inner;
+    float  angle_scale;
+ 
+    bool is_directional()           { return flags & uint(1U << 0); }
+    bool is_point()                 { return flags & uint(1U << 1); }
+    bool is_spot()                  { return flags & uint(1U << 2); }
+    bool is_area()                  { return flags & uint(1U << 6); }
+    bool has_shadows()              { return flags & uint(1U << 3); }
+    bool has_shadows_screen_space() { return flags & uint(1U << 4); }
+    bool is_volumetric()            { return flags & uint(1U << 5); }
+    // 0 means inline fallback, 1-4 maps to array slice 0-3
+    uint nrd_local_shadow_slot()    { return (flags >> 8u) & 7u; }
+
+    float compute_attenuation_range(const float distance_to_light)
+    {
+        if (far <= 0.0f)
+            return 0.0f;
+
+        // smooth window so lights fade out instead of popping at the range boundary
+        float ratio  = distance_to_light / far;
+        float ratio2 = ratio * ratio;
+        float window = saturate(1.0f - ratio2 * ratio2);
+        return window * window;
+    }
+
+    float compute_attenuation_inverse_square(const float distance_to_light)
+    {
+        return 1.0f / (distance_to_light * distance_to_light + 0.0001f);
+    }
+
+    float compute_attenuation_distance(const float3 surface_position)
+    {
+        float d = length(surface_position - position);
+
+        return compute_attenuation_inverse_square(d) * compute_attenuation_range(d);
+    }
+
+    float compute_attenuation_angle()
+    {
+        // cos_outer, cos_inner, angle_scale are precomputed once in Build
+        float cd          = dot(to_pixel, forward);
+        float attenuation = saturate((cd - cos_outer) * angle_scale);
+        return attenuation * attenuation;
+    }
+
+    // builds an orthonormal basis for the area light using the entity's authored right vector
+    // so the rectangle aligns with the gizmo and any explicit rotation around the forward axis
+    void compute_area_light_basis(out float3 light_right, out float3 light_up)
+    {
+        light_right = normalize(right);
+        light_up    = normalize(cross(forward, light_right));
+    }
+
+    // finds the closest point on the rectangular area light to the surface position
+    float3 compute_closest_point_on_area(const float3 surface_position)
+    {
+        float3 light_right, light_up;
+        compute_area_light_basis(light_right, light_up);
+        
+        float3 to_surface = surface_position - position;
+        
+        // project onto light plane and clamp to rectangle bounds
+        float half_width  = area_width  * 0.5f;
+        float half_height = area_height * 0.5f;
+        
+        float right_proj = clamp(dot(to_surface, light_right), -half_width, half_width);
+        float up_proj    = clamp(dot(to_surface, light_up), -half_height, half_height);
+        
+        return position + light_right * right_proj + light_up * up_proj;
+    }
+
+    // finds the representative point on the area light for specular calculations
+    // this is the point that contributes most to the specular highlight based on the reflected view ray
+    float3 compute_representative_point_on_area(const float3 surface_position, const float3 surface_normal, const float3 view_direction)
+    {
+        float3 light_right, light_up;
+        compute_area_light_basis(light_right, light_up);
+        
+        // compute reflection vector
+        float3 reflection = reflect(-view_direction, surface_normal);
+        
+        // find where the reflection ray intersects the light plane
+        // plane equation: dot(p - position, forward) = 0
+        float3 to_light  = position - surface_position;
+        float denom      = dot(reflection, -forward);
+        
+        float3 representative_point;
+        
+        if (abs(denom) > 0.0001f)
+        {
+            // ray intersects the plane
+            float t            = dot(to_light, -forward) / denom;
+            float3 plane_point = surface_position + reflection * max(t, 0.0f);
+            
+            // project intersection point onto light rectangle and clamp
+            float3 point_on_plane = plane_point - position;
+            float half_width      = area_width  * 0.5f;
+            float half_height     = area_height * 0.5f;
+            
+            float right_proj = clamp(dot(point_on_plane, light_right), -half_width, half_width);
+            float up_proj    = clamp(dot(point_on_plane, light_up), -half_height, half_height);
+            
+            representative_point = position + light_right * right_proj + light_up * up_proj;
+        }
+        else
+        {
+            // reflection is parallel to light plane, fall back to closest point
+            representative_point = compute_closest_point_on_area(surface_position);
+        }
+        
+        return representative_point;
+    }
+
+    float compute_attenuation_area(const float3 surface_position)
+    {
+        float3 closest_point = compute_closest_point_on_area(surface_position);
+        float3 to_surface   = surface_position - closest_point;
+        float d             = length(to_surface);
+        float3 direction_ws = d > 0.0001f ? to_surface / d : forward;
+        float emission_cos  = saturate(dot(forward, direction_ws));
+        float emitter_area  = max(area_width * area_height, 0.0001f);
+
+        // intensity holds radiance, irradiance from a lambertian emitter cannot exceed pi * radiance
+        // (emitter filling the whole hemisphere), so cap the near field where a * cos / d^2 diverges
+        float attenuation = compute_attenuation_inverse_square(d) * compute_attenuation_range(d) * emission_cos * emitter_area;
+        return min(attenuation, PI);
+    }
+
+    float compute_attenuation(const float3 surface_position)
+    {
+        float attenuation = 0.0f;
+        
+        if (is_directional())
+        {
+            attenuation = 1.0f;
+        }
+        else if (is_point())
+        {
+            attenuation = compute_attenuation_distance(surface_position);
+        }
+        else if (is_spot())
+        {
+            attenuation = compute_attenuation_distance(surface_position) * compute_attenuation_angle();
+        }
+        else if (is_area())
+        {
+            attenuation = compute_attenuation_area(surface_position);
+        }
+
+        return attenuation;
+    }
+
+    float compute_attenuation_volumetric(const float3 vol_position)
+    {
+        float atten = 1.0f;
+
+        if (is_directional())
+        {
+            atten = 1.0f;
+        }
+        else if (is_point() || is_spot() || is_area())
+        {
+            float dist_to_vol = length(vol_position - position);
+            atten = compute_attenuation_inverse_square(dist_to_vol) * compute_attenuation_range(dist_to_vol);
+
+            if (is_spot())
+            {
+                // direction from light to point, cos_outer/inner/angle_scale precomputed in Build
+                float3 to_vol     = normalize(vol_position - position);
+                float cd          = dot(to_vol, forward);
+                float atten_angle = saturate((cd - cos_outer) * angle_scale);
+                atten *= atten_angle * atten_angle;
+            }
+            else if (is_area())
+            {
+                float emitter_area = max(area_width * area_height, 0.0001f);
+                float3 to_vol = dist_to_vol > 0.0001f ? (vol_position - position) / dist_to_vol : forward;
+                atten *= saturate(dot(forward, to_vol)) * emitter_area;
+                atten  = min(atten, PI);
+            }
+        }
+
+        return atten;
+    }
+    
+    float3 compute_direction(float3 light_position, float3 fragment_position)
+    {
+        float3 direction = 0.0f;
+        
+        if (is_directional())
+        {
+            direction = normalize(forward.xyz);
+        }
+        else if (is_point() || is_spot() || is_area())
+        {
+            direction = normalize(fragment_position - light_position);
+        }
+
+        return direction;
+    }
+
+    // karis 2013 area light roughness widening, spreads the specular lobe to match the light's angular extent
+    float compute_area_roughness_modification(float roughness_alpha, float distance)
+    {
+        float area_size   = max(area_width, area_height) * 0.5f;
+        float solid_angle = saturate(area_size / (2.0f * max(distance, 0.01f)));
+        return saturate(roughness_alpha + solid_angle / (2.0f * roughness_alpha + solid_angle));
+    }
+
+    void Build(uint light_index, Surface surface)
+    {
+        LightParameters light            = light_parameters[light_index];
+        index                            = light_index;
+        flags                            = light.flags;
+        color                            = light.color.rgb;
+        position                         = light.position.xyz;
+        intensity                        = light.intensity;
+        near                             = 0.01f;
+        far                              = light.range;
+        angle                            = light.angle;
+        area_width                       = light.area_width;
+        area_height                      = light.area_height;
+        forward                          = (is_point() && !is_area()) ? float3(0.0f, 0.0f, 1.0f) : light.direction.xyz;
+        right                            = light.direction_right.xyz;
+        distance_to_pixel                = length(surface.position - position);
+
+        // precompute spot cone trig once per pixel per light, used by surface and volumetric paths
+        cos_outer   = cos(angle);
+        cos_inner   = cos(angle * 0.9f);
+        angle_scale = 1.0f / max(0.0001f, cos_inner - cos_outer);
+        
+        // for area lights, point the brdf direction at the rectangle centroid so it stays
+        // camera independent and produces a valid lambertian cosine even when the closest
+        // point on the rectangle is coplanar with the surface (eg floor under a tall tube)
+        // distance attenuation in compute_attenuation_area still uses the closest point
+        // and the specular lobe is widened by compute_area_roughness_modification
+        to_pixel = compute_direction(position, surface.position);
+        
+        n_dot_l = saturate(dot(surface.normal, -to_pixel));
+        
+        // compute attenuation
+        attenuation = compute_attenuation(surface.position);
+        
+        radiance = color * intensity * attenuation * n_dot_l;
+    }
+};
+
+struct AngularInfo
+{
+    float3 n;
+    float3 l;
+    float3 v;
+    float3 h;
+    float l_dot_h;
+    float v_dot_h;
+    float n_dot_v;
+    float n_dot_h;
+    float n_dot_l;
+
+    void Build(Light light, Surface surface)
+    {
+        // surface.normal, surface.camera_to_pixel and light.to_pixel are already unit length
+        n = surface.normal;            // outward direction of surface point
+        v = -surface.camera_to_pixel;  // direction from surface point to view
+        l = -light.to_pixel;           // direction from surface point to light
+        h = normalize(l + v);          // half vector still needs normalization
+
+        n_dot_l = saturate(dot(n, l));
+        n_dot_v = saturate(dot(n, v));
+        n_dot_h = saturate(dot(n, h));
+        l_dot_h = saturate(dot(l, h));
+        v_dot_h = saturate(dot(v, h));
+    }
+};
+
+#endif // SPARTAN_COMMON_STRUCT

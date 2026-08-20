@@ -1,0 +1,245 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+#pragma once
+
+//= INCLUDES =================================
+#include "RHI_PhysicalDevice.h"
+#include <array>
+#include <memory>
+#include <map>
+#include <mutex>
+#include <vector>
+#include "RHI_Descriptor.h"
+#include "RHI_Definitions.h"
+//============================================
+
+namespace spartan
+{
+    class RHI_CommandList;
+    class RHI_SwapChain;
+    class RHI_SyncPrimitive;
+    class RHI_Texture;
+    class RHI_Sampler;
+
+    enum class RHI_Frame_List
+    {
+        Graphics,
+        ComputeA,
+        ComputeB
+    };
+
+    struct RHI_Work
+    {
+        RHI_SyncPrimitive* timeline = nullptr;
+        uint64_t value              = 0;
+    };
+
+    class RHI_Device
+    {
+    public:
+        // core
+        static void Initialize();
+        static void Tick(const uint64_t frame_count);
+        static void Destroy();
+
+        // frame, swapchain and the three recording lists live here
+        static void CreateSwapChain(
+            void* sdl_window,
+            uint32_t width,
+            uint32_t height,
+            RHI_Present_Mode present_mode,
+            uint32_t buffer_count,
+            bool hdr,
+            const char* name
+        );
+        static void DestroySwapChain();
+        static RHI_SwapChain* GetSwapChain();
+        static void AcquireSwapChainImage();
+        static void BlitToBackBuffer(RHI_Texture* texture);
+        static void BeginFrame(bool acquire_compute);
+        static void Bind(RHI_Frame_List list);
+        static void Bind(RHI_CommandList* cmd_list);
+        static bool IsRecording();
+        static bool IsRecording(RHI_Frame_List list);
+        static RHI_Queue_Type GetBoundQueueType();
+        static RHI_Work Submit(
+            RHI_Frame_List list,
+            RHI_SyncPrimitive* semaphore_wait = nullptr,
+            bool is_immediate = false,
+            RHI_SyncPrimitive* semaphore_signal = nullptr,
+            RHI_SyncPrimitive* semaphore_timeline_wait = nullptr,
+            uint64_t timeline_wait_value = 0
+        );
+        static void SetFrameWait(RHI_SyncPrimitive* timeline_wait, uint64_t timeline_value);
+        static RHI_Work EndFrame(
+            RHI_SyncPrimitive* timeline_wait = nullptr,
+            uint64_t timeline_value = 0
+        );
+
+        // queues
+        static void QueueWaitAll(const bool flush = false);
+        static uint32_t GetQueueIndex(const RHI_Queue_Type type);
+        static RHI_Queue* GetQueue(const RHI_Queue_Type type);
+        static void* GetQueueRhiResource(const RHI_Queue_Type type);
+
+        // descriptors
+        static void AllocateDescriptorSet(void*& resource, RHI_DescriptorSetLayout* descriptor_set_layout, const std::vector<RHI_DescriptorWithBinding>& descriptors);
+        static std::unordered_map<uint64_t, RHI_DescriptorSet>& GetDescriptorSets();
+        static std::mutex& GetDescriptorSetMutex();
+        static uint64_t GetDescriptorSetFrame();
+        static void DescriptorSetInvalidateReferencingResource(void* resource);
+        static void* GetDescriptorSet(const RHI_Device_Bindless_Resource resource_type);
+        static void* GetDescriptorSetLayout(const RHI_Device_Bindless_Resource resource_type);
+        static void UpdateBindlessMaterials(std::array<RHI_Texture*, rhi_max_array_size>* textures, RHI_Buffer* parameters);
+        static void UpdateBindlessLights(RHI_Buffer* parameters);
+        static void UpdateBindlessSamplers(const std::shared_ptr<RHI_Sampler>* samplers, uint32_t count);
+        static void UpdateBindlessAABBs(RHI_Buffer* buffer);
+        static void UpdateBindlessDrawData(RHI_Buffer* buffer);
+        static void UpdateBindlessGeometryVertices(RHI_Buffer* buffer);
+        static void UpdateBindlessGeometryIndices(RHI_Buffer* buffer);
+        static void UpdateBindlessInstances(RHI_Buffer* buffer);
+
+        // pipelines
+        static void GetOrCreatePipeline(RHI_PipelineState& pso, RHI_Pipeline*& pipeline, RHI_DescriptorSetLayout*& descriptor_set_layout);
+        static uint32_t GetPipelineCount();
+        static void* GetPipelineCache();
+
+        // deletion queue
+        static void DeletionQueueAdd(const RHI_Resource_Type resource_type, void* resource);
+        static void DeletionQueueParse();
+        static void DeletionQueueFlush();
+        static bool DeletionQueueNeedsToParse();
+
+        // memory
+        static void* MemoryGetMappedDataFromBuffer(void* resource);
+        static void MemoryBufferCreate(void*& resource, const uint64_t size, uint32_t flags_usage, uint32_t flags_memory, const void* data_initial, const char* name);
+        static void MemoryBufferDestroy(void*& resource);
+        static void MemoryTextureCreate(RHI_Texture* texture);
+        static void MemoryTextureDestroy(void*& resource);
+        static void MemoryMap(void* resource, void*& mapped_data);
+        static void MemoryUnmap(void* resource);
+        static uint64_t MemoryGetAllocatedMb();
+        static uint64_t MemoryGetAvailableMb();
+        static uint64_t MemoryGetTotalMb();
+
+        // staging buffer pool - avoids per-upload allocation churn
+        static void* StagingBufferAcquire(uint64_t size);
+        static void StagingBufferRelease(void* buffer);
+        static void StagingBufferPoolDestroy();
+
+        // properties (actual silicon properties)
+        static float PropertyGetTimestampPeriod()                         { return m_timestamp_period; }
+        static uint64_t PropertyGetMinUniformBufferOffsetAlignment()      { return m_min_uniform_buffer_offset_alignment; }
+        static uint64_t PropertyGetMinStorageBufferOffsetAlignment()      { return m_min_storage_buffer_offset_alignment; }
+        static uint64_t PropertyGetMinAccelerationBufferOffsetAlignment() { return m_min_acceleration_buffer_offset_alignment; }
+        static uint32_t PropertyGetMaxTexture1dDimension()                { return m_max_texture_1d_dimension; }
+        static uint32_t PropertyGetMaxTexture2dDimension()                { return m_max_texture_2d_dimension; }
+        static uint32_t PropertyGetMaxTexture3dDimension()                { return m_max_texture_3d_dimension; }
+        static uint32_t PropertyGetMaxTextureCubeDimension()              { return m_max_texture_cube_dimension; }
+        static uint32_t PropertyGetMaxTextureArrayLayers()                { return m_max_texture_array_layers; }
+        static uint32_t PropertyGetMaxPushConstantSize()                  { return m_max_push_constant_size; }
+        static uint32_t PropertyGetMaxShadingRateTexelSizeX()             { return m_max_shading_rate_texel_size_x; }
+        static uint32_t PropertyGetMaxShadingRateTexelSizeY()             { return m_max_shading_rate_texel_size_y; }
+        static uint64_t PropertyGetOptimalBufferCopyOffsetAlignment()     { return m_optimal_buffer_copy_offset_alignment; }
+        static uint32_t PropertyGetShaderGroupHandleSize()                { return m_shader_group_handle_size; }
+        static uint32_t PropertyGetShaderGroupHandleAlignment()           { return m_shader_group_handle_alignment; }
+        static uint32_t PropertyGetShaderGroupBaseAlignment()             { return m_shader_group_base_alignment; }
+        static bool IsSupportedVrs()                                      { return m_is_shading_rate_supported; }
+        static bool IsSupportedXess()                                     { return m_xess_supported; }
+        static bool IsSupportedDlss()                                     { return m_dlss_supported; }
+        static bool IsSupportedRayTracing()                               { return m_is_ray_tracing_supported; }
+        static bool IsSupportedMeshShaders()                              { return m_is_mesh_shaders_supported; }
+
+        // markers
+        static void MarkerBegin(RHI_CommandList* cmd_list, const char* name, const math::Vector4& color);
+        static void MarkerEnd(RHI_CommandList* cmd_list);
+
+        // physical device
+        static void PhysicalDeviceRegister(const RHI_PhysicalDevice& physical_device);
+        static void PhysicalDeviceSetPrimary(const uint32_t index);
+        static std::vector<RHI_PhysicalDevice>& PhysicalDeviceGet();
+
+        // device state
+        static bool IsDeviceLost()  { return m_device_lost; }
+        static void SetDeviceLost() { m_device_lost = true; }
+
+        // misc
+        static uint64_t GetBufferDeviceAddress(void* buffer);
+        static void SetResourceName(void* resource, const RHI_Resource_Type resource_type, const char* name);
+        static bool IsValidResolution(const uint32_t width, const uint32_t height);
+        static uint32_t GetDescriptorType(const RHI_Descriptor& descriptor);
+        static RHI_PhysicalDevice* GetPrimaryPhysicalDevice();
+        static void SetVariableRateShading(const RHI_CommandList* cmd_list, const bool enabled);
+
+        // renderer hooks, keeps the rhi from including renderer headers
+        static void SetPipelineBoundCallback(void (*callback)(RHI_CommandList*));
+        static void InvokePipelineBound(RHI_CommandList* cmd_list);
+        static void SetDefaultPushConstantsCallback(void (*callback)(RHI_CommandList*));
+        static void InvokeDefaultPushConstants(RHI_CommandList* cmd_list);
+        static void SetPassResetCallback(void (*callback)());
+        static void InvokePassReset();
+        static void SetScaleDimensionCallback(uint32_t (*callback)(uint32_t, float));
+        static uint32_t ScaleDimension(uint32_t dimension, float scale = -1.0f);
+        static void SetDummyVertexBuffer(RHI_Buffer* buffer);
+        static RHI_Buffer* GetDummyVertexBuffer();
+
+    private:
+        static RHI_CommandList* Cmd();
+        static RHI_CommandList* Cmd(RHI_Frame_List list);
+        friend class RHI_CommandList;
+        friend class RHI_Buffer;
+        friend class RHI_VendorTechnology;
+        friend class RHI_AccelerationStructure;
+        // properties
+        static float m_timestamp_period;
+        static uint64_t m_min_uniform_buffer_offset_alignment;
+        static uint64_t m_min_storage_buffer_offset_alignment;
+        static uint64_t m_min_acceleration_buffer_offset_alignment;
+        static uint32_t m_max_texture_1d_dimension;
+        static uint32_t m_max_texture_2d_dimension;
+        static uint32_t m_max_texture_3d_dimension;
+        static uint32_t m_max_texture_cube_dimension;
+        static uint32_t m_max_texture_array_layers;
+        static uint32_t m_max_push_constant_size;
+        static uint32_t m_max_shading_rate_texel_size_x;
+        static uint32_t m_max_shading_rate_texel_size_y;
+        static uint64_t m_optimal_buffer_copy_offset_alignment;
+        static uint32_t m_shader_group_handle_size;
+        static uint32_t m_shader_group_handle_alignment;
+        static uint32_t m_shader_group_base_alignment;
+        static bool m_is_shading_rate_supported;
+        static bool m_xess_supported;
+        static bool m_dlss_supported;
+        static bool m_is_ray_tracing_supported;
+        static bool m_is_mesh_shaders_supported;
+        static void (*m_pipeline_bound_callback)(RHI_CommandList*);
+        static void (*m_default_push_constants_callback)(RHI_CommandList*);
+        static void (*m_pass_reset_callback)();
+        static uint32_t (*m_scale_dimension_callback)(uint32_t, float);
+        static RHI_Buffer* m_dummy_vertex_buffer;
+
+        // misc
+        static bool m_wide_lines;
+        static bool m_device_lost;
+        static uint32_t m_physical_device_index;
+    };
+}

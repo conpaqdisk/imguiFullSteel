@@ -1,0 +1,1468 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES ======================
+#include "pch.h"
+#include <cstdio>
+#include <sstream>
+#include "Entity.h"
+#include "Prefab.h"
+#include "components/AudioSource.h"
+#include "components/Camera.h"
+#include "components/Light.h"
+#include "components/Physics.h"
+#include "components/Render.h"
+#include "components/Script.h"
+#include "components/Spline.h"
+#include "components/SplineFollower.h"
+#include "components/Terrain.h"
+#include "components/Volume.h"
+#include "components/ParticleSystem.h"
+#include "components/SkidMarks.h"
+#include "components/Water.h"
+#include "components/Traffic.h"
+#include "components/Pedestrians.h"
+#include "components/SpawnPoint.h"
+#include "components/CarReset.h"
+#include "components/Text3D.h"
+#include "components/Animator.h"
+#include "components/Ragdoll.h"
+SP_WARNINGS_OFF
+#include "../io/pugixml.hpp"
+SP_WARNINGS_ON
+//=================================
+
+//= NAMESPACES ===============
+using namespace std;
+using namespace spartan::math;
+//============================
+
+namespace spartan
+{
+    namespace
+    {
+        void save_transform(pugi::xml_node& node, const Vector3& position, const Quaternion& rotation, const Vector3& scale)
+        {
+            char position_text[96];
+            char rotation_text[128];
+            char scale_text[96];
+            std::snprintf(position_text, sizeof(position_text), "%g %g %g", position.x, position.y, position.z);
+            std::snprintf(rotation_text, sizeof(rotation_text), "%g %g %g %g", rotation.x, rotation.y, rotation.z, rotation.w);
+            std::snprintf(scale_text, sizeof(scale_text), "%g %g %g", scale.x, scale.y, scale.z);
+            node.append_attribute("position") = position_text;
+            node.append_attribute("rotation") = rotation_text;
+            node.append_attribute("scale")    = scale_text;
+        }
+
+        void load_transform_override(Entity* entity, pugi::xml_node& node)
+        {
+            if (pugi::xml_attribute attr = node.attribute("position"))
+            {
+                Vector3 position = entity->GetPositionLocal();
+                stringstream ss(attr.as_string());
+                ss >> position.x >> position.y >> position.z;
+                entity->SetPositionLocal(position);
+            }
+
+            if (pugi::xml_attribute attr = node.attribute("rotation"))
+            {
+                Quaternion rotation = entity->GetRotationLocal();
+                stringstream ss(attr.as_string());
+                ss >> rotation.x >> rotation.y >> rotation.z >> rotation.w;
+                entity->SetRotationLocal(rotation);
+            }
+
+            if (pugi::xml_attribute attr = node.attribute("scale"))
+            {
+                Vector3 scale = entity->GetScaleLocal();
+                stringstream ss(attr.as_string());
+                ss >> scale.x >> scale.y >> scale.z;
+                entity->SetScaleLocal(scale);
+            }
+        }
+
+        // input is an entity, output is a clone of that entity (descendant entities are not cloned)
+        Entity* clone_entity(Entity* entity)
+        {
+            // clone basic properties
+            Entity* clone = World::CreateEntity();
+            clone->SetObjectName(entity->GetObjectName());
+            // copy the local active flag, not the parent aware state, the clone derives its effective
+            // visibility from its own hierarchy, a temporarily deactivated shared source must not bake in
+            clone->SetActive(entity->IsActive());
+            clone->SetPosition(entity->GetPositionLocal());
+            clone->SetRotation(entity->GetRotationLocal());
+            clone->SetScale(entity->GetScaleLocal());
+            clone->SetTagsString(entity->GetTagsString());
+            // a clone of a runtime only entity is runtime only too, without this a cloned prop is
+            // written into the world file and comes back on load as an orphan nothing can clean up
+            clone->SetTransient(entity->IsTransient());
+
+            // clone all the components
+            for (shared_ptr<Component> component_original : entity->GetAllComponents())
+            {
+                if (component_original != nullptr)
+                {
+                    // component
+                    Component* component_clone = clone->AddComponent(component_original->GetType());
+
+                    // component's properties
+                    component_clone->SetAttributes(component_original->GetAttributes());
+                }
+            }
+
+            return clone;
+        };
+
+        // input is an entity, output is a clone of that entity (descendant entities are cloned)
+        Entity* clone_entity_and_descendants(Entity* entity)
+        {
+            Entity* clone_self = clone_entity(entity);
+
+            // clone children make them call this lambda
+            for (Entity* child_transform : entity->GetChildren())
+            {
+                Entity* clone_child = clone_entity_and_descendants(child_transform);
+                clone_child->SetParent(clone_self);
+            }
+
+            return clone_self;
+        };
+
+        // clones descendants that carry components straight onto clone_root, component-less
+        // nodes are dropped and their transform is folded into each surviving child
+        void clone_components_flattened(Entity* source, Entity* clone_root, const Matrix& source_to_root)
+        {
+            for (Entity* child : source->GetChildren())
+            {
+                if (!child)
+                {
+                    continue;
+                }
+
+                // row vector convention, child_world = child_local * parent_world
+                const Matrix child_to_root = child->GetLocalMatrix() * source_to_root;
+
+                if (child->GetComponentCount() > 0)
+                {
+                    Entity* child_clone = clone_entity(child);
+                    child_clone->SetParent(clone_root);
+                    child_clone->SetPositionLocal(child_to_root.GetTranslation());
+                    child_clone->SetRotationLocal(child_to_root.GetRotation());
+                    child_clone->SetScaleLocal(child_to_root.GetScale());
+                }
+
+                clone_components_flattened(child, clone_root, child_to_root);
+            }
+        };
+
+    }
+
+    Entity::Entity()
+    {
+        m_object_name = "Entity";
+        m_is_active   = true;
+
+        m_components.fill(nullptr);
+    }
+
+    Entity::~Entity()
+    {
+        m_components.fill(nullptr);
+
+        // the selection holds raw pointers, drop this one wherever it sits in the list, not just when
+        // it happens to be the primary pick
+        Camera::RemoveFromSelection(this);
+    }
+
+    Entity* Entity::Clone()
+    {
+        return clone_entity_and_descendants(this);
+    }
+
+    Entity* Entity::CloneVisualOnly()
+    {
+        Entity* clone_root = clone_entity(this);
+        clone_components_flattened(this, clone_root, Matrix::Identity);
+
+        return clone_root;
+    }
+
+    void Entity::AddTag(const string& tag)
+    {
+        if (!tag.empty() && !HasTag(tag))
+        {
+            m_tags.push_back(tag);
+        }
+    }
+
+    void Entity::RemoveTag(const string& tag)
+    {
+        m_tags.erase(remove(m_tags.begin(), m_tags.end(), tag), m_tags.end());
+    }
+
+    bool Entity::HasTag(const string& tag) const
+    {
+        return find(m_tags.begin(), m_tags.end(), tag) != m_tags.end();
+    }
+
+    string Entity::GetTagsString() const
+    {
+        string result;
+        for (const string& tag : m_tags)
+        {
+            if (!result.empty())
+            {
+                result += ",";
+            }
+            result += tag;
+        }
+        return result;
+    }
+
+    void Entity::SetTagsString(const string& comma_separated)
+    {
+        m_tags.clear();
+        stringstream ss(comma_separated);
+        string tag;
+        while (getline(ss, tag, ','))
+        {
+            // trim spaces around each tag
+            const size_t first = tag.find_first_not_of(' ');
+            if (first == string::npos)
+            {
+                continue;
+            }
+            const size_t last = tag.find_last_not_of(' ');
+            AddTag(tag.substr(first, last - first + 1));
+        }
+    }
+
+    void Entity::RegisterForScripting(sol::state_view State)
+    {
+        State.new_usertype<Entity>("Entity",
+            "GetComponent", [](Entity* Self, ComponentType Type) -> sol::reference
+            {
+                if (Component* comp = Self->GetComponentByType(Type))
+                {
+                    return comp->AsLua(World::GetLuaState());
+                }
+
+                return sol::nil;
+            },
+            "AddComponent", [](Entity* Self, ComponentType Type) -> sol::reference
+            {
+                if (Component* comp = Self->AddComponentByType(Type))
+                {
+                    return comp->AsLua(World::GetLuaState());
+                }
+
+                return sol::nil;
+            },
+            "RemoveComponent", [](Entity* Self, ComponentType Type)
+            {
+                Self->RemoveComponentByType(Type);
+            },
+            "ForEachChild",    [](Entity* Self, const sol::function& Callback)
+            {
+                for (Entity* Child : Self->m_children)
+                {
+                    Callback(Child);
+                }
+            },
+            "ForEachDescendant", [](Entity* Self, const sol::function& Callback)
+            {
+                std::vector<Entity*> descendants;
+                Self->GetDescendants(&descendants);
+                for (Entity* descendant : descendants)
+                {
+                    Callback(descendant);
+                }
+            },
+            "GetDescendants", [](Entity* Self) -> sol::table
+            {
+                sol::state_view lua = World::GetLuaState();
+                sol::table result   = lua.create_table();
+                std::vector<Entity*> descendants;
+                Self->GetDescendants(&descendants);
+                for (size_t i = 0; i < descendants.size(); i++)
+                {
+                    result[i + 1] = descendants[i];
+                }
+                return result;
+            },
+
+            "GetAllComponents",         &Entity::GetAllComponents,
+            "GetComponentCount",        &Entity::GetComponentCount,
+            "GetName",                  &Entity::GetObjectName,
+            "SetName",                  &Entity::SetObjectName,
+            "GetObjectSize",            &Entity::GetObjectSize,
+            // return as string so lua does not lose uint64 precision
+            "GetObjectID", [](Entity* self) -> std::string
+            {
+                return self ? std::to_string(self->GetObjectId()) : "0";
+            },
+
+            "Clone",                    &Entity::Clone,
+            "IsActive",                 &Entity::IsActive,
+            "GetActive",                &Entity::GetActive,
+            "SetActive",                &Entity::SetActive,
+            "GetChildren", [](Entity* Self) -> sol::table
+            {
+                sol::state_view lua = World::GetLuaState();
+                sol::table result = lua.create_table();
+                const std::vector<Entity*> children = Self->GetChildren();
+                for (size_t i = 0; i < children.size(); i++)
+                {
+                    result[i + 1] = children[i];
+                }
+                return result;
+            },
+            "HasChildren",              &Entity::HasChildren,
+            "SetParent",                &Entity::SetParent,
+            "GetParent",                &Entity::GetParent,
+            "GetChildByName",           &Entity::GetChildByName,
+            "GetChildByIndex",          &Entity::GetChildByIndex,
+            "GetChildrenCount",         &Entity::GetChildrenCount,
+            "GetDescendantByName",      &Entity::GetDescendantByName,
+            "IsDescendantOf",           &Entity::IsDescendantOf,
+
+            "Translate",                &Entity::Translate,
+            "Rotate",                   &Entity::Rotate,
+
+            "IsTransient",              &Entity::IsTransient,
+            "SetTransient",             &Entity::SetTransient,
+
+            "GetUp",                    &Entity::GetUp,
+            "GetDown",                  &Entity::GetDown,
+            "GetForward",               &Entity::GetForward,
+            "GetBackward",              &Entity::GetBackward,
+            "GetRight",                 &Entity::GetRight,
+            "GetLeft",                  &Entity::GetLeft,
+
+            "GetPosition",              &Entity::GetPosition,
+            "GetPositionLocal",         &Entity::GetPositionLocal,
+            "SetPosition",              &Entity::SetPosition,
+            "SetPositionLocal",         &Entity::SetPositionLocal,
+
+            "GetRotation",              &Entity::GetRotation,
+            "GetRotationLocal",         &Entity::GetRotationLocal,
+            "SetRotation",              &Entity::SetRotation,
+            "SetRotationLocal",         &Entity::SetRotationLocal,
+
+            "GetScale",                 &Entity::GetScale,
+            "GetScaleLocal",            &Entity::GetScaleLocal,
+            "SetScale",                 &Entity::SetScale,
+            "SetScaleLocal",            &Entity::SetScaleLocal
+            );
+    }
+
+    void Entity::Start()
+    {
+        for (shared_ptr<Component>& component : m_components)
+        {
+            if (component)
+            {
+                component->Start();
+            }
+        }
+    }
+
+    void Entity::Stop()
+    {
+        for (shared_ptr<Component>& component : m_components)
+        {
+            if (component)
+            {
+                component->Stop();
+            }
+        }
+    }
+
+    void Entity::PreTick()
+    {
+        // only these components override pretick, skip the full component array walk
+        if (Physics* physics = GetComponent<Physics>())
+        {
+            physics->PreTick();
+        }
+        if (Script* script = GetComponent<Script>())
+        {
+            script->PreTick();
+        }
+        if (Ragdoll* ragdoll = GetComponent<Ragdoll>())
+        {
+            ragdoll->PreTick();
+        }
+    }
+
+    void Entity::Tick()
+    {
+        // render-only entities are the common case on big maps, avoid scanning empty slots
+        if (m_component_count == 1)
+        {
+            if (Render* render = GetComponent<Render>())
+            {
+                render->Tick();
+                m_time_since_last_transform_sec += static_cast<float>(Timer::GetDeltaTimeSec());
+                return;
+            }
+        }
+
+        for (shared_ptr<Component>& component : m_components)
+        {
+            if (component)
+            {
+                component->Tick();
+            }
+        }
+
+        m_time_since_last_transform_sec += static_cast<float>(Timer::GetDeltaTimeSec());
+    }
+
+    void Entity::TickAfterParallelRender()
+    {
+        if (m_component_count == 1 && GetComponent<Render>())
+        {
+            m_time_since_last_transform_sec += static_cast<float>(Timer::GetDeltaTimeSec());
+            return;
+        }
+
+        for (shared_ptr<Component>& component : m_components)
+        {
+            if (component && component->GetType() != ComponentType::Render)
+            {
+                component->Tick();
+            }
+        }
+
+        m_time_since_last_transform_sec += static_cast<float>(Timer::GetDeltaTimeSec());
+    }
+
+    uint32_t Entity::GetComponentCount() const
+    {
+        return m_component_count;
+    }
+
+    void Entity::Save(pugi::xml_node& node)
+    {
+        // self
+        {
+            node.append_attribute("name")   = m_object_name.c_str();
+            node.append_attribute("id")     = m_object_id;
+            node.append_attribute("active") = m_is_active;
+            save_transform(node, m_position_local, m_rotation_local, m_scale_local);
+
+            if (!m_tags.empty())
+            {
+                node.append_attribute("tags") = GetTagsString().c_str();
+            }
+
+            // save the prefab reference first so it is recreated before any user-added components are loaded
+            if (HasPrefabData())
+            {
+                pugi::xml_node prefab_node = node.append_child("prefab");
+
+                if (!m_prefab_type.empty())
+                {
+                    prefab_node.append_attribute("type") = m_prefab_type.c_str();
+                }
+
+                if (!m_prefab_file_path.empty())
+                {
+                    prefab_node.append_attribute("file") = m_prefab_file_path.c_str();
+                }
+
+                for (const auto& [key, value] : m_prefab_attributes)
+                {
+                    prefab_node.append_attribute(key.c_str()) = value.c_str();
+                }
+            }
+
+            // components
+            // for prefab instances only user-added components are saved, the base rebuilds its own
+            for (uint32_t i = 0; i < static_cast<uint32_t>(ComponentType::Max); i++)
+            {
+                shared_ptr<Component>& component = m_components[i];
+                if (!component)
+                {
+                    continue;
+                }
+
+                if (HasPrefabData() && m_prefab_owned_components[i])
+                {
+                    continue;
+                }
+
+                string type_name              = Component::TypeToString(component->GetType());
+                pugi::xml_node component_node = node.append_child(type_name.c_str());
+                component->Save(component_node);
+            }
+        }
+
+        const vector<Entity*> children = GetChildren();
+        if (HasPrefabData())
+        {
+            // the prefab base is rebuilt on load, so only persist what the user added on top
+            for (Entity* child : children)
+            {
+                if (child->IsTransient())
+                {
+                    continue;
+                }
+
+                if (child->m_prefab_owned)
+                {
+                    // base child, scan it for deeper user additions
+                    child->SaveOverrides(node, child->GetObjectName());
+                }
+                else
+                {
+                    // user added child directly under the instance root, save it in full
+                    pugi::xml_node child_node = node.append_child("Entity");
+                    child->Save(child_node);
+                }
+            }
+        }
+        else
+        {
+            for (Entity* child : children)
+            {
+                if (child->IsTransient())
+                {
+                    continue;
+                }
+
+                pugi::xml_node child_node = node.append_child("Entity");
+                child->Save(child_node);
+            }
+        }
+    }
+
+    void Entity::SaveOverrides(pugi::xml_node& root_node, const string& path)
+    {
+        // detect user additions on this base node
+        bool has_user_components = false;
+        for (uint32_t i = 0; i < static_cast<uint32_t>(ComponentType::Max); i++)
+        {
+            if (m_components[i] && !m_prefab_owned_components[i])
+            {
+                has_user_components = true;
+                break;
+            }
+        }
+
+        const vector<Entity*> children = GetChildren();
+        bool has_user_children = false;
+        for (Entity* child : children)
+        {
+            if (!child->m_prefab_owned && !child->IsTransient())
+            {
+                has_user_children = true;
+                break;
+            }
+        }
+
+        const bool has_transform = HasPrefabTransformChanged();
+
+        if (has_transform || has_user_components || has_user_children)
+        {
+            pugi::xml_node override_node      = root_node.append_child("prefab_override");
+            override_node.append_attribute("path") = path.c_str();
+
+            if (has_transform)
+            {
+                save_transform(override_node, m_position_local, m_rotation_local, m_scale_local);
+            }
+
+            for (uint32_t i = 0; i < static_cast<uint32_t>(ComponentType::Max); i++)
+            {
+                shared_ptr<Component>& component = m_components[i];
+                if (component && !m_prefab_owned_components[i])
+                {
+                    string type_name              = Component::TypeToString(component->GetType());
+                    pugi::xml_node component_node = override_node.append_child(type_name.c_str());
+                    component->Save(component_node);
+                }
+            }
+
+            for (Entity* child : children)
+            {
+                if (!child->m_prefab_owned && !child->IsTransient())
+                {
+                    pugi::xml_node child_node = override_node.append_child("Entity");
+                    child->Save(child_node);
+                }
+            }
+        }
+
+        // recurse into base children to capture additions deeper in the hierarchy
+        for (Entity* child : children)
+        {
+            if (child->m_prefab_owned)
+            {
+                child->SaveOverrides(root_node, path + "/" + child->GetObjectName());
+            }
+        }
+    }
+
+    bool Entity::HasPrefabTransformChanged() const
+    {
+        return m_position_local != m_prefab_position_local ||
+               m_rotation_local != m_prefab_rotation_local ||
+               m_scale_local    != m_prefab_scale_local;
+    }
+
+    void Entity::SetPrefabData(const string& type, const unordered_map<string, string>& attributes)
+    {
+        m_prefab_type       = type;
+        m_prefab_attributes = attributes;
+    }
+
+    void Entity::SetPrefabFilePath(const string& path)
+    {
+        m_prefab_file_path = path;
+    }
+
+    void Entity::ClearPrefabData()
+    {
+        m_prefab_type.clear();
+        m_prefab_file_path.clear();
+        m_prefab_attributes.clear();
+    }
+
+    void Entity::MarkPrefabBaseline()
+    {
+        m_prefab_position_local = m_position_local;
+        m_prefab_rotation_local = m_rotation_local;
+        m_prefab_scale_local    = m_scale_local;
+
+        // mark the components currently on this entity as part of the prefab base
+        for (uint32_t i = 0; i < static_cast<uint32_t>(ComponentType::Max); i++)
+        {
+            m_prefab_owned_components[i] = m_components[i] != nullptr;
+        }
+
+        // mark descendants as prefab owned and recurse into them
+        for (Entity* child : m_children)
+        {
+            child->m_prefab_owned = true;
+            child->MarkPrefabBaseline();
+        }
+    }
+
+    void Entity::Load(pugi::xml_node& node, bool load_children)
+    {
+        // self
+        {
+            m_is_active   = node.attribute("active").as_bool(true);
+            m_object_id   = node.attribute("id").as_ullong();
+            m_object_name = node.attribute("name").as_string(m_object_name.c_str());
+            SetTagsString(node.attribute("tags").as_string(""));
+
+            {
+                string pos_str = node.attribute("position").as_string();
+                stringstream ss(pos_str);
+                ss >> m_position_local.x >> m_position_local.y >> m_position_local.z;
+            }
+
+            {
+                string rot_str = node.attribute("rotation").as_string();
+                stringstream ss(rot_str);
+                ss >> m_rotation_local.x >> m_rotation_local.y >> m_rotation_local.z >> m_rotation_local.w;
+            }
+
+            {
+                string scale_str = node.attribute("scale").as_string();
+                stringstream ss(scale_str);
+                ss >> m_scale_local.x >> m_scale_local.y >> m_scale_local.z;
+            }
+
+            // components and prefabs
+            for (pugi::xml_node component_node = node.first_child(); component_node; component_node = component_node.next_sibling())
+            {
+                string type_name = component_node.name();
+                if (type_name == "Entity")
+                {
+                    continue;
+                } // skip children, handled below
+
+                // check for prefab node - creates complex entity hierarchies
+                if (type_name == "prefab")
+                {
+                    // store prefab data for saving later
+                    string prefab_type = component_node.attribute("type").as_string();
+                    string prefab_file = component_node.attribute("file").as_string();
+
+                    unordered_map<string, string> prefab_attributes;
+                    for (pugi::xml_attribute attr = component_node.first_attribute(); attr; attr = attr.next_attribute())
+                    {
+                        string attr_name = attr.name();
+                        if (attr_name == "type" || attr_name == "file")
+                        {
+                            continue;
+                        } // type and file are stored separately
+                        prefab_attributes[attr_name] = attr.value();
+                    }
+                    SetPrefabData(prefab_type, prefab_attributes);
+
+                    if (!prefab_file.empty())
+                    {
+                        SetPrefabFilePath(prefab_file);
+                    }
+
+                    // code prefab - use registered factory function
+                    if (!prefab_type.empty() && Prefab::IsRegistered(prefab_type))
+                    {
+                        Prefab::Create(component_node, this);
+                    }
+                    // file prefab - load entity hierarchy from .prefab file
+                    else if (!prefab_file.empty())
+                    {
+                        Prefab::LoadFromFile(prefab_file, this);
+                    }
+
+                    // snapshot the base so later additions are detected as overrides
+                    MarkPrefabBaseline();
+
+                    continue;
+                }
+
+                // apply a user override onto an existing base node, resolved by name path
+                if (type_name == "prefab_override")
+                {
+                    string path     = component_node.attribute("path").as_string();
+                    Entity* target  = GetDescendantByPath(path);
+                    if (!target)
+                    {
+                        SP_LOG_WARNING("Prefab override path no longer exists, skipping: %s", path.c_str());
+                        continue;
+                    }
+
+                    load_transform_override(target, component_node);
+
+                    for (pugi::xml_node override_child = component_node.first_child(); override_child; override_child = override_child.next_sibling())
+                    {
+                        string override_name = override_child.name();
+                        if (override_name == "Entity")
+                        {
+                            Entity* child = World::CreateEntity();
+                            child->Load(override_child);
+                            child->SetParent(target);
+                        }
+                        else
+                        {
+                            ComponentType override_type = Component::StringToType(override_name);
+                            if (override_type != ComponentType::Max)
+                            {
+                                if (Component* component = target->AddComponent(override_type))
+                                {
+                                    component->Load(override_child);
+                                }
+                            }
+                        }
+                    }
+
+                    continue;
+                }
+
+                ComponentType type = Component::StringToType(type_name);
+                if (type != ComponentType::Max)
+                {
+                    if (Component* component = AddComponent(type))
+                    {
+                        component->Load(component_node);
+                    }
+                }
+            }
+        }
+
+        // children, skipped when the world loader flattens the hierarchy for parallel load
+        if (load_children)
+        {
+            for (pugi::xml_node child_node = node.child("Entity"); child_node; child_node = child_node.next_sibling("Entity"))
+            {
+                Entity* child = World::CreateEntity();
+                child->Load(child_node);
+                child->SetParent(this);
+            }
+        }
+
+        UpdateTransform();
+    }
+
+    bool Entity::GetActive()
+    {
+        if (Entity* parent = GetParent())
+        {
+            return m_is_active && parent->GetActive();
+        }
+
+        return m_is_active;
+    }
+
+    void Entity::SetActive(const bool active)
+    {
+        if (active == m_is_active)
+        {
+            return;
+        }
+
+        m_is_active = active;
+    }
+
+    Component* Entity::GetComponentByType(ComponentType Type) const
+    {
+        return m_components[static_cast<uint32_t>(Type)].get();
+    }
+
+    Component* Entity::AddComponentByType(ComponentType Type)
+    {
+        if (Component* component = GetComponentByType(Type))
+        {
+            return component;
+        }
+
+        std::shared_ptr<Component> component;
+        switch (Type)
+        {
+        case ComponentType::AudioSource:
+            component = std::make_shared<AudioSource>(this);
+            break;
+        case ComponentType::Camera:
+            component = std::make_shared<Camera>(this);
+            break;
+        case ComponentType::Light:
+            component = std::make_shared<Light>(this);
+            break;
+        case ComponentType::Physics:
+            component = std::make_shared<Physics>(this);
+            break;
+        case ComponentType::Render:
+            component = std::make_shared<Render>(this);
+            break;
+        case ComponentType::Spline:
+            component = std::make_shared<Spline>(this);
+            break;
+        case ComponentType::SplineFollower:
+            component = std::make_shared<SplineFollower>(this);
+            break;
+        case ComponentType::Terrain:
+            component = std::make_shared<Terrain>(this);
+            break;
+        case ComponentType::Volume:
+            component = std::make_shared<Volume>(this);
+            break;
+        case ComponentType::Script:
+            component = std::make_shared<Script>(this);
+            break;
+        case ComponentType::ParticleSystem:
+            component = std::make_shared<ParticleSystem>(this);
+            break;
+        case ComponentType::Water:
+            component = std::make_shared<Water>(this);
+            break;
+        case ComponentType::Traffic:
+            component = std::make_shared<Traffic>(this);
+            break;
+        case ComponentType::Pedestrians:
+            component = std::make_shared<Pedestrians>(this);
+            break;
+        case ComponentType::SpawnPoint:
+            component = std::make_shared<SpawnPoint>(this);
+            break;
+        case ComponentType::CarReset:
+            component = std::make_shared<CarReset>(this);
+            break;
+        case ComponentType::Text3D:
+            component = std::make_shared<Text3D>(this);
+            break;
+        case ComponentType::Animator:
+            component = std::make_shared<Animator>(this);
+            break;
+        case ComponentType::Ragdoll:
+            component = std::make_shared<Ragdoll>(this);
+            break;
+        case ComponentType::Max:
+            break;
+        }
+
+        m_components[static_cast<uint32_t>(Type)] = component;
+        m_component_count++;
+
+        component->SetType(Type);
+        component->Initialize();
+
+        return component.get();
+    }
+
+    void Entity::RemoveComponentByType(ComponentType Type)
+    {
+        if (m_components[static_cast<uint32_t>(Type)])
+        {
+            m_components[static_cast<uint32_t>(Type)] = nullptr;
+            if (m_component_count > 0)
+            {
+                m_component_count--;
+            }
+        }
+    }
+
+    Component* Entity::AddComponent(const ComponentType type)
+    {
+        Component* component = nullptr;
+
+        switch (type)
+        {
+            // auto-generated from SP_COMPONENT_LIST
+            #define X(type, str) case ComponentType::type: component = static_cast<Component*>(AddComponent<type>()); break;
+            SP_COMPONENT_LIST
+            #undef X
+            default: component = nullptr; break;
+        }
+
+        SP_ASSERT(component != nullptr);
+
+        return component;
+    }
+
+    void Entity::RemoveComponentById(const uint64_t id)
+    {
+        for (shared_ptr<Component>& component : m_components)
+        {
+            if (component)
+            {
+                if (id == component->GetObjectId())
+                {
+                    component->Remove();
+                    component = nullptr;
+                    if (m_component_count > 0)
+                    {
+                        m_component_count--;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    void Entity::UpdateTransform()
+    {
+        // compute local transform
+        m_matrix_local = Matrix(m_position_local, m_rotation_local, m_scale_local);
+
+        // compute world transform
+        if (m_parent)
+        {
+            m_matrix = m_matrix_local * m_parent->GetMatrix();
+        }
+        else
+        {
+            m_matrix = m_matrix_local;
+        }
+
+        // update directions directly from matrix (avoids unstable quaternion decomposition)
+        // row-major layout: row 0 = right (X), row 1 = up (Y), row 2 = forward (Z)
+        {
+            // x
+            m_right    = Vector3::Normalize(Vector3(m_matrix.m00, m_matrix.m01, m_matrix.m02));
+            m_left     = -m_right;
+            // y
+            m_up       = Vector3::Normalize(Vector3(m_matrix.m10, m_matrix.m11, m_matrix.m12));
+            m_down     = -m_up;
+            // z
+            m_forward  = Vector3::Normalize(Vector3(m_matrix.m20, m_matrix.m21, m_matrix.m22));
+            m_backward = -m_forward;
+        }
+
+        // mark update
+        m_time_since_last_transform_sec = 0.0f;
+
+        // copy under the children lock, parallel prefab loads can AddChild while a parent updates
+        Entity* stack_children[32];
+        Entity** child_list = nullptr;
+        uint32_t child_count = 0;
+        vector<Entity*> heap_children;
+        {
+            lock_guard lock(m_mutex_children);
+            child_count = static_cast<uint32_t>(m_children.size());
+            if (child_count == 0)
+            {
+                return;
+            }
+
+            if (child_count <= 32)
+            {
+                memcpy(stack_children, m_children.data(), child_count * sizeof(Entity*));
+                child_list = stack_children;
+            }
+            else
+            {
+                heap_children = m_children;
+                child_list    = heap_children.data();
+            }
+        }
+
+        for (uint32_t i = 0; i < child_count; i++)
+        {
+            if (child_list[i])
+            {
+                child_list[i]->UpdateTransform();
+            }
+        }
+    }
+
+    void Entity::SetPosition(const Vector3& position)
+    {
+        if (GetPosition() == position)
+        {
+            return;
+        }
+
+        SetPositionLocal(!GetParent() ? position : position * GetParent()->GetMatrix().Inverted());
+    }
+
+    void Entity::SetPositionLocal(const Vector3& position)
+    {
+        if (m_position_local == position)
+        {
+            return;
+        }
+
+        // refuse non finite inputs, a NaN or inf position seeps into the world matrix and
+        // then into every render component bbox derived from it, which crashes the frustum culler
+        if (!position.IsFinite())
+        {
+            SP_LOG_WARNING("Entity::SetPositionLocal: rejecting non finite position on '%s'", GetObjectName().c_str());
+            return;
+        }
+
+        m_position_local = position;
+        UpdateTransform();
+    }
+
+    void Entity::SetRotation(const Quaternion& rotation)
+    {
+        // compute local rotation without using unstable GetRotation() decomposition
+        Quaternion local_rotation;
+        if (!GetParent())
+        {
+            local_rotation = rotation;
+        }
+        else
+        {
+            // compute parent's world rotation by composing local rotations up the hierarchy
+            // world_rot = root_local * ... * parent_local (compose from root down)
+            vector<Quaternion> rotations;
+            Entity* ancestor = GetParent();
+            while (ancestor)
+            {
+                rotations.push_back(ancestor->GetRotationLocal());
+                ancestor = ancestor->GetParent();
+            }
+
+            // compose from root (back of vector) to parent (front of vector)
+            Quaternion parent_world_rotation = Quaternion::Identity;
+            for (auto it = rotations.rbegin(); it != rotations.rend(); ++it)
+            {
+                parent_world_rotation = parent_world_rotation * (*it);
+            }
+
+            local_rotation = parent_world_rotation.Inverse() * rotation;
+        }
+
+        SetRotationLocal(local_rotation);
+    }
+
+    void Entity::SetRotationLocal(const Quaternion& rotation)
+    {
+        if (m_rotation_local == rotation)
+        {
+            return;
+        }
+
+        // refuse non finite inputs, a NaN quaternion produces a NaN 3x3 rotation block in the
+        // world matrix even when translation stays finite, which still NaNs every derived bbox
+        if (!rotation.IsFinite())
+        {
+            SP_LOG_WARNING("Entity::SetRotationLocal: rejecting non finite rotation on '%s'", GetObjectName().c_str());
+            return;
+        }
+
+        m_rotation_local = rotation;
+        UpdateTransform();
+    }
+
+    void Entity::SetScale(const Vector3& scale)
+    {
+        if (GetScale() == scale)
+        {
+            return;
+        }
+
+        SetScaleLocal(!GetParent() ? scale : scale / GetParent()->GetScale());
+    }
+
+    void Entity::SetScaleLocal(const Vector3& scale)
+    {
+        if (m_scale_local == scale)
+        {
+            return;
+        }
+
+        // refuse non finite inputs, a NaN scale propagates into the world matrix and every
+        // bbox computed off it, which crashes the frustum culler assert downstream
+        if (!scale.IsFinite())
+        {
+            SP_LOG_WARNING("Entity::SetScaleLocal: rejecting non finite scale on '%s'", GetObjectName().c_str());
+            return;
+        }
+
+        m_scale_local = scale;
+
+        // a scale of 0 will cause a division by zero when decomposing the world transform matrix
+        m_scale_local.x = (m_scale_local.x == 0.0f) ? numeric_limits<float>::min() : m_scale_local.x;
+        m_scale_local.y = (m_scale_local.y == 0.0f) ? numeric_limits<float>::min() : m_scale_local.y;
+        m_scale_local.z = (m_scale_local.z == 0.0f) ? numeric_limits<float>::min() : m_scale_local.z;
+
+        UpdateTransform();
+    }
+
+    void Entity::Translate(const Vector3& delta)
+    {
+        if (!GetParent())
+        {
+            SetPositionLocal(m_position_local + delta);
+        }
+        else
+        {
+            // go through SetPosition, Matrix * Vector3 treats the vector as a point so a displacement cannot pass through the inverse
+            SetPosition(GetPosition() + delta);
+        }
+    }
+
+    void Entity::Rotate(const Quaternion& delta)
+    {
+        if (!GetParent())
+        {
+            SetRotationLocal((delta * m_rotation_local).Normalized());
+        }
+        else
+        {
+            SetRotationLocal(GetParent()->GetRotation().Inverse() * delta * GetParent()->GetRotation() * m_rotation_local);
+        }
+    }
+
+    Entity* Entity::GetChildByIndex(const uint32_t index)
+    {
+        lock_guard lock(m_mutex_children);
+        if (index >= m_children.size())
+        {
+            return nullptr;
+        }
+
+        return m_children[index];
+    }
+
+    Entity* Entity::GetChildByName(const string& name)
+    {
+        lock_guard lock(m_mutex_children);
+        for (Entity* child : m_children)
+        {
+            if (child->GetObjectName() == name)
+            {
+                return child;
+            }
+        }
+
+        return nullptr;
+    }
+
+    Entity* Entity::GetDescendantByPath(const string& path)
+    {
+        // path is a slash separated chain of child names relative to this entity
+        // sibling names are assumed unique within a prefab, duplicates resolve to the first match
+        Entity* current = this;
+        stringstream ss(path);
+        string segment;
+        while (getline(ss, segment, '/'))
+        {
+            if (segment.empty())
+            {
+                continue;
+            }
+
+            current = current->GetChildByName(segment);
+            if (!current)
+            {
+                return nullptr;
+            }
+        }
+
+        return current;
+    }
+
+    void Entity::SetParent(Entity* new_parent)
+    {
+        {
+            lock_guard lock(m_mutex_parent);
+
+            if (new_parent)
+            {
+                // early exit if the parent is this entity
+                if (GetObjectId() == new_parent->GetObjectId())
+                {
+                    return;
+                }
+
+                // early exit if the parent is already set
+                if (m_parent && m_parent->GetObjectId() == new_parent->GetObjectId())
+                {
+                    return;
+                }
+
+                // if the new parent is a descendant of this transform (e.g. dragging and dropping an entity onto one of it's children)
+                if (new_parent->IsDescendantOf(this))
+                {
+                    vector<Entity*> children;
+                    {
+                        lock_guard children_lock(m_mutex_children);
+                        children.swap(m_children);
+                    }
+
+                    for (Entity* child : children)
+                    {
+                        if (!child)
+                        {
+                            continue;
+                        }
+
+                        child->m_parent = m_parent; // directly setting parent
+                        child->UpdateTransform();   // update transform if needed
+                    }
+                }
+            }
+
+            // remove the this as a child from the existing parent
+            if (m_parent)
+            {
+                bool update_child_with_null_parent = false;
+                m_parent->RemoveChild(this, update_child_with_null_parent);
+            }
+
+            // add this is a child to new parent
+            if (new_parent)
+            {
+                new_parent->AddChild(this);
+            }
+
+            m_parent = new_parent;
+        }
+
+        // transform after releasing m_mutex_parent, UpdateTransform can touch children/locks
+        UpdateTransform();
+    }
+
+    void Entity::AddChild(Entity* child)
+    {
+        SP_ASSERT(child != nullptr);
+        lock_guard lock(m_mutex_children);
+
+        // ensure that the child is not this transform
+        if (child->GetObjectId() == GetObjectId())
+        {
+            return;
+        }
+
+        // if this is not already a child, add it
+        if (!(find(m_children.begin(), m_children.end(), child) != m_children.end()))
+        {
+            m_children.emplace_back(child);
+        }
+    }
+
+    void Entity::MoveChildToIndex(Entity* child, uint32_t index)
+    {
+        SP_ASSERT(child != nullptr);
+        lock_guard lock(m_mutex_children);
+
+        // find the child in the list
+        auto it = find(m_children.begin(), m_children.end(), child);
+        if (it == m_children.end())
+        {
+            return;
+        } // child not found
+
+        // get current position before removing
+        uint32_t current_index = static_cast<uint32_t>(distance(m_children.begin(), it));
+
+        // remove from current position
+        m_children.erase(it);
+
+        // adjust target index if the child was before the target position
+        // (removing it shifts all subsequent indices down by 1)
+        if (current_index < index && index > 0)
+        {
+            index--;
+        }
+
+        // clamp index to valid range
+        if (index > m_children.size())
+        {
+            index = static_cast<uint32_t>(m_children.size());
+        }
+
+        // insert at new position
+        m_children.insert(m_children.begin() + index, child);
+    }
+
+    void Entity::RemoveChild(Entity* child, bool update_child_with_null_parent)
+    {
+        SP_ASSERT(child != nullptr);
+
+        // ensure the transform is not itself
+        if (child->GetObjectId() == GetObjectId())
+        {
+            return;
+        }
+
+        {
+            lock_guard lock(m_mutex_children);
+
+            // remove the child
+            m_children.erase(remove_if(m_children.begin(), m_children.end(), [child](Entity* vec_transform) { return vec_transform->GetObjectId() == child->GetObjectId(); }), m_children.end());
+        }
+
+        // never call SetParent while holding m_mutex_children, that path can re-enter RemoveChild and deadlock
+        if (update_child_with_null_parent)
+        {
+            child->SetParent(nullptr);
+        }
+    }
+
+    void Entity::ClearParent()
+    {
+        lock_guard lock(m_mutex_parent);
+
+        m_parent = nullptr;
+        UpdateTransform();
+    }
+
+    uint32_t Entity::GetChildrenCount() const
+    {
+        lock_guard lock(m_mutex_children);
+        return static_cast<uint32_t>(m_children.size());
+    }
+
+    vector<Entity*> Entity::GetChildren() const
+    {
+        lock_guard lock(m_mutex_children);
+        return m_children;
+    }
+
+    // searches the entire hierarchy, finds any children and saves them in m_children
+    // this is a recursive function, the children will also find their own children and so on
+    void Entity::AcquireChildren()
+    {
+        lock_guard lock(m_mutex_children);
+        m_children.clear();
+        m_children.shrink_to_fit();
+
+        const vector<Entity*>& entities = World::GetEntities();
+        for (Entity* possible_child : entities)
+        {
+            if (!possible_child || !possible_child->GetParent() || possible_child->GetObjectId() == GetObjectId())
+            {
+                continue;
+            }
+
+            // if it's parent matches this transform
+            if (possible_child->GetParent()->GetObjectId() == GetObjectId())
+            {
+                // welcome home son
+                m_children.emplace_back(possible_child);
+
+                // make the child do the same thing all over, essentially resolving the entire hierarchy
+                possible_child->AcquireChildren();
+            }
+        }
+    }
+
+    bool Entity::IsDescendantOf(Entity* transform) const
+    {
+        SP_ASSERT(transform != nullptr);
+
+        if (!m_parent)
+        {
+            return false;
+        }
+
+        if (m_parent->GetObjectId() == transform->GetObjectId())
+        {
+            return true;
+        }
+
+        for (Entity* child : transform->GetChildren())
+        {
+            if (IsDescendantOf(child))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    void Entity::GetDescendants(vector<Entity*>* descendants)
+    {
+        const vector<Entity*> children = GetChildren();
+        for (Entity* child : children)
+        {
+            descendants->emplace_back(child);
+
+            if (child->HasChildren())
+            {
+                child->GetDescendants(descendants);
+            }
+        }
+    }
+
+    Entity* Entity::GetDescendantByName(const string& name)
+    {
+        vector<Entity*> descendants;
+        GetDescendants(&descendants);
+
+        for (Entity* entity : descendants)
+        {
+            if (entity->GetObjectName() == name)
+            {
+                return entity;
+            }
+        }
+
+        return nullptr;
+    }
+
+    Matrix Entity::GetParentTransformMatrix()
+    {
+        return GetParent() ? GetParent()->GetMatrix() : Matrix::Identity;
+    }
+}

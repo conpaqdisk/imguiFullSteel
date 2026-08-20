@@ -1,0 +1,13 @@
+{
+  "BaseConfig": {
+    "Url": "file://config.backends.base.json",
+    "IgnoredProperties": [ "IgnoredFunctions" ]
+  },
+  "Namespace": "Hexa.NET.ImGui.Backends.SDL2",
+  "ApiName": "ImGuiImplSDL2",
+  "LibName": "cimgui_impl",
+  "Defines": [
+    "CIMGUI_USE_SDL2=1",
+    "CIMGUI_USE_SDL2Renderer=1"
+  ]
+}

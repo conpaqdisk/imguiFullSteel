@@ -1,0 +1,55 @@
+{
+  "FormatVersion": 3,
+  "Id": "d5516087-f7dd-44d4-a7e1-3c18767de921"/*ConvertColors*/,
+  "Description": "Converts between different color spaces. \n\nPlease note that for high precision (e.g. when converting back and forth between color spaces) you should change the render target format to 32bit.",
+  "SymbolTags": "8",
+  "InputUis": [
+    {
+      "InputId": "c11ad183-0f0c-46cb-b543-8f39cc707427"/*GenerateMipmaps*/,
+      "Position": {
+        "X": 584.6041,
+        "Y": 376.76242
+      }
+    },
+    {
+      "InputId": "caa374cf-d07a-4af9-89a0-42597e11a6ff"/*OutputFormat*/,
+      "Position": {
+        "X": 584.6041,
+        "Y": 341.76242
+      }
+    },
+    {
+      "InputId": "dd2f08a9-a539-41e9-aa1e-f8ad64fb8d29"/*Texture2d*/,
+      "Relevancy": "Required",
+      "Position": {
+        "X": 584.6041,
+        "Y": 271.76242
+      }
+    },
+    {
+      "InputId": "ffcba423-04e2-4bc6-b3bf-fbc3b15c84b8"/*Mode*/,
+      "Position": {
+        "X": 37.37989,
+        "Y": 385.8991
+      }
+    }
+  ],
+  "SymbolChildUis": [
+    {
+      "ChildId": "43825992-d326-4c85-b3ee-7f9cc46f5a80"/*_ImageFxShaderSetupStatic*/,
+      "Position": {
+        "X": 724.6041,
+        "Y": 271.76242
+      }
+    }
+  ],
+  "OutputUis": [
+    {
+      "OutputId": "49e4972f-e360-4bc3-b780-032d5e985540"/*Output*/,
+      "Position": {
+        "X": 724.6041,
+        "Y": 446.76242
+      }
+    }
+  ]
+}

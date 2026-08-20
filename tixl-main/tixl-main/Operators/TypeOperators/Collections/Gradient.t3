@@ -1,0 +1,38 @@
+{
+  "FormatVersion": 3,
+  "Id": "c5c3232c-70f8-4d1d-847d-6b6b25f3d9d6"/*Gradient*/,
+  "Inputs": [
+    {
+      "Id": "b129b4d8-7c1b-47e4-b156-b24d6632b13a"/*GradientInput*/,
+      "DefaultValue": {
+        "Gradient": {
+          "Interpolation": "Linear",
+          "Steps": [
+            {
+              "Id": "3c3d0fbc-2aa6-4a4e-998f-a104c68a4a27",
+              "NormalizedPosition": 0.0,
+              "Color": {
+                "R": 9.9999E-07,
+                "G": 9.999968E-07,
+                "B": 1E-06,
+                "A": 1.0
+              }
+            },
+            {
+              "Id": "739beb51-8831-421b-99a5-80890affe3bd",
+              "NormalizedPosition": 1.0,
+              "Color": {
+                "R": 1.0,
+                "G": 0.99999,
+                "B": 1.0,
+                "A": 1.0
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "Children": [],
+  "Connections": []
+}

@@ -1,0 +1,270 @@
+#nullable enable
+using Newtonsoft.Json;
+using Newtonsoft.Json.Converters;
+using T3.Core.Animation;
+using T3.Core.IO;
+using T3.Core.Settings;
+using T3.Editor.Compilation;
+using T3.Editor.Gui.Windows;
+using T3.Editor.Gui.Windows.RenderExport;
+using T3.Editor.Gui.Windows.TimeLine;
+
+namespace T3.Editor.Gui.UiHelpers;
+
+/// <summary>
+/// Saves view layout, currently open node and other user settings 
+/// </summary>
+///  todo - make internal, make extendable by external packages
+public sealed class UserSettings : Settings<UserSettings.ConfigData>
+{
+    internal UserSettings(bool saveOnQuit) : base("userSettings.json", saveOnQuit: saveOnQuit)
+    {
+    }
+
+    /// <summary>
+    /// Initializes gated debug logging based on current user settings configuration.
+    /// </summary>
+    public static void InitializeGatedLogging()
+    {
+        Log.Gated.Initialize(
+            Config.LogAudioDetails,
+            Config.LogAudioRenderingDetails,
+            Config.LogVideoRenderingDetails);
+    }
+
+    public sealed class ConfigData
+    {
+        /// <summary>
+        /// Last saved user view for symbolChildIds.
+        /// </summary>
+        /// <remarks>
+        /// Note that we are using symbolChildId instead of symbol, because we can assume that
+        /// symbolChildIds provide more context, e.g. there are many LayerId instances with different
+        /// Ids and the user scope might be different.
+        /// </remarks>
+        //public readonly Dictionary<Guid, CanvasScope> OperatorViewSettings = new();
+        public readonly Dictionary<Guid, ImRect> ViewedCanvasAreaForSymbolChildId = new();
+
+        public readonly Dictionary<string, Guid> LastOpsForWindows = new();
+
+        [JsonConverter(typeof(StringEnumConverter))]
+        public GraphHoverModes HoverMode = GraphHoverModes.LastValue;
+
+        // Projects
+        public List<string> ProjectDirectories = [];
+        public bool EnableUsbProjectDetection = true;
+
+        // UI-Elements
+        public bool ShowThumbnails = true;
+        public bool ShowMainMenu = true;
+        public bool ShowTitleAndDescription = true;
+        public bool ShowToolbar = true;
+        public bool ShowTimeline = true;
+        public bool TimelineFollowsPlayback = true;
+        public bool ShowMiniMap = false;
+        public bool ShowInteractionOverlay = false;
+        public float LayerHeight = 18;
+
+        /// <summary>When true, the Welcome window opens automatically at startup. Toggled from that window.</summary>
+        public bool ShowWelcomeOnStartup = true;
+
+        // UI-State
+        public float UiScaleFactor = 1;
+        public bool FullScreen = false;
+        public int WindowLayoutIndex = 0;
+        public bool SaveWindowLayoutsWithProjects = true;
+        public bool EnableIdleMotion = true;
+        public bool SuspendRenderingWhenHidden = true;
+        public bool UseVSync = true;
+
+        /** Windows' implementation of mirroring a display is extremely slow and can
+        * take up to 50% of the GPU time. Enabling this work around will copy the Main window
+        * SwapChain buffer into a texture that is used for the 2nd viewer window.
+        */
+        public bool MirrorUiOnSecondView = false;
+
+        public bool EnableKeyboardShortCuts = true;
+
+        public GraphStyles GraphStyle = GraphStyles.Magnetic;
+
+        // Interaction
+        public bool WarnBeforeLibEdit = true;
+        public bool SmartGroupDragging = false;
+
+        public readonly bool ShowExplicitTextureFormatInOutputWindow = false;
+        public bool UseArcConnections = true;
+        public bool ResetTimeAfterPlayback;
+        public float SnapStrength = 5;
+        public ValueEditMethods ValueEditMethod;
+        public int ValueEditSmoothing = 6;
+        public float ScrollSmoothing = 0.06f;
+
+        public bool UseTouchPadPanning = false;
+        public float PanSpeed = 20;
+
+        // Mag Graph
+        public bool DisconnectOnUnsnap = true;
+        public float MaxCurveRadius = 350;
+        public int MaxSegmentCount = 32;
+        public bool EnableHorizontalSnapping = true;
+
+        /// <summary>
+        /// Below this smoothed mouse speed (screen px/s) dragging ops against a section
+        /// border grows the frame, and dragging a border pushes neighbors. 0 disables.
+        /// </summary>
+        public float SectionSlowResizeSpeed = 20;
+
+        public bool AddSpacesToParameterNames = true;
+
+        public float ClickThreshold = 5; // Increase for high-res display and pen tablets
+        public bool AdjustCameraSpeedWithMouseWheel = false;
+        public float CameraSpeed = 1;
+
+        public bool MiddleMouseButtonZooms = false;
+
+        public FrameStepAmount FrameStepAmount = FrameStepAmount.FrameAt30Fps;
+
+        public bool MouseWheelEditsNeedCtrlKey = true;
+        public bool AutoPinAllAnimations = false;
+
+        public readonly float KeyboardScrollAcceleration = 2.5f;
+
+        public bool VariationLiveThumbnails = false;
+        public bool VariationHoverPreview = true;
+
+        public bool EditorHoverPreview = true;
+
+        public bool HelpHoverPreview = true;
+
+        public bool ApplyDropdownValuesOnHover = true;
+
+        public bool ShowSkillQuestInHub = true;
+
+        // Asset Lib
+        public bool SyncWithOperatorSelection = true;
+        public bool ScrollAssetLibToActive = true;
+        
+        // Load Save
+        public string UserName = UndefinedUserName;
+        public bool EnableAutoBackup = true;
+        public bool MinimalBackup = true;
+        
+        public bool PreventSavingSymbolsWithMissingReferences = true;
+
+        public float GizmoSize = 100;
+
+        // Fullscreen settings
+        public int FullScreenIndexMain = 0;
+        // Output window
+        public int FullScreenIndexViewer = 0;
+        public Vector4 OutputArea = new(0,0,0,0);
+
+        /// <summary>Seconds between captures while continuous screenshot mode is active (Ctrl-click the output's screenshot icon).</summary>
+        public float ContinuousScreenshotDelay = 5;
+
+        // FileFormats is internal, so this field must be too; JsonProperty keeps it serialized.
+        /// <summary>File format used by the output window's screenshot icon. JPG produces much smaller files for sequences.</summary>
+        [JsonProperty]
+        [JsonConverter(typeof(StringEnumConverter))]
+        internal ScreenshotWriter.FileFormats ScreenshotFileFormat = ScreenshotWriter.FileFormats.Png;
+
+        // Timeline
+        public float TimeRasterDensity = 1f;
+
+        // Space mouse
+        public float SpaceMouseRotationSpeedFactor = 1f;
+        public float SpaceMouseMoveSpeedFactor = 1f;
+        public float SpaceMouseDamping = 0.5f;
+
+        // Migration-only: these load from existing userSettings.json to preserve
+        // the user's last render path counters. Not written back.
+        [Obsolete("Migrated to per-symbol RenderSettings in .t3ui")]
+        public string? RenderVideoFilePath;
+        [Obsolete("Migrated to per-symbol RenderSettings in .t3ui")]
+        public string? RenderSequenceFilePath;
+        [Obsolete("Migrated to per-symbol RenderSettings in .t3ui")]
+        public string? RenderSequenceFileName;
+        [Obsolete("Migrated to per-symbol RenderSettings in .t3ui")]
+        public string? RenderSequencePrefix;
+
+        // Video-proxy preferences moved to per-project CompositionSettings.ProxyConfig (they travel with the
+        // project) — ProxyFormat / ProxyResolution / UseProxyVideos are no longer per-machine user settings.
+        // This one stays per-machine: it guards the local disk against proxy generation when space is low.
+        public float ProxyMinFreeDiskGb = 5f; // refuse to generate a proxy if the target drive has less free space
+
+        // Profiling and debugging
+        public bool LoadMultiThreaded = true;
+        public bool EnableFrameProfiling = true;
+        public bool KeepTraceForLogMessages = false;
+        public bool EnableGCProfiling = false;
+        public bool EnableMidiDebugLogging = false;
+        public bool ShowOperatorStats = false;
+        
+        // Gated Debug Logging
+        public bool LogAudioDetails = false;
+        public bool LogAudioRenderingDetails = false;
+        public bool LogVideoRenderingDetails = false;
+
+        public CompilerOptions.Verbosity CompileCsVerbosity = CompilerOptions.Verbosity.Minimal;
+
+        [JsonConverter(typeof(StringEnumConverter))]
+        public TimeFormat.TimeDisplayModes TimeDisplayMode = TimeFormat.TimeDisplayModes.Bars;
+
+        public readonly List<Bookmark> Bookmarks = [];
+
+        public string ColorThemeName = string.Empty;
+
+        // Other
+
+        public string KeyBindingName = string.Empty;
+
+        public bool ExpandSpectrumVisualizerVertically = true;
+        public int GridOutputColumnCount = 16;
+        //private string _defaultNewProjectDirectory = _defaultProjectFolder;
+        //public string DefaultNewProjectDirectory => _defaultNewProjectDirectory ??= _defaultProjectFolder;
+
+        // Rendering Profiling
+        public bool ShowRenderProfilingLogs = false;
+
+        private static readonly string _defaultProjectFolder = FileLocations.DefaultProjectFolder;
+    }
+
+    public enum ValueEditMethods
+    {
+        InfinitySlider,
+        RadialSlider,
+        JogDial,
+        ValueLadder,
+    }
+
+    public enum GraphHoverModes
+    {
+        Disabled,
+        Live,
+        LastValue,
+    }
+
+    public enum GraphStyles
+    {
+        Legacy,
+        Magnetic,
+    }
+
+    internal static bool IsUserNameDefined()
+    {
+        return !string.IsNullOrEmpty(Config.UserName) && Config.UserName != UndefinedUserName;
+    }
+
+    internal const string UndefinedUserName = "unknown";
+
+    internal static Guid GetLastOpenOpForWindow(string windowTitle)
+    {
+        return Config.LastOpsForWindows.TryGetValue(windowTitle, out var id) ? id : Guid.Empty;
+    }
+
+    internal static void SaveLastViewedOpForWindow(string title, Guid opInstanceId)
+    {
+        Config.LastOpsForWindows[title] = opInstanceId;
+    }
+    // Rendering Profiling
+}

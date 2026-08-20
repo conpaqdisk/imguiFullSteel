@@ -1,0 +1,229 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES ================================
+#include "pch.h"
+#include "Window.h"
+#include "ThreadPool.h"
+#include "../input/Input.h"
+#include "../world/World.h"
+#include "../physics/PhysicsWorld.h"
+#include "../profiling/Profiler.h"
+#include "../rendering/Renderer.h"
+#include "../resource/ResourceCache.h"
+#include "../resource/import/FontImporter.h"
+#include "../resource/import/ModelImporter.h"
+#include "../resource/import/ImageImporter.h"
+#include "../display/Display.h"
+#include "../memory/Allocator.h"
+#include "../testing/SmokeTest.h"
+#include "../rhi/RHI_Device.h"
+#include "../xr/Xr.h"
+#include "../commands/console/ConsoleCommands.h"
+#include "../mcp/McpServer.h"
+#include "../steam/Steam.h"
+#include "../resource/IconAtlas.h"
+#include "Settings.h"
+#include <future>
+//===========================================
+
+//= NAMESPACES ===============
+using namespace std;
+using namespace spartan::math;
+//============================
+
+namespace spartan
+{
+    namespace
+    {
+        vector<string> arguments;
+        uint32_t flags = 0;
+    }
+
+    void Engine::Initialize(const vector<string>& args)
+    {
+        arguments = args;
+
+        SetFlag(EngineMode::EditorVisible, !HasArgument("-game"));
+        SetFlag(EngineMode::Playing,       true);
+
+        // initialize
+        Stopwatch timer_initialize;
+        {
+            Log::Initialize();
+            Settings::LoadPreInitSettings();
+            FontImporter::Initialize();
+            ImageImporter::Initialize();
+            Window::Initialize();
+            Display::Initialize();
+            Timer::Initialize();
+            Input::Initialize();
+            ThreadPool::Initialize();
+            ResourceCache::Initialize();
+            Profiler::Initialize();
+
+            // overlap independent cpu work with the heavy renderer path
+            future<void> physics_future = ThreadPool::AddTask([]()
+            {
+                PhysicsWorld::Initialize();
+            });
+            future<void> icon_decode_future = ThreadPool::AddTask([]()
+            {
+                IconAtlas::DecodeSources();
+            });
+
+            Renderer::Initialize();
+            Window::PumpEvents();
+            World::Initialize();
+            Settings::Initialize();
+            SmokeTest::Initialize();
+            McpServer::Initialize(args);
+            Steam::Initialize(); // must stay on the main thread, steam callbacks run here too
+
+            physics_future.get();
+            icon_decode_future.get();
+
+            // xr is intentionally not auto initialized here, ctrl+0 brings it up on demand
+            // so the openxr runtime (e.g. steamvr) is never spawned without explicit intent
+        }
+
+        // post-initialize
+        {
+            // gpu-capability defaults for new users (no settings file)
+            // existing users keep their saved preferences
+            if (!Settings::HasLoadedUserSettingsFromFile())
+            {
+                bool ray_tracing_supported = RHI_Device::IsSupportedRayTracing();
+                ConsoleRegistry::Get().SetValueFromString("r.ray_traced_reflections", std::to_string(static_cast<float>(ray_tracing_supported)));
+                ConsoleRegistry::Get().SetValueFromString("r.ray_traced_shadows", std::to_string(static_cast<float>(ray_tracing_supported)));
+                ConsoleRegistry::Get().SetValueFromString("r.mesh_shaders", std::to_string(static_cast<float>(RHI_Device::IsSupportedMeshShaders())));
+
+                Renderer_AntiAliasing_Upsampling aa = Renderer_AntiAliasing_Upsampling::AA_Taau_Upscale_Taau;
+                if (RHI_Device::IsSupportedDlss())
+                {
+                    aa = Renderer_AntiAliasing_Upsampling::AA_Dlss_Upscale_Dlss;
+                }
+                ConsoleRegistry::Get().SetValueFromString("r.antialiasing_upsampling", std::to_string(static_cast<float>(aa)));
+            }
+
+            Window::PumpEvents();
+            ResourceCache::LoadDefaultResources();
+            Window::PumpEvents();
+        }
+
+        SP_LOG_INFO("%s has been initialized. Duration %.1f sec", version::c_str(), timer_initialize.GetElapsedTimeSec());
+    }
+
+    void Engine::Shutdown()
+    {
+        Steam::Shutdown();
+        McpServer::Shutdown();
+        Profiler::Shutdown();
+
+        // the thread pool can hold state from other systems
+        // so shut it down first (it waits) to avoid crashes due to race conditions
+        ThreadPool::Shutdown();
+
+        // world must tear down first, DestroyAccelerationStructures and entity
+        // destructors still need live meshes and materials from the resource cache
+        World::Shutdown();
+        ResourceCache::UnloadDefaultResources();
+
+        PhysicsWorld::Shutdown();
+        Xr::Shutdown();
+        Renderer::Shutdown();
+   
+        Event::Shutdown();
+        Window::Shutdown();
+        ImageImporter::Shutdown();
+        FontImporter::Shutdown();
+        Settings::Shutdown();
+    }
+
+    void Engine::Tick()
+    {
+        // pre-tick
+        Input::PreTick();
+        McpServer::Tick();
+        Steam::Tick();
+
+        // ctrl+0 toggles openxr for whatever runtime/headset is active (steamvr, psvr2 via stvr, etc)
+        if ((Input::GetKey(KeyCode::Ctrl_Left) || Input::GetKey(KeyCode::Ctrl_Right)) && Input::GetKeyDown(KeyCode::Alpha0))
+        {
+            if (!Xr::IsAvailable())
+            {
+                SP_LOG_INFO("openxr: enabling (any connected openxr headset)");
+                Xr::Initialize();
+            }
+            else
+            {
+                SP_LOG_INFO("openxr: disabling");
+                Xr::Shutdown();
+            }
+        }
+
+        // f12 takes a screenshot, usable with the headset on
+        if (Input::GetKeyDown(KeyCode::F12))
+        {
+            Renderer::Screenshot();
+        }
+
+        // tick
+        Window::Tick();
+        Input::Tick();
+        PhysicsWorld::Tick();
+        World::Tick();
+        PhysicsWorld::DrawDebugVisualization();
+        Xr::Tick();
+        Renderer::Tick();
+        Allocator::Tick();
+        SmokeTest::Tick();
+
+    }
+
+    bool Engine::IsFlagSet(const EngineMode flag)
+    {
+        return flags & static_cast<uint32_t>(flag);
+    }
+
+    void Engine::SetFlag(const EngineMode flag, const bool enabled)
+    {
+        enabled ? (flags |= static_cast<uint32_t>(flag)) : (flags &= ~static_cast<uint32_t>(flag));
+    }
+
+    void Engine::ToggleFlag(const EngineMode flag)
+    {
+        IsFlagSet(flag) ? (flags &= ~static_cast<uint32_t>(flag)) : (flags |= static_cast<uint32_t>(flag));
+    }
+
+    bool Engine::HasArgument(const string& argument)
+    {
+        for (const auto& arg : arguments)
+        {
+            if (arg == argument)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}

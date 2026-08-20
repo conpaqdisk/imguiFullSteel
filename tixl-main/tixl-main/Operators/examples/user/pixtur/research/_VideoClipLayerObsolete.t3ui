@@ -1,0 +1,61 @@
+{
+  "FormatVersion": 3,
+  "Id": "0dbc4f3f-8fdb-402b-a7cb-6949cf21a98a"/*_VideoClipLayerObsolete*/,
+  "Description": "Plays the source region of a video source defined by the time clip container.",
+  "InputUis": [
+    {
+      "InputId": "28f27625-37fe-409a-b6c1-d4eabf6c1eb8"/*Volume*/,
+      "Position": {
+        "X": -224.20642,
+        "Y": 46.76013
+      }
+    },
+    {
+      "InputId": "31721e18-556b-452b-a8aa-18dbd44af74d"/*Path*/,
+      "Position": {
+        "X": -224.20642,
+        "Y": 11.760132
+      },
+      "Usage": "FilePath"
+    },
+    {
+      "InputId": "5eb10090-ae6a-4ae7-9fbd-5bd9ffd13b1b"/*ResyncThreshold*/,
+      "Position": {
+        "X": -224.20642,
+        "Y": 81.76013
+      }
+    }
+  ],
+  "SymbolChildUis": [
+    {
+      "ChildId": "49676bbc-9566-479e-87ff-68741dedf878"/*_VideoFormatConversion*/,
+      "Position": {
+        "X": -84.20642,
+        "Y": 116.76013
+      }
+    },
+    {
+      "ChildId": "524dda12-de31-4378-87bd-9e587c087871"/*PlayVideo*/,
+      "Position": {
+        "X": -84.20642,
+        "Y": 11.760132
+      }
+    },
+    {
+      "ChildId": "a054b8bc-67ad-4610-92a9-d51d1d57aab4"/*Layer2d*/,
+      "Position": {
+        "X": -84.20642,
+        "Y": 151.76013
+      }
+    }
+  ],
+  "OutputUis": [
+    {
+      "OutputId": "44a513ca-ab20-46df-bb6b-f28b42dc86e0"/*Output*/,
+      "Position": {
+        "X": -84.20642,
+        "Y": 186.76013
+      }
+    }
+  ]
+}

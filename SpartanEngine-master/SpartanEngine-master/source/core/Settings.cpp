@@ -1,0 +1,287 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= INCLUDES =========================
+#include "pch.h"
+#include "Window.h"
+#include "../rendering/Renderer.h"
+#include "../resource/ResourceCache.h"
+#include "../input/Input.h"
+#include "../xr/Xr.h"
+SP_WARNINGS_OFF
+#include "../io/pugixml.hpp"
+SP_WARNINGS_ON
+//====================================
+
+//= NAMESPACES ================
+using namespace std;
+using namespace spartan::math;
+//=============================
+
+namespace spartan
+{
+    namespace
+    { 
+        bool m_has_loaded_user_settings = false;
+        string file_path                = "spartan.xml";
+
+        void resolve_file_path()
+        {
+            // already resolved to an absolute path from a previous call
+            if (file_path.size() > 2 &&
+                (file_path[1] == ':' || file_path[0] == '/' || file_path[0] == '\\'))
+            {
+                if (FileSystem::Exists(file_path))
+                {
+                    return;
+                }
+            }
+
+            // prefer the xml next to the exe, cwd differs between vs and a double click
+            const string exe_dir = FileSystem::GetExecutableDirectory();
+            const string exe_xml = exe_dir + "/spartan.xml";
+            if (FileSystem::Exists(exe_xml))
+            {
+                file_path = exe_xml;
+                return;
+            }
+
+            const string cwd_xml = FileSystem::GetWorkingDirectory() + "/spartan.xml";
+            if (FileSystem::Exists(cwd_xml))
+            {
+                file_path = cwd_xml;
+                return;
+            }
+
+            // walk up from the exe looking for binaries/spartan.xml
+            string current = exe_dir;
+            for (uint32_t level = 0; level < 16; level++)
+            {
+                const string candidate = current + "/binaries/spartan.xml";
+                if (FileSystem::Exists(candidate))
+                {
+                    file_path = candidate;
+                    return;
+                }
+
+                const string parent = FileSystem::GetParentDirectory(current);
+                if (parent == current)
+                {
+                    break;
+                }
+                current = parent;
+            }
+
+            // last resort, keep a writable default next to the exe
+            file_path = exe_xml;
+        }
+
+        // helper to convert cvar name to xml-safe name (e.g., "r.bloom" -> "r_bloom")
+        string cvar_name_to_xml(const char* name)
+        {
+            string result(name);
+            for (char& c : result)
+            {
+                if (c == '.')
+                {
+                    c = '_';
+                }
+            }
+            return result;
+        }
+
+        void save()
+        {
+            pugi::xml_document doc;
+
+            // write settings
+            pugi::xml_node root = doc.append_child("Settings");
+            {
+                root.append_child("FullScreen").text().set(Window::IsFullScreen());
+                root.append_child("IsMouseVisible").text().set(Input::GetMouseCursorVisible());
+
+                // never persist hmd eye resolution, that poisons the next non-vr launch
+                uint32_t output_w = static_cast<uint32_t>(Renderer::GetResolutionOutput().x);
+                uint32_t output_h = static_cast<uint32_t>(Renderer::GetResolutionOutput().y);
+                uint32_t render_w = static_cast<uint32_t>(Renderer::GetResolutionRender().x);
+                uint32_t render_h = static_cast<uint32_t>(Renderer::GetResolutionRender().y);
+                float viewport_w  = 0.0f;
+                float viewport_h  = 0.0f;
+                if (!Xr::TryGetPersistedDesktopResolution(output_w, output_h, render_w, render_h, viewport_w, viewport_h))
+                {
+                    if (Xr::GetStereoMode())
+                    {
+                        output_w = Window::GetWidthInPixels();
+                        output_h = Window::GetHeightInPixels();
+                        render_w = 1920;
+                        render_h = 1080;
+                    }
+                }
+
+                root.append_child("ResolutionOutputWidth").text().set(output_w);
+                root.append_child("ResolutionOutputHeight").text().set(output_h);
+                root.append_child("ResolutionRenderWidth").text().set(render_w);
+                root.append_child("ResolutionRenderHeight").text().set(render_h);
+                root.append_child("FPSLimit").text().set(Timer::GetFpsLimit());
+                for (const auto& [name, cvar] : ConsoleRegistry::Get().GetAll())
+                {
+                    if (name.size() >= 2 && name[0] == 'r' && name[1] == '.')
+                    {
+                        float value = get<float>(*cvar.m_value_ptr);
+
+                        if (name == "r.resolution_scale" && cvar_dynamic_resolution.GetValueAs<bool>())
+                        {
+                            value = 1.0f;
+                        }
+
+                        root.append_child(cvar_name_to_xml(string(name).c_str()).c_str()).text().set(value);
+                    }
+                }
+
+                root.append_child("UseRootShaderDirectory").text().set(ResourceCache::GetUseRootShaderDirectory());
+            }
+
+            if (!doc.save_file(file_path.c_str()))
+            {
+                SP_LOG_ERROR("Failed to save settings file: %s", file_path.c_str());
+            }
+        }
+
+        void load()
+        {
+            // attempt to load file
+            pugi::xml_document doc;
+            if (!doc.load_file(file_path.c_str()))
+            {
+                SP_LOG_ERROR("Failed to load XML file");
+                return;
+            }
+
+            pugi::xml_node root = doc.child("Settings");
+
+            // load settings
+            {
+                if ((root.child("FullScreen").text().as_bool()))
+                {
+                    Window::FullScreen();
+                }
+
+                Input::SetMouseCursorVisible(root.child("IsMouseVisible").text().as_bool());
+                Timer::SetFpsLimit(root.child("FPSLimit").text().as_float());
+
+                int render_w = root.child("ResolutionRenderWidth").text().as_int();
+                int render_h = root.child("ResolutionRenderHeight").text().as_int();
+                int output_w = root.child("ResolutionOutputWidth").text().as_int();
+                int output_h = root.child("ResolutionOutputHeight").text().as_int();
+
+                // reject leftover openxr eye sizes (near-square, huge) so a bad save cannot stick
+                if (output_w > 0 && output_h > 0)
+                {
+                    const float aspect = static_cast<float>(output_w) / static_cast<float>(output_h);
+                    if (aspect > 0.85f && aspect < 1.15f && output_w >= 3000)
+                    {
+                        SP_LOG_WARNING(
+                            "settings: discarding poisoned hmd resolution %dx%d, using window size",
+                            output_w,
+                            output_h
+                        );
+                        output_w = static_cast<int>(Window::GetWidthInPixels());
+                        output_h = static_cast<int>(Window::GetHeightInPixels());
+                        render_w = 1920;
+                        render_h = 1080;
+                    }
+                }
+
+                Renderer::SetResolutionRender(render_w, render_h);
+                Renderer::SetResolutionOutput(output_w, output_h);
+                bool dynamic_resolution = root.child("r_dynamic_resolution").text().as_bool();
+
+                // load render options from xml
+                for (const auto& [name, cvar] : ConsoleRegistry::Get().GetAll())
+                {
+                    if (name.size() >= 2 && name[0] == 'r' && name[1] == '.')
+                    {
+                        pugi::xml_node child = root.child(cvar_name_to_xml(string(name).c_str()).c_str());
+                        if (child)
+                        {
+                            if (name == "r.resolution_scale" && dynamic_resolution)
+                            {
+                                ConsoleRegistry::Get().SetValueFromString(string(name).c_str(), "1.0");
+                            }
+                            else
+                            {
+                                ConsoleRegistry::Get().SetValueFromString(string(name).c_str(), child.text().as_string());
+                            }
+                        }
+                    }
+                }
+
+                // this setting can be mapped directly to the resource cache (no need to wait for it to initialize)
+                if (pugi::xml_node use_root_shader_directory = root.child("UseRootShaderDirectory"))
+                {
+                    ResourceCache::SetUseRootShaderDirectory(use_root_shader_directory.text().as_bool());
+                }
+            }
+
+            m_has_loaded_user_settings = true;
+        }
+    }
+
+    void Settings::LoadPreInitSettings()
+    {
+        resolve_file_path();
+        if (!FileSystem::Exists(file_path))
+        {
+            return;
+        }
+
+        pugi::xml_document doc;
+        if (!doc.load_file(file_path.c_str()))
+        {
+            return;
+        }
+
+        pugi::xml_node root = doc.child("Settings");
+        if (pugi::xml_node use_root_shader_directory = root.child("UseRootShaderDirectory"))
+        {
+            ResourceCache::SetUseRootShaderDirectory(use_root_shader_directory.text().as_bool());
+        }
+    }
+
+    void Settings::Initialize()
+    {
+        resolve_file_path();
+        if (FileSystem::Exists(file_path))
+        {
+            load();
+        }
+    }
+    
+    void Settings::Shutdown()
+    {
+        save();
+    }
+
+    bool Settings::HasLoadedUserSettingsFromFile()
+    {
+        return m_has_loaded_user_settings;
+    }
+}

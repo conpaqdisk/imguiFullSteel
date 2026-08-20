@@ -1,0 +1,970 @@
+/*
+Copyright(c) 2015-2026 Panos Karabelas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+//= includes =========
+#include "../common.hlsl"
+#include "planet.hlsl"
+//====================
+
+// constants - atmosphere
+static const float3 up_direction       = float3(0.0, 1.0, 0.0);
+static const float earth_radius        = planet_earth_radius;
+static const float atmosphere_radius   = planet_atmosphere_radius;
+static const float3 earth_center       = planet_earth_center;
+
+// constants - scattering coefficients at sea level
+static const float3 rayleigh_scatter   = float3(5.802e-6, 13.558e-6, 33.1e-6);
+static const float rayleigh_height     = 8000.0;
+static const float3 mie_scatter        = float3(3.996e-6, 3.996e-6, 3.996e-6);
+static const float3 mie_extinction     = float3(4.4e-6, 4.4e-6, 4.4e-6);
+static const float mie_height          = 1200.0;
+static const float mie_g               = 0.8;
+
+// constants - ozone
+static const float3 ozone_absorption   = float3(0.65e-6, 1.881e-6, 0.085e-6);
+static const float ozone_center_height = 25000.0;
+static const float ozone_width         = 15000.0;
+
+// constants - sun and ground
+// every sun energy term reads get_sun_radiance_toa() from common.hlsl, the neutral white top
+// of atmosphere radiance derived from the directional light's intensity, all tinting comes
+// from atmospheric transmittance so the sky, sun disc, clouds, ibl and direct surface
+// lighting stay locked to the atmosphere as the single ground truth for sun color
+static const float sun_angular_radius  = 0.00935;
+static const float3 ground_albedo      = float3(0.3, 0.3, 0.3);
+
+// constants - sampling
+static const int transmittance_samples = 32;
+static const int multiscatter_samples  = 16;
+static const int scattering_samples    = 32;
+
+// utility
+float safe_sqrt(float x) { return sqrt(max(0.0, x)); }
+
+float2 ray_sphere_intersect(float3 origin, float3 direction, float3 center, float radius)
+{
+    float3 oc = origin - center;
+    float b = dot(direction, oc);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = b * b - c;
+    
+    if (discriminant < 0.0)
+        return float2(-1.0, -1.0);
+    
+    float d = sqrt(discriminant);
+    return float2(-b - d, -b + d);
+}
+
+float get_height(float3 position)
+{
+    return length(position - earth_center) - earth_radius;
+}
+
+// keep the camera inside the atmosphere shell, shared by the sky view lut and the panorama bake
+float3 clamp_camera_to_atmosphere(float3 cam_pos)
+{
+    float cam_h = get_height(cam_pos);
+    if (cam_h < 0.0)
+    {
+        return earth_center + normalize(cam_pos - earth_center) * (earth_radius + 1.0);
+    }
+    if (cam_h > atmosphere_radius - earth_radius)
+    {
+        return earth_center + normalize(cam_pos - earth_center) * (atmosphere_radius - 1.0);
+    }
+    return cam_pos;
+}
+
+// density functions
+float get_rayleigh_density(float height) { return exp(-height / rayleigh_height); }
+float get_mie_density(float height)      { return exp(-height / mie_height); }
+float get_ozone_density(float height)    { return max(0.0, 1.0 - abs(height - ozone_center_height) / ozone_width); }
+
+float3 get_extinction(float height)
+{
+    return rayleigh_scatter * get_rayleigh_density(height) +
+           mie_extinction * get_mie_density(height) +
+           ozone_absorption * get_ozone_density(height);
+}
+
+float3 get_scattering(float height)
+{
+    return rayleigh_scatter * get_rayleigh_density(height) + mie_scatter * get_mie_density(height);
+}
+
+// phase functions
+float rayleigh_phase(float cos_theta)
+{
+    return (3.0 / (16.0 * PI)) * (1.0 + cos_theta * cos_theta);
+}
+
+float cornette_shanks_phase(float cos_theta, float g)
+{
+    float g2 = g * g;
+    float num = 3.0 * (1.0 - g2) * (1.0 + cos_theta * cos_theta);
+    float denom = (8.0 * PI) * (2.0 + g2) * pow(1.0 + g2 - 2.0 * g * cos_theta, 1.5);
+    return num / max(denom, 0.0001);
+}
+
+// transmittance lut uv mapping with horizon emphasis
+float2 transmittance_lut_params_to_uv(float height, float cos_zenith)
+{
+    float h = safe_sqrt((height - earth_radius) / (atmosphere_radius - earth_radius));
+    float rho = safe_sqrt(max(0.0, height * height - earth_radius * earth_radius));
+    float cos_horizon = -rho / height;
+    
+    float x_mu;
+    if (cos_zenith > cos_horizon)
+        x_mu = 0.5 + 0.5 * (cos_zenith - cos_horizon) / (1.0 - cos_horizon);
+    else
+        x_mu = 0.5 * (cos_zenith + 1.0) / (cos_horizon + 1.0);
+    
+    return float2(saturate(x_mu), h);
+}
+
+void transmittance_uv_to_params(float2 uv, out float height, out float cos_zenith)
+{
+    float h = uv.y * uv.y;
+    height = earth_radius + h * (atmosphere_radius - earth_radius);
+    
+    float rho = safe_sqrt(max(0.0, height * height - earth_radius * earth_radius));
+    float cos_horizon = -rho / height;
+    
+    if (uv.x > 0.5)
+    {
+        float t = (uv.x - 0.5) * 2.0;
+        cos_zenith = cos_horizon + t * (1.0 - cos_horizon);
+    }
+    else
+    {
+        float t = uv.x * 2.0;
+        cos_zenith = t * (cos_horizon + 1.0) - 1.0;
+    }
+}
+
+// compute optical depth from position to atmosphere top
+float3 compute_transmittance_to_top(float3 position, float3 direction)
+{
+    float2 intersect = ray_sphere_intersect(position, direction, earth_center, atmosphere_radius);
+    float t_max = intersect.y;
+    if (t_max < 0.0)
+        return float3(1.0, 1.0, 1.0);
+    
+    // rays that hit the planet are fully occluded, zero gives every consumer the earth shadow
+    float2 ground_hit = ray_sphere_intersect(position, direction, earth_center, earth_radius);
+    if (ground_hit.x > 0.0)
+        return float3(0.0, 0.0, 0.0);
+    
+    // trapezoidal integration
+    float dt = t_max / transmittance_samples;
+    float3 optical_depth = float3(0.0, 0.0, 0.0);
+    float3 prev_ext = get_extinction(get_height(position));
+    
+    for (int i = 1; i <= transmittance_samples; i++)
+    {
+        float3 sample_pos = position + direction * i * dt;
+        float height = get_height(sample_pos);
+        if (height < 0.0) break;
+        
+        float3 curr_ext = get_extinction(height);
+        optical_depth += (prev_ext + curr_ext) * 0.5 * dt;
+        prev_ext = curr_ext;
+    }
+    
+    return exp(-optical_depth);
+}
+
+// multi-scatter lut - infinite bounce approximation
+float3 compute_multiscatter(float height, float cos_sun_zenith, Texture2D transmittance_lut, SamplerState samp)
+{
+    float3 position = earth_center + float3(0.0, earth_radius + height, 0.0);
+    float3 sun_dir = float3(safe_sqrt(1.0 - cos_sun_zenith * cos_sun_zenith), cos_sun_zenith, 0.0);
+    
+    float3 luminance_sum = float3(0.0, 0.0, 0.0);
+    float3 f_ms_sum = float3(0.0, 0.0, 0.0);
+    
+    const int sqrt_samples = 8;
+    for (int i = 0; i < sqrt_samples; i++)
+    {
+        for (int j = 0; j < sqrt_samples; j++)
+        {
+            float u = (i + 0.5) / sqrt_samples;
+            float v = (j + 0.5) / sqrt_samples;
+            
+            float cos_theta = u * 2.0 - 1.0;
+            float sin_theta = safe_sqrt(1.0 - cos_theta * cos_theta);
+            float phi = v * PI2;
+            float3 ray_dir = float3(sin_theta * cos(phi), cos_theta, sin_theta * sin(phi));
+            
+            float2 atmo_hit = ray_sphere_intersect(position, ray_dir, earth_center, atmosphere_radius);
+            float t_max = atmo_hit.y;
+            
+            float2 ground_hit = ray_sphere_intersect(position, ray_dir, earth_center, earth_radius);
+            bool hits_ground = ground_hit.x > 0.0;
+            if (hits_ground) t_max = ground_hit.x;
+            
+            float dt = t_max / multiscatter_samples;
+            float3 trans = float3(1.0, 1.0, 1.0);
+            float3 scatter_integral = float3(0.0, 0.0, 0.0);
+            
+            for (int k = 0; k < multiscatter_samples; k++)
+            {
+                float3 sample_pos = position + ray_dir * (k + 0.5) * dt;
+                float sample_h = get_height(sample_pos);
+                
+                float3 scatter = get_scattering(sample_h);
+                float3 extinct = get_extinction(sample_h);
+                
+                float cos_sun = dot(normalize(sample_pos - earth_center), sun_dir);
+                float2 sun_uv = transmittance_lut_params_to_uv(sample_h + earth_radius, cos_sun);
+                float3 trans_sun = transmittance_lut.SampleLevel(samp, sun_uv, 0).rgb;
+                
+                float3 scatter_no_phase = scatter * trans_sun;
+                float3 s_int = (scatter_no_phase - scatter_no_phase * exp(-extinct * dt)) / max(extinct, 0.0001);
+                
+                scatter_integral += s_int * trans;
+                trans *= exp(-extinct * dt);
+            }
+            
+            // ground contribution
+            if (hits_ground)
+            {
+                float3 ground_pos = position + ray_dir * t_max;
+                float3 ground_n = normalize(ground_pos - earth_center);
+                float ndotl = saturate(dot(ground_n, sun_dir));
+                
+                float2 sun_uv = transmittance_lut_params_to_uv(earth_radius, dot(ground_n, sun_dir));
+                float3 trans_sun = transmittance_lut.SampleLevel(samp, sun_uv, 0).rgb;
+                
+                luminance_sum += trans * trans_sun * ndotl * ground_albedo / PI;
+            }
+            
+            float phase = 1.0 / (4.0 * PI);
+            luminance_sum += scatter_integral * phase;
+            f_ms_sum += scatter_integral * phase;
+        }
+    }
+    
+    float sphere_samples = sqrt_samples * sqrt_samples;
+    luminance_sum *= 4.0 * PI / sphere_samples;
+    f_ms_sum *= 4.0 * PI / sphere_samples;
+    
+    // infinite series approximation
+    return luminance_sum / max(float3(1.0, 1.0, 1.0) - f_ms_sum, 0.001);
+}
+
+// main sky color computation
+float3 compute_sky_luminance(
+    float3 position, float3 view_dir, float3 sun_dir,
+    Texture2D transmittance_lut, Texture2D multiscatter_lut,
+    SamplerState samp, float jitter = 0.5)
+{
+    float2 atmo_hit = ray_sphere_intersect(position, view_dir, earth_center, atmosphere_radius);
+    if (atmo_hit.y < 0.0) return float3(0.0, 0.0, 0.0);
+    
+    float t_min = max(0.0, atmo_hit.x);
+    float t_max = atmo_hit.y;
+    
+    float2 ground_hit = ray_sphere_intersect(position, view_dir, earth_center, earth_radius);
+    if (ground_hit.x > 0.0) t_max = min(t_max, ground_hit.x);
+    
+    float cos_theta = dot(view_dir, sun_dir);
+    float phase_r = rayleigh_phase(cos_theta);
+    float phase_m = cornette_shanks_phase(cos_theta, mie_g);
+    
+    float3 luminance = float3(0.0, 0.0, 0.0);
+    float3 trans = float3(1.0, 1.0, 1.0);
+    float dt = (t_max - t_min) / scattering_samples;
+    
+    for (int i = 0; i < scattering_samples; i++)
+    {
+        float3 sample_pos = position + view_dir * (t_min + (i + jitter) * dt);
+        float height = get_height(sample_pos);
+        
+        if (height < 0.0 || height > atmosphere_radius - earth_radius)
+            continue;
+        
+        float3 extinction = get_extinction(height);
+        float rayleigh_d = get_rayleigh_density(height);
+        float mie_d = get_mie_density(height);
+        
+        float3 up = normalize(sample_pos - earth_center);
+        float cos_sun = dot(up, sun_dir);
+        
+        // the lut stores zero for ground occluded sun rays, earth shadow and twilight fall out naturally
+        float2 sun_uv = transmittance_lut_params_to_uv(height + earth_radius, cos_sun);
+        float3 trans_sun = transmittance_lut.SampleLevel(samp, sun_uv, 0).rgb;
+        
+        // single + multi scatter
+        float3 scatter_r = rayleigh_scatter * rayleigh_d * phase_r;
+        float3 scatter_m = mie_scatter * mie_d * phase_m;
+        float3 scattering = (scatter_r + scatter_m) * trans_sun;
+        
+        float2 ms_uv = float2(cos_sun * 0.5 + 0.5, saturate(height / (atmosphere_radius - earth_radius)));
+        float3 ms = multiscatter_lut.SampleLevel(samp, ms_uv, 0).rgb;
+        float3 ms_scatter = (rayleigh_scatter * rayleigh_d + mie_scatter * mie_d) * ms;
+        
+        float3 total = scattering + ms_scatter;
+        float3 scatter_int = total * (1.0 - exp(-extinction * dt)) / max(extinction, 1e-6);
+        
+        luminance += scatter_int * trans;
+        trans *= exp(-extinction * dt);
+        
+        if (all(trans < 1e-6)) break;
+    }
+    
+    // top of atmosphere radiance, the integral above already applied per path transmittance
+    return luminance * get_sun_radiance_toa();
+}
+
+// sun disc with limb darkening and a solar aureole
+float3 compute_sun_disc(float3 view_dir, float3 sun_dir, float3 transmittance)
+{
+    float cos_angle = dot(view_dir, sun_dir);
+    if (cos_angle <= 0.0)
+    {
+        return float3(0.0, 0.0, 0.0);
+    }
+
+    float angle = acos(saturate(cos_angle));
+    float3 toa  = get_sun_radiance_toa() * transmittance;
+    float x     = angle / sun_angular_radius;
+
+    // limb darkening across the geometric disc
+    float r    = saturate(x);
+    float mu   = safe_sqrt(1.0 - r * r);
+    float limb = 0.3 + 0.93 * mu - 0.23 * mu * mu;
+
+    // compact soft core, solid angle division is skipped on purpose, it produces ~600k nits
+    // that the panorama hdr clamp flattens into a hard circle and erases every soft edge
+    float core  = 1.0 - smoothstep(0.75, 1.4, x);
+    float3 disc = toa * core * limb * 0.5;
+
+    // wide solar aureole, must stay bright over several degrees or tonemap collapses the sun
+    // into a flat cream sticker against the blue sky
+    float3 aureole = toa * (
+        exp(-x * x * 0.8)  * 0.45 +
+        exp(-x * x * 0.05) * 0.35 +
+        exp(-x * x * 0.008) * 0.18 +
+        exp(-x * x * 0.0015) * 0.06
+    );
+
+    return disc + aureole;
+}
+
+// =====================================================================
+// sky view lut (hillaire 2020)
+// the per panorama pixel atmosphere integration is replaced by a small lut baked once per
+// frame, the sky is azimuthally symmetric about the light's vertical plane so u only needs
+// the [0, pi] azimuth difference, v is elevation with a square root warp that concentrates
+// texels at the horizon where the gradient is steepest, the texture packs two half luts
+// vertically, rows [0, h) hold the sun sky and rows [h, 2h) hold the moonlit night sky
+// =====================================================================
+
+static const float2 sky_view_lut_size = float2(192.0, 108.0); // resolution of one half
+
+// horizontal unit vector of a direction, falls back to +x when degenerate
+float2 sky_view_horizontal(float3 dir)
+{
+    float2 h   = float2(dir.x, dir.z);
+    float  len = length(h);
+    return len > 1e-5 ? h / len : float2(1.0, 0.0);
+}
+
+// forward mapping used when sampling, unit uv in [0,1]^2 for the upper hemisphere
+float2 sky_view_dir_to_unit(float3 view_dir, float3 light_dir)
+{
+    float elevation = asin(saturate(view_dir.y));
+    float v         = sqrt(elevation / (PI * 0.5));
+    float cos_az    = clamp(dot(sky_view_horizontal(view_dir), sky_view_horizontal(light_dir)), -1.0, 1.0);
+    float u         = acos(cos_az) / PI;
+    return float2(u, v);
+}
+
+// inverse mapping used by the bake kernel, texel centers span the full unit range
+float3 sky_view_unit_to_dir(float2 unit, float3 light_dir)
+{
+    float elevation = unit.y * unit.y * (PI * 0.5);
+    float azimuth   = unit.x * PI;
+    float2 fwd      = sky_view_horizontal(light_dir);
+    float2 side     = float2(-fwd.y, fwd.x);
+    float2 dir_h    = fwd * cos(azimuth) + side * sin(azimuth);
+    float  cos_el   = cos(elevation);
+    return float3(dir_h.x * cos_el, sin(elevation), dir_h.y * cos_el);
+}
+
+// bilinear fetch from the packed lut, half_index 0 samples the sun half, 1 the moon half
+float3 sample_sky_view_lut(Texture2D lut, SamplerState samp, float3 view_dir, float3 light_dir, float half_index)
+{
+    float2 unit = sky_view_dir_to_unit(view_dir, light_dir);
+    float2 uv;
+    uv.x = (unit.x * (sky_view_lut_size.x - 1.0) + 0.5) / sky_view_lut_size.x;
+    uv.y = (unit.y * (sky_view_lut_size.y - 1.0) + 0.5) / (sky_view_lut_size.y * 2.0) + half_index * 0.5;
+    return lut.SampleLevel(samp, uv, 0).rgb;
+}
+
+// =====================================================================
+// night sky
+// =====================================================================
+
+float night_hash13(float3 p)
+{
+    p = frac(p * 0.1031);
+    p += dot(p, p.zyx + 31.32);
+    return frac((p.x + p.y) * p.z);
+}
+
+// smooth 3d value noise on a hashed lattice
+float night_value_noise(float3 p)
+{
+    float3 i = floor(p);
+    float3 f = frac(p);
+    float3 u = f * f * (3.0 - 2.0 * f);
+    
+    float n000 = night_hash13(i);
+    float n100 = night_hash13(i + float3(1, 0, 0));
+    float n010 = night_hash13(i + float3(0, 1, 0));
+    float n110 = night_hash13(i + float3(1, 1, 0));
+    float n001 = night_hash13(i + float3(0, 0, 1));
+    float n101 = night_hash13(i + float3(1, 0, 1));
+    float n011 = night_hash13(i + float3(0, 1, 1));
+    float n111 = night_hash13(i + float3(1, 1, 1));
+    
+    return lerp(
+        lerp(lerp(n000, n100, u.x), lerp(n010, n110, u.x), u.y),
+        lerp(lerp(n001, n101, u.x), lerp(n011, n111, u.x), u.y),
+        u.z);
+}
+
+float night_fbm(float3 p, int octaves)
+{
+    float v = 0.0;
+    float a = 0.5;
+    [loop] for (int i = 0; i < octaves; i++)
+    {
+        v += a * night_value_noise(p);
+        p *= 2.03;
+        a *= 0.5;
+    }
+    return v;
+}
+
+// orthonormal tangent frame around n
+void night_make_basis(float3 n, out float3 t, out float3 b)
+{
+    float3 a = abs(n.y) < 0.95 ? float3(0, 1, 0) : float3(1, 0, 0);
+    t = normalize(cross(a, n));
+    b = cross(n, t);
+}
+
+float3 night_rotate_about_axis(float3 dir, float3 axis, float angle)
+{
+    float s = sin(angle);
+    float c = cos(angle);
+    return dir * c + cross(axis, dir) * s + axis * dot(axis, dir) * (1.0 - c);
+}
+
+float3 night_apply_earth_rotation(float3 view_dir, float time_of_day)
+{
+    // same axis as Light::SetTimeOfDay / DayNightCycle, sun and stars share one earth spin
+    const float3 celestial_axis = float3(1.0, 0.0, 0.0);
+    return night_rotate_about_axis(view_dir, celestial_axis, time_of_day * PI2);
+}
+
+// stars and milky way are dimmed by airmass toward the horizon, blue is attenuated more than red
+float3 night_atmospheric_extinction(float3 view_dir)
+{
+    float airmass = 1.0 / max(view_dir.y + 0.05, 0.05);
+    return exp(-airmass * float3(0.07, 0.10, 0.16));
+}
+
+// yale bsc5 catalog stars as unresolved pinpoints, magnitude drives flux and size
+float3 night_compute_stars(float3 celestial_view, Texture2D stars_tex, Texture2D grid_tex, float time_seconds)
+{
+    float2 res;
+    grid_tex.GetDimensions(res.x, res.y);
+    if (res.x < 2.0 || res.y < 2.0)
+    {
+        return float3(0, 0, 0);
+    }
+
+    float2 uv = direction_sphere_uv(celestial_view);
+    int2 grid_size = int2(res);
+    int2 cell = int2(uv * res);
+    cell = clamp(cell, int2(0, 0), grid_size - 1);
+
+    // skysphere equirect is 4096 wide, one texel is the natural unresolved star size
+    const float pixel_ang = PI2 / 4096.0;
+
+    float3 result = float3(0, 0, 0);
+    [unroll]
+    for (int dy = -1; dy <= 1; dy++)
+    {
+        [unroll]
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            int2 c = cell + int2(dx, dy);
+            c.x = (c.x + grid_size.x) % grid_size.x;
+            c.y = clamp(c.y, 0, grid_size.y - 1);
+
+            float4 cell_data = grid_tex.Load(int3(c, 0));
+            uint offset = asuint(cell_data.x);
+            uint count  = asuint(cell_data.y);
+            count = min(count, 64u);
+
+            [loop]
+            for (uint i = 0; i < count; i++)
+            {
+                int idx = int(offset + i);
+                float4 star = stars_tex.Load(int3(idx, 0, 0));
+                float4 col  = stars_tex.Load(int3(idx, 1, 0));
+
+                float3 star_dir = star.xyz;
+                float ndot = dot(celestial_view, star_dir);
+                // ~2.5 texels, enough for aa and the brightest diffraction arms
+                if (ndot < 0.999995)
+                {
+                    continue;
+                }
+
+                float mag  = star.w;
+                float flux = pow(10.0, -0.4 * mag);
+                // relative brightness weight, mag -1.5 -> ~1, mag 6.5 -> ~0
+                float bright = saturate((-mag + 6.5) / 8.0);
+                float ang2   = max(0.0, 1.0 - ndot) * 2.0;
+
+                // most stars stay inside one texel, only the brightest grow a little
+                float core_r = pixel_ang * (0.22 + bright * bright * 0.85);
+                float core   = exp(-ang2 / max(core_r * core_r, 1e-14));
+                if (core < 1e-3)
+                {
+                    continue;
+                }
+
+                // energy near night_sky scale, strong magnitude contrast, no common floor
+                float energy = flux * 0.035;
+                float3 rgb   = col.rgb * energy;
+
+                float seed    = frac(dot(star_dir, float3(12.9898, 78.233, 37.719)) * 43758.5453);
+                float twinkle = 1.0 + bright * 0.18 * sin(time_seconds * (1.6 + seed * 2.4) + seed * PI2);
+                float3 contrib = rgb * core * twinkle;
+
+                // thin diffraction cross on the brightest only
+                if (bright > 0.72)
+                {
+                    float3 t_axis, b_axis;
+                    night_make_basis(star_dir, t_axis, b_axis);
+                    float3 delta = celestial_view - star_dir * ndot;
+                    float u = abs(dot(delta, t_axis));
+                    float v = abs(dot(delta, b_axis));
+                    float sw = pixel_ang * 0.10;
+                    float sl = pixel_ang * (0.7 + bright * 1.6);
+                    float spike = exp(-u / sw) * exp(-v / sl) + exp(-v / sw) * exp(-u / sl);
+                    contrib += rgb * spike * bright * 0.28 * twinkle;
+                }
+
+                result += contrib;
+            }
+        }
+    }
+    return result;
+}
+
+// procedural galactic plane, fbm density modulated along a tilted band with dust rifts and a bulge
+float3 night_compute_milky_way(float3 view_dir)
+{
+    const float3 galactic_up = float3(0.42064, 0.55179, 0.72260);
+    const float3 bulge_dir   = float3(-0.79602, -0.09950, 0.59702);
+
+    float lat  = abs(dot(view_dir, galactic_up));
+    float band = exp(-lat * lat / 0.040);
+    if (band < 0.001)
+    {
+        return float3(0, 0, 0);
+    }
+
+    float3 fp     = view_dir * 4.0;
+    float density = night_fbm(fp, 4);
+    density = saturate(density * 1.6 - 0.35);
+
+    float dust = night_fbm(fp * 2.5 + 11.7, 4);
+    dust       = saturate(dust * 1.3 - 0.40);
+    density    = saturate(density - dust * 0.7);
+
+    float bulge     = pow(saturate(dot(view_dir, bulge_dir)), 6.0);
+    float intensity = density * (0.5 + bulge * 1.5);
+
+    float3 cool = float3(0.55, 0.70, 1.00);
+    float3 warm = float3(1.00, 0.85, 0.65);
+    float3 col  = lerp(cool, warm, bulge);
+
+    return col * intensity * band * 0.0018;
+}
+
+// moon split into disc and halo so they can be composited differently
+struct moon_result
+{
+    float3 disc;
+    float3 halo;
+};
+
+moon_result night_compute_moon(float3 view_dir, float3 moon_dir)
+{
+    moon_result r;
+    r.disc = float3(0, 0, 0);
+    r.halo = float3(0, 0, 0);
+    
+    float moon_elev = dot(moon_dir, up_direction);
+    
+    // fade the moon and its halo as it dips below the horizon
+    float horizon_fade = smoothstep(-0.05, 0.10, moon_elev);
+    if (horizon_fade <= 0.0)
+    {
+        return r;
+    }
+    
+    const float moon_radius = 0.018;
+    const float sin_r       = sin(moon_radius);
+    
+    float cos_angle = dot(view_dir, moon_dir);
+    if (cos_angle < 0.0)
+    {
+        return r;
+    }
+    
+    // soft wide gaussian halo around the moon, scaled to night_sky so it does not wash the sky blue
+    float angle_to_moon = acos(saturate(cos_angle));
+    float halo_falloff  = exp(-angle_to_moon * angle_to_moon / 0.0040);
+    r.halo = float3(0.55, 0.72, 0.95) * halo_falloff * 0.0045 * horizon_fade;
+    
+    // outside the disc, only the halo contributes
+    if (cos_angle < cos(moon_radius * 1.05))
+    {
+        return r;
+    }
+    
+    // tangent basis around the moon for disc-local coordinates
+    float3 t_axis, b_axis;
+    night_make_basis(moon_dir, t_axis, b_axis);
+    
+    // disc-local coordinates u,v in [-1,1]
+    float u  = dot(view_dir, t_axis) / sin_r;
+    float v  = dot(view_dir, b_axis) / sin_r;
+    float r2 = u * u + v * v;
+    if (r2 > 1.0)
+    {
+        return r;
+    }
+    
+    // surface normal of the visible hemisphere point at this disc location
+    float w  = safe_sqrt(1.0 - r2);
+    float3 n = -moon_dir * w + t_axis * u + b_axis * v;
+    
+    // domain warped fbm for terrain, mare are dark basaltic plains, highlands are bright
+    float3 sp     = n * 5.5;
+    float warp    = night_fbm(sp * 0.6 + 7.3, 3);
+    float terrain = night_fbm(sp + warp * 0.6, 5);
+    
+    float mare      = smoothstep(0.42, 0.62, terrain);
+    float albedo_v  = lerp(0.16, 0.06, mare);
+    
+    // higher frequency noise adds crater-like darkening to the highlands
+    float crater_n    = night_fbm(sp * 4.0 + 23.1, 3);
+    float crater_mask = smoothstep(0.42, 0.55, crater_n);
+    albedo_v *= lerp(1.0, 0.78, crater_mask * (1.0 - mare));
+    
+    // mare cool, highlands warm
+    float3 tint   = lerp(float3(1.00, 0.94, 0.86), float3(0.78, 0.84, 0.95), mare);
+    float3 albedo = albedo_v * tint;
+    
+    // perturb normal by terrain gradient so mare and highlands shade differently
+    const float eps = 0.07;
+    float dxp = night_fbm(sp + float3(eps, 0, 0), 4) - terrain;
+    float dyp = night_fbm(sp + float3(0, eps, 0), 4) - terrain;
+    float dzp = night_fbm(sp + float3(0, 0, eps), 4) - terrain;
+    float3 n_perturbed = normalize(n + float3(dxp, dyp, dzp) * 0.55);
+    
+    // lunar light direction, rotated off the antisolar direction to give a waxing gibbous phase
+    const float phase_angle = 0.45;
+    float3 lunar_sun = normalize(-moon_dir * cos(phase_angle) + t_axis * sin(phase_angle));
+    
+    // illumination with a soft terminator
+    float n_dot_l = dot(n_perturbed, lunar_sun);
+    float lit     = smoothstep(-0.04, 0.06, n_dot_l);
+    
+    // hapke-like limb darkening, less pronounced than the sun
+    float limb = pow(saturate(w), 0.55);
+    
+    // earthshine, faint cool blue glow on the unlit side
+    float dark         = saturate(-n_dot_l);
+    float3 earthshine  = float3(0.04, 0.06, 0.10) * dark * 0.45;
+    
+    // cool moonlight, disc peak sits above night_sky but below a daylight sun
+    float3 lunar_light = float3(0.92, 0.96, 1.00) * 0.045;
+    float3 surface     = albedo * lunar_light * lit * limb + earthshine * 0.015;
+    
+    // anti-aliased disc edge
+    float r_norm = sqrt(r2);
+    float edge   = smoothstep(1.0, 0.96, r_norm);
+    
+    r.disc = surface * edge * horizon_fade;
+    return r;
+}
+
+// night atmosphere, uses the shared night radiometric levels from common.hlsl
+float3 night_compute_atmosphere(float3 view_dir, float3 moon_dir, Texture2D sky_view_lut, SamplerState samp)
+{
+    float3 base = night_sky_radiance(view_dir.y);
+    
+    float dy = view_dir.y - 0.04;
+    float airglow_band = exp(-(dy * dy) / 0.0050);
+    float3 airglow = night_airglow_rad * airglow_band;
+    
+    float moon_elev = dot(moon_dir, up_direction);
+    float3 moon_scatter = float3(0, 0, 0);
+    if (moon_elev > -0.10)
+    {
+        float3 lum  = sample_sky_view_lut(sky_view_lut, samp, view_dir, moon_dir, 1.0);
+        float fade  = smoothstep(-0.05, 0.10, moon_elev);
+        moon_scatter = lum * night_moon_to_sun * fade;
+    }
+    
+    return base + airglow + moon_scatter;
+}
+
+// compute shaders
+
+#if defined(TRANSMITTANCE_LUT)
+[numthreads(8, 8, 1)]
+void main_cs(uint3 tid : SV_DispatchThreadID)
+{
+    float2 res;
+    tex_uav.GetDimensions(res.x, res.y);
+    if (any(tid.xy >= uint2(res))) return;
+    
+    float2 uv = (tid.xy + 0.5) / res;
+    float height, cos_zenith;
+    transmittance_uv_to_params(uv, height, cos_zenith);
+    
+    float3 pos = earth_center + float3(0.0, height, 0.0);
+    float sin_z = safe_sqrt(1.0 - cos_zenith * cos_zenith);
+    float3 dir = float3(sin_z, cos_zenith, 0.0);
+    
+    tex_uav[tid.xy] = float4(compute_transmittance_to_top(pos, dir), 1.0);
+}
+
+#elif defined(MULTISCATTER_LUT)
+[numthreads(8, 8, 1)]
+void main_cs(uint3 tid : SV_DispatchThreadID)
+{
+    float2 res;
+    tex_uav.GetDimensions(res.x, res.y);
+    if (any(tid.xy >= uint2(res))) return;
+    
+    float2 uv = (tid.xy + 0.5) / res;
+    float cos_sun = uv.x * 2.0 - 1.0;
+    float height = uv.y * (atmosphere_radius - earth_radius);
+    
+    tex_uav[tid.xy] = float4(compute_multiscatter(height, cos_sun, tex, GET_SAMPLER(sampler_bilinear_clamp)), 1.0);
+}
+
+#elif defined(SKY_VIEW_LUT)
+// bakes the full 32 step atmosphere march into a small direction indexed lut once per frame,
+// the panorama bake then replaces its per pixel march with one bilinear fetch, the night path
+// previously marched a second time for moon scatter which the moon half absorbs as well
+[numthreads(8, 8, 1)]
+void main_cs(uint3 tid : SV_DispatchThreadID)
+{
+    float2 res;
+    tex_uav.GetDimensions(res.x, res.y);
+    if (any(tid.xy >= uint2(res)))
+    {
+        return;
+    }
+    
+    float  half_h    = res.y * 0.5;
+    bool   moon_half = float(tid.y) >= half_h;
+    float2 texel     = float2(float(tid.x), moon_half ? float(tid.y) - half_h : float(tid.y));
+    float2 unit      = float2(texel.x / (res.x - 1.0), texel.y / (half_h - 1.0));
+    
+    Light light;
+    Surface surface;
+    light.Build(0, surface);
+    float3 sun_dir  = normalize(-light.forward);
+    float  sun_elev = dot(sun_dir, up_direction);
+    
+    // the moon half is only read when the night factor exceeds its cutoff, skip the march during the day
+    if (moon_half && sun_elev >= 0.35)
+    {
+        tex_uav[tid.xy] = float4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+    
+    float3 light_dir = moon_half ? normalize(-sun_dir) : sun_dir;
+    float3 view_dir  = sky_view_unit_to_dir(unit, light_dir);
+    float3 cam_pos   = clamp_camera_to_atmosphere(get_camera_position());
+    
+    float3 luminance = compute_sky_luminance(cam_pos, view_dir, light_dir, tex, tex2,
+                                             GET_SAMPLER(sampler_bilinear_clamp), 0.5);
+    tex_uav[tid.xy] = float4(luminance, 1.0);
+}
+
+#else
+[numthreads(THREAD_GROUP_COUNT_X, THREAD_GROUP_COUNT_Y, 1)]
+void main_cs(uint3 tid : SV_DispatchThreadID)
+{
+    float2 res;
+    tex_uav.GetDimensions(res.x, res.y);
+
+    // bake mode, set by Pass_Skysphere via the first push constant float
+    //   warmup > 0, the first n frames after a sun or app start change, the cpu
+    //            issues a full sized dispatch and every output pixel runs the full bake, the
+    //            value is the progressive blend for that frame (1, 1/2, 1/3 ...) so the first
+    //            frame fully replaces the panorama, no ghost of the old sky survives, and the
+    //            burst converges to the exact mean of the jittered bakes
+    //   warmup = 0.0, steady state, the cpu issues a quarter resolution dispatch (1/16 of
+    //            the waves) and each thread writes exactly one full resolution pixel chosen
+    //            from a 4x4 tile by a phase that cycles with buffer_frame.frame, so every
+    //            pixel refreshes every 16 frames or ~267 ms at 60 fps. the coarse dispatch
+    //            is the real saver, an early-return scheme does not skip wave time because
+    //            gpu lockstep execution pays for every wave with one active lane
+    const float warmup_blend = buffer_pass.values[0].x;
+    const bool  warmup       = warmup_blend > 0.0;
+    uint2 pixel;
+    if (warmup)
+    {
+        pixel = tid.xy;
+    }
+    else
+    {
+        // bayer ordered refresh, decorrelates staleness inside each 4x4 tile so cloud motion reads as soft noise instead of a raster combing pattern
+        static const uint2 bayer_order[16] = { uint2(0, 0), uint2(2, 2), uint2(2, 0), uint2(0, 2), uint2(1, 1), uint2(3, 3), uint2(3, 1), uint2(1, 3), uint2(1, 0), uint2(3, 2), uint2(3, 0), uint2(1, 2), uint2(0, 1), uint2(2, 3), uint2(2, 1), uint2(0, 3) };
+        pixel = tid.xy * 4u + bayer_order[buffer_frame.frame & 15u];
+    }
+    if (any(pixel >= uint2(res))) return;
+
+    float2 uv = (float2(pixel) + 0.5) / res;
+    
+    // equirectangular to direction
+    float phi = uv.x * PI2 + PI;
+    float theta = (0.5 - uv.y) * PI;
+    float cos_t = cos(theta);
+    float3 view_dir = normalize(float3(cos(phi) * cos_t, sin(theta), sin(phi) * cos_t));
+    float3 orig_view = view_dir;
+    
+    // mirror below horizon for ibl
+    bool below_horizon = view_dir.y < 0.0;
+    if (below_horizon) view_dir.y = -view_dir.y;
+    
+    // sun direction from light
+    Light light;
+    Surface surface;
+    light.Build(0, surface);
+    float3 sun_dir = normalize(-light.forward);
+    float sun_elev = dot(sun_dir, up_direction);
+    
+    // day/night factor
+    float day_factor = 1.0 / (1.0 + exp(-sun_elev * 20.0));
+    
+    // camera in atmosphere
+    float3 cam_pos = clamp_camera_to_atmosphere(get_camera_position());
+    
+    // sky luminance, one fetch from the per frame sky view lut instead of a 32 step march
+    float3 luminance = sample_sky_view_lut(tex3, GET_SAMPLER(sampler_bilinear_clamp), view_dir, sun_dir, 0.0);
+    
+    // sun disc only, all night celestials are gathered below
+    float3 sun_col = float3(0, 0, 0);
+    
+    // ground fade for the bottom hemisphere, fully gone within ~7 degrees below the horizon
+    // hard cap on the luminance prevents the mie peak around the sun from producing a vertical
+    // pillar straight down through the equirectangular bottom pole
+    float ground_fade = below_horizon ? saturate(1.0 + orig_view.y * 8.0) : 1.0;
+
+    if (below_horizon)
+    {
+        // clamp the mirrored sky so an intense sun mie spike cannot punch through the fade
+        // dark warm grey ground tone, faded out away from the horizon
+        float lum_avg = (luminance.r + luminance.g + luminance.b) * 0.333;
+        float3 lum_capped = luminance * min(1.0, 1.0 / max(lum_avg, 1e-3));
+        luminance = lum_capped * 0.15 * ground_fade;
+    }
+    else if (sun_elev > -0.02)
+    {
+        float3 cam_up    = normalize(cam_pos - earth_center);
+        float2 sun_uv    = transmittance_lut_params_to_uv(length(cam_pos - earth_center), max(dot(cam_up, sun_dir), 0.0));
+        float3 sun_trans = tex.SampleLevel(GET_SAMPLER(sampler_bilinear_clamp), sun_uv, 0).rgb;
+        sun_col          = compute_sun_disc(orig_view, sun_dir, sun_trans) * smoothstep(-0.02, 0.02, sun_elev);
+    }
+    
+    // night sky, atmosphere is sky-dome, celestials ride behind the atmosphere
+    // the physical sky needs no day factor, the earth shadow in the transmittance lut fades it naturally
+    float night_factor      = 1.0 - day_factor;
+    // stars only after the sun is below the horizon, never on a blue daytime sky
+    float star_visibility = smoothstep(0.02, -0.12, sun_elev);
+    float3 night_ambient    = float3(0, 0, 0);
+    float3 night_celestials = float3(0, 0, 0);
+    if (night_factor > 0.001)
+    {
+        float time_of_day     = buffer_frame.time_of_day;
+        float3 celestial_view = night_apply_earth_rotation(orig_view, time_of_day);
+        // moon stays opposite the sun, sun already tracks time of day
+        float3 moon_dir       = normalize(-sun_dir);
+
+        night_ambient = night_compute_atmosphere(view_dir, moon_dir, tex3, GET_SAMPLER(sampler_bilinear_clamp));
+
+        if (!below_horizon)
+        {
+            float3 ext = night_atmospheric_extinction(orig_view);
+            if (star_visibility > 0.001)
+            {
+                night_celestials += night_compute_milky_way(celestial_view) * ext * star_visibility;
+                night_celestials += night_compute_stars(celestial_view, tex5, tex6, (float)buffer_frame.time) * ext * star_visibility;
+            }
+
+            moon_result mr    = night_compute_moon(orig_view, moon_dir);
+            night_ambient    += mr.halo;
+            night_celestials += mr.disc;
+        }
+        else
+        {
+            night_ambient *= ground_fade;
+        }
+
+        night_ambient    *= night_factor;
+        night_celestials *= night_factor;
+    }
+
+    float3 final_color = luminance + night_ambient + sun_col + night_celestials;
+    // chroma preserving clamp so the sun disc and any other hdr spike carry the directional
+    // light's temperature into the panorama instead of clipping every channel to the cap
+    final_color        = hdr_clamp_chroma(final_color, 100.0);
+
+    // temporal accumulation, behaviour depends on bake mode
+    //   warmup, progressive average of the jittered full bakes, frame n blends at 1/n so the
+    //   first frame fully replaces the panorama and the burst lands on the exact mean, the
+    //   old fixed 0.1 blend left ~43 percent of the previous sky in the history after the burst
+    //   steady, gentle blend smooths the interleaved panorama refresh
+    float4 prev = tex_uav[pixel];
+    final_color = lerp(prev.rgb, final_color, warmup ? warmup_blend : 0.06);
+
+    tex_uav[pixel] = float4(final_color, 1.0);
+}
+#endif

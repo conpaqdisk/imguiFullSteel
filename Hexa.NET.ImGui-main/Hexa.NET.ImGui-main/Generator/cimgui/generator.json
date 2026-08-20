@@ -1,0 +1,8 @@
+{
+  "BaseConfig": {
+    "Url": "file://config.base.json"
+  },
+  "Namespace": "Hexa.NET.ImGui",
+  "ApiName": "ImGui",
+  "LibName": "cimgui"
+}
